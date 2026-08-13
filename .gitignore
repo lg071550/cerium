@@ -1,0 +1,15 @@
+# toolchain (downloaded locally, large)
+tools/emsdk/
+tools/python/
+tools/esbuild/
+tools/*.tar.gz
+
+# build output
+build/
+
+# editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
