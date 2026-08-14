@@ -7,6 +7,9 @@ tools/*.tar.gz
 # build output
 build/
 
+# local binaries
+harness.exe
+
 # editor / OS noise
 .vscode/
 .idea/
