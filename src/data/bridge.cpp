@@ -21,6 +21,15 @@ EM_JS(void, bridge_init_js, (int capacity), {
 
     var worker = new Worker("build/feeds.worker.js", { type: "module" });
     worker.postMessage({ kind: "init", sab: sab, capacity: capacity });
+    worker.onmessage = function (e) {
+      var d = e.data;
+      if (!d || d.kind !== "candles") return;
+      var arr = d.data; // Float64Array: [ts, o, h, l, c, vol, takerBuyVol] × n
+      var ptr = _malloc(arr.length * 8);
+      HEAPF64.set(arr, ptr >> 3);
+      _cerium_on_candles(ptr, arr.length / 7, d.interval, d.sym);
+      _free(ptr);
+    };
     Module._ceriumWorker = worker;
   } catch (e) {
     console.error("feeds: bridge init failed", e);
@@ -63,7 +72,7 @@ EM_JS(void, bridge_cmd_js, (unsigned type, unsigned venue, double arg), {
 
 namespace bridge {
 
-void init() { bridge_init_js(65536); }
+void init() { bridge_init_js(1 << 20); } // 1 Mi events = 32 MiB ring
 
 int drain(wire::Event* dest, int maxEvents) {
   return bridge_drain_js(dest, maxEvents);

@@ -39,7 +39,7 @@ MODE="${1:-release}"
 if [[ "$MODE" == "dev" ]]; then
   OPT="-O1 -g -sASSERTIONS=2"
 else
-  OPT="-O2 -sASSERTIONS=1"
+  OPT="-O3 -flto -sASSERTIONS=0"
 fi
 
 mkdir -p build
@@ -51,7 +51,7 @@ if [[ ! -x "$ESBUILD" ]]; then
   exit 1
 fi
 "$ESBUILD" feeds/main.ts --bundle --format=esm --target=es2020 \
-  --outfile=build/feeds.worker.js --log-level=warning
+  --outfile=build/feeds.worker.js --log-level=warning --minify
 
 SOURCES=$(find src -name '*.cpp' | sort)
 
@@ -61,7 +61,7 @@ em++ -std=c++20 $OPT -fno-exceptions -fno-rtti \
   -Ithird_party \
   --use-port=emdawnwebgpu \
   -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web \
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_free \
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_cerium_on_candles \
   --embed-file assets@/assets \
   $SOURCES \
   -o build/cerium.js

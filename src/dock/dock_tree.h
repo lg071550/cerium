@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../ui/draw_list.h"
+#include "../render/draw_list.h"
 
 #include <memory>
 #include <utility>
@@ -43,6 +43,8 @@ struct DockTree {
   void computeRects(Rect area, float splitter);
   DockNode* leafAt(float x, float y);
   void collectSplitters(float splitter, std::vector<std::pair<Rect, DockNode*>>& out);
+  void collectTabs(std::vector<int>& out) const; // all tab ids in the tree
+  DockNode* firstLeaf();                         // leftmost leaf (panels land here)
 
   void insertTab(DockNode* leaf, int tabId, int index = -1);
   void removeTab(DockNode* leaf, int tabId);

@@ -4,6 +4,31 @@
 #include <cstring>
 
 // ---------------------------------------------------------------------------
+// error channel (handler installed by the host app; stderr always)
+// ---------------------------------------------------------------------------
+
+static GpuErrorFn g_errorFn = nullptr;
+
+void gpu_set_error_handler(GpuErrorFn fn) { g_errorFn = fn; }
+
+void gpu_report_error(const char* msg) {
+  fprintf(stderr, "cerium: %s\n", msg);
+  if (g_errorFn) g_errorFn(msg);
+}
+
+// Returns the sRGB sibling of an 8-bit unorm surface format so we can render
+// through an sRGB view (linear-light blending) while keeping the *surface*
+// configured with the non-sRGB format browsers prefer. Other formats pass
+// through unchanged (no sRGB reinterpretation).
+static WGPUTextureFormat srgb_view_format(WGPUTextureFormat f) {
+  switch (f) {
+    case WGPUTextureFormat_BGRA8Unorm: return WGPUTextureFormat_BGRA8UnormSrgb;
+    case WGPUTextureFormat_RGBA8Unorm: return WGPUTextureFormat_RGBA8UnormSrgb;
+    default: return f;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // async acquisition (callbacks fire from the browser event loop / ProcessEvents)
 // ---------------------------------------------------------------------------
 
@@ -19,6 +44,7 @@ static void on_device(WGPURequestDeviceStatus status, WGPUDevice device,
   if (status != WGPURequestDeviceStatus_Success) {
     fprintf(stderr, "webgpu: device request failed: %.*s\n",
             (int)message.length, message.data ? message.data : "");
+    gpu_report_error("WebGPU device request failed");
     return;
   }
   g.device = device;
@@ -30,6 +56,7 @@ static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
   if (status != WGPURequestAdapterStatus_Success) {
     fprintf(stderr, "webgpu: adapter request failed: %.*s\n",
             (int)message.length, message.data ? message.data : "");
+    gpu_report_error("WebGPU is not available in this browser");
     return;
   }
   g.adapter = adapter;
@@ -76,8 +103,22 @@ bool gpu_poll(GpuContext& g) {
 
   WGPUSurfaceCapabilities caps = {};
   wgpuSurfaceGetCapabilities(g.surface, g.adapter, &caps);
-  g.surfaceFormat = caps.formatCount > 0 ? caps.formats[0] : WGPUTextureFormat_BGRA8Unorm;
+  // The canvas is color-managed: we output linear-light values and let the
+  // sRGB surface encode on write. Prefer BGRA8UnormSrgb.
+  g.surfaceFormat = WGPUTextureFormat_BGRA8Unorm;
+  for (size_t i = 0; i < caps.formatCount; ++i) {
+    if (caps.formats[i] == WGPUTextureFormat_BGRA8UnormSrgb ||
+        caps.formats[i] == WGPUTextureFormat_RGBA8UnormSrgb) {
+      g.surfaceFormat = caps.formats[i];
+      break;
+    }
+  }
+  if (caps.formatCount > 0 && g.surfaceFormat == WGPUTextureFormat_BGRA8Unorm) {
+    // no sRGB variant offered — fall back to the first advertised format
+    g.surfaceFormat = caps.formats[0];
+  }
   wgpuSurfaceCapabilitiesFreeMembers(caps);
+  g.renderFormat = srgb_view_format(g.surfaceFormat);
 
   g.ready = true;
   return true;
@@ -97,6 +138,12 @@ void gpu_resize(GpuContext& g, int physW, int physH) {
   cfg.height = (uint32_t)physH;
   cfg.presentMode = WGPUPresentMode_Fifo;
   cfg.alphaMode = WGPUCompositeAlphaMode_Auto;
+  // Declare the sRGB view format so an sRGB view of the swapchain texture is
+  // valid; the surface itself stays configured with the non-sRGB format.
+  if (g.renderFormat != g.surfaceFormat) {
+    cfg.viewFormatCount = 1;
+    cfg.viewFormats = &g.renderFormat;
+  }
   wgpuSurfaceConfigure(g.surface, &cfg);
 }
 
@@ -118,6 +165,18 @@ WGPUTextureView gpu_next_frame(GpuContext& g, WGPUTexture* outTexture) {
   }
 
   *outTexture = st.texture;
+  if (g.renderFormat != g.surfaceFormat) {
+    // Render through an sRGB view so alpha blends composite in linear light.
+    WGPUTextureViewDescriptor viewDesc = {};
+    viewDesc.format = g.renderFormat;
+    viewDesc.dimension = WGPUTextureViewDimension_2D;
+    viewDesc.baseMipLevel = 0;
+    viewDesc.mipLevelCount = 1;
+    viewDesc.baseArrayLayer = 0;
+    viewDesc.arrayLayerCount = 1;
+    viewDesc.aspect = WGPUTextureAspect_All;
+    return wgpuTextureCreateView(st.texture, &viewDesc);
+  }
   return wgpuTextureCreateView(st.texture, nullptr);
 }
 

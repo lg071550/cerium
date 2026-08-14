@@ -22,3 +22,41 @@ export interface TradePrint {
 }
 
 export type FeedState = "connecting" | "syncing" | "live" | "reconnecting" | "error";
+
+export type FeedClass = "cex-spot" | "cex-perp" | "dex-perp";
+
+export type FeedId =
+  | "coinbase"
+  | "binance"
+  | "okx"
+  | "bybit"
+  | "kraken"
+  | "bitget"
+  | "gate"
+  | "bitstamp"
+  | "cryptocom"
+  | "bitfinex"
+  | "coinbase-perp"
+  | "coinbase-us-perp"
+  | "binance-perp"
+  | "okx-perp"
+  | "bybit-perp"
+  | "kraken-perp"
+  | "bitget-perp"
+  | "gate-perp"
+  | "mexc-perp"
+  | "cryptocom-perp"
+  | "bitfinex-perp"
+  | "deribit"
+  | "hyperliquid"
+  | "lighter"
+  | "extended"
+  | "dydx"
+  | "aster";
+
+export interface FeedDescriptor {
+  id: FeedId;
+  label: string;
+  venue: string;
+  class: FeedClass;
+}

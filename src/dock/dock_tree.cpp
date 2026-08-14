@@ -76,6 +76,24 @@ void DockTree::collectSplitters(float splitter,
   collectSplittersRec(root, splitter, out);
 }
 
+static void collectTabsRec(const DockNode* n, std::vector<int>& out) {
+  if (!n) return;
+  if (n->isLeaf()) {
+    for (int t : n->tabs) out.push_back(t);
+    return;
+  }
+  collectTabsRec(n->a, out);
+  collectTabsRec(n->b, out);
+}
+
+void DockTree::collectTabs(std::vector<int>& out) const { collectTabsRec(root, out); }
+
+DockNode* DockTree::firstLeaf() {
+  DockNode* n = root;
+  while (n && !n->isLeaf()) n = n->a;
+  return n;
+}
+
 void DockTree::insertTab(DockNode* leaf, int tabId, int index) {
   if (!leaf || !leaf->isLeaf()) return;
   if (index < 0 || index > (int)leaf->tabs.size()) {

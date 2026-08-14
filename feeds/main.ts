@@ -4,15 +4,27 @@
 import { CMD, EV, STATUS, WireWriter } from "./wire";
 import type { L2Update, PriceLevel, TradePrint } from "./types";
 import type { AdapterDeps, VenueAdapter } from "./venues/types";
-import { BinancePerpAdapter } from "./venues/binancePerp";
-
-// Venue registry — index must match the C++ side (src/data/feeds.cpp).
-const VENUES: { id: number; make: (deps: AdapterDeps) => VenueAdapter }[] = [
-  { id: 0, make: (deps) => new BinancePerpAdapter(deps) },
-];
+import { SYMBOLS, VENUES, type VenueDef } from "./registry";
+import { fetchKlines } from "./candles";
 
 let writer: WireWriter | null = null;
-const adapters: (VenueAdapter | null)[] = [];
+let symbolIndex = 0;
+let candleInterval = 1;
+const adapters: (VenueAdapter | null)[] = new Array(VENUES.length).fill(null);
+const enabled = new Set<number>(VENUES.map((v) => v.index)); // all on by default
+
+function refreshCandles(): void {
+  const sym = SYMBOLS[symbolIndex];
+  const interval = candleInterval;
+  const forSymbol = symbolIndex;
+  fetchKlines(sym, interval).then((data) => {
+    if (!data) return;
+    (self as unknown as Worker).postMessage(
+      { kind: "candles", sym: forSymbol, interval, data },
+      [data.buffer],
+    );
+  });
+}
 
 function makeDeps(venue: number): AdapterDeps {
   const w = writer!;
@@ -32,6 +44,7 @@ function makeDeps(venue: number): AdapterDeps {
         for (const u of updates)
           w.push(EV.BookUpdate, venue, u.side === "bid" ? 0 : 1, u.price, u.size, Date.now());
       },
+      noteActivity() {},
     },
     setState(state) {
       w.push(EV.FeedStatus, venue, 0, 0, 0, Date.now(), STATUS[state] ?? 0);
@@ -43,6 +56,18 @@ function makeDeps(venue: number): AdapterDeps {
   };
 }
 
+function startVenue(v: VenueDef): void {
+  const a = v.make(makeDeps(v.index), SYMBOLS[symbolIndex]);
+  adapters[v.index] = a;
+  a?.start();
+}
+
+function stopVenue(index: number): void {
+  const a = adapters[index];
+  adapters[index] = null;
+  a?.stop();
+}
+
 let lastCmdSeq = 0;
 
 function pollCommands(): void {
@@ -50,26 +75,56 @@ function pollCommands(): void {
   const seq = writer.cmdSeq();
   if (seq === lastCmdSeq) return;
   lastCmdSeq = seq;
-  const { type, venue } = writer.command();
+  const { type, venue, arg } = writer.command();
+
   if (type === CMD.ResyncVenue) {
     const a = adapters[venue];
     if (a) {
       a.stop();
       a.start();
     }
+    return;
   }
-  // SetSymbol / SetVenueEnabled land with later phases (D2/D3)
+
+  if (type === CMD.SetVenueEnabled) {
+    const def = VENUES[venue];
+    if (!def) return;
+    if (arg === 0) {
+      if (!enabled.has(venue)) return;
+      enabled.delete(venue);
+      stopVenue(venue);
+    } else {
+      if (enabled.has(venue)) return;
+      enabled.add(venue);
+      startVenue(def); // make() returns null when unsupported → stays null
+    }
+    return;
+  }
+
+  if (type === CMD.SetSymbol) {
+    const next = Math.floor(arg);
+    if (next === symbolIndex || next < 0 || next >= SYMBOLS.length) return;
+    symbolIndex = next;
+    for (const v of VENUES) stopVenue(v.index);
+    for (const v of VENUES) if (enabled.has(v.index)) startVenue(v);
+    refreshCandles();
+    return;
+  }
+
+  if (type === CMD.SetCandles) {
+    const minutes = Math.floor(arg);
+    if (minutes <= 0 || minutes === candleInterval) return;
+    candleInterval = minutes;
+    refreshCandles();
+  }
 }
 
 self.onmessage = (e: MessageEvent) => {
   const data = e.data;
   if (data?.kind === "init" && data.sab instanceof SharedArrayBuffer) {
     writer = new WireWriter(data.sab, data.capacity ?? 0);
-    for (const v of VENUES) {
-      const a = v.make(makeDeps(v.id));
-      adapters[v.id] = a;
-      a.start();
-    }
+    for (const v of VENUES) if (enabled.has(v.index)) startVenue(v);
+    refreshCandles();
     setInterval(pollCommands, 100);
   }
 };

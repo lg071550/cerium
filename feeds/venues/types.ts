@@ -8,6 +8,8 @@ export interface BookSink {
   clear(): void;
   applySnapshot(bids: readonly PriceLevel[], asks: readonly PriceLevel[]): void;
   applyUpdates(updates: readonly L2Update[]): void;
+  // Heartbeat/keepalive hook used by several venue adapters; optional no-op.
+  noteActivity?(): void;
 }
 
 export interface AdapterDeps {

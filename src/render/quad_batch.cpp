@@ -1,15 +1,15 @@
 #include "quad_batch.h"
 #include "pipeline.h"
 
-static const char* kQuadWGSL = R"wgsl(
-struct Uniforms { screen: vec2f, scale: f32, pad: f32 };
-@group(0) @binding(0) var<uniform> u: Uniforms;
+#include <string>
 
+// group(0) uniforms + srgb_to_linear come from wgsl_common() (pipeline.h)
+static const char* kQuadWGSL = R"wgsl(
 struct VsIn {
   @builtin(vertex_index) vi: u32,
   @location(0) rect: vec4f,
   @location(1) color: vec4f,
-  @location(2) params: vec4f,
+  @location(2) params: vec4f, // radius, border, softness (shadow), inflate
 };
 struct VsOut {
   @builtin(position) pos: vec4f,
@@ -17,6 +17,8 @@ struct VsOut {
   @location(1) local: vec2f, // physical px within rect
   @location(2) size: vec2f,  // physical px
   @location(3) radius: f32,  // physical px
+  @location(4) border: f32,  // physical px; >0 → hollow outline band
+  @location(5) soft: f32,    // physical px; >0 → soft shadow falloff
 };
 
 @vertex fn vs(in: VsIn) -> VsOut {
@@ -24,15 +26,23 @@ struct VsOut {
     vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
     vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
   let c = corners[in.vi];
-  let px = (in.rect.xy + c * in.rect.zw) * u.scale;
+
+  // geometry inflates by params.w (logical px) so soft shadows have room;
+  // the SDF shape stays the original rect
+  let inflate = in.params.w;
+  let geomXY = in.rect.xy - vec2f(inflate);
+  let geomWH = in.rect.zw + vec2f(inflate * 2.0);
+  let px = (geomXY + c * geomWH) * u.scale;
   let clip = vec2f(px.x / u.screen.x * 2.0 - 1.0, 1.0 - px.y / u.screen.y * 2.0);
 
   var out: VsOut;
   out.pos = vec4f(clip, 0.0, 1.0);
   out.color = in.color;
-  out.local = c * in.rect.zw * u.scale;
+  out.local = c * geomWH * u.scale - vec2f(inflate * u.scale);
   out.size = in.rect.zw * u.scale;
   out.radius = in.params.x * u.scale;
+  out.border = in.params.y * u.scale;
+  out.soft = in.params.z * u.scale;
   return out;
 }
 
@@ -41,71 +51,32 @@ struct VsOut {
   let b = in.size * 0.5 - vec2f(r);
   let q = abs(in.local - in.size * 0.5) - b;
   let d = length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r;
-  let a = clamp(0.5 - d, 0.0, 1.0); // 1px physical AA band
-  return vec4f(in.color.rgb, in.color.a * a);
+
+  var a: f32;
+  if (in.soft > 0.5) {
+    // shadow mode: full coverage inside the shape, smooth falloff decaying
+    // to zero `soft` px OUTSIDE the edge (d > 0 is outside)
+    let t = clamp(1.0 - d / in.soft, 0.0, 1.0);
+    a = t * t * (3.0 - 2.0 * t);
+  } else {
+    a = clamp(0.5 - d, 0.0, 1.0); // 1px physical AA band
+    if (in.border > 0.0) {
+      // hollow: keep only the outer `border`-thick band
+      a -= clamp(0.5 - (d + in.border), 0.0, 1.0);
+    }
+  }
+  let rgb = vec3f(srgb_to_linear(in.color.x), srgb_to_linear(in.color.y),
+                  srgb_to_linear(in.color.z));
+  return vec4f(rgb, in.color.a * a);
 }
 )wgsl";
 
 void QuadBatch::init(WGPUDevice dev, WGPUTextureFormat format,
                      WGPUBindGroupLayout uniformLayout) {
   device = dev;
-  WGPUShaderModule shader = pipeline_shader(dev, kQuadWGSL, "quad");
-
-  WGPUVertexAttribute attrs[3] = {};
-  attrs[0].format = WGPUVertexFormat_Float32x4;
-  attrs[0].offset = 0;
-  attrs[0].shaderLocation = 0;
-  attrs[1].format = WGPUVertexFormat_Float32x4;
-  attrs[1].offset = 16;
-  attrs[1].shaderLocation = 1;
-  attrs[2].format = WGPUVertexFormat_Float32x4;
-  attrs[2].offset = 32;
-  attrs[2].shaderLocation = 2;
-
-  WGPUVertexBufferLayout vb = {};
-  vb.arrayStride = sizeof(QuadInstance);
-  vb.stepMode = WGPUVertexStepMode_Instance;
-  vb.attributeCount = 3;
-  vb.attributes = attrs;
-
-  WGPUBlendState blend = pipeline_blend_state();
-  WGPUColorTargetState colorTarget = {};
-  colorTarget.format = format;
-  colorTarget.blend = &blend;
-  colorTarget.writeMask = WGPUColorWriteMask_All;
-
-  WGPUFragmentState fragment = {};
-  fragment.module = shader;
-  fragment.entryPoint.data = "fs";
-  fragment.entryPoint.length = WGPU_STRLEN;
-  fragment.targetCount = 1;
-  fragment.targets = &colorTarget;
-
-  WGPUPipelineLayoutDescriptor plDesc = {};
-  plDesc.bindGroupLayoutCount = 1;
-  plDesc.bindGroupLayouts = &uniformLayout;
-  WGPUPipelineLayout plLayout = wgpuDeviceCreatePipelineLayout(dev, &plDesc);
-
-  WGPURenderPipelineDescriptor desc = {};
-  desc.layout = plLayout;
-  desc.vertex.module = shader;
-  desc.vertex.entryPoint.data = "vs";
-  desc.vertex.entryPoint.length = WGPU_STRLEN;
-  desc.vertex.bufferCount = 1;
-  desc.vertex.buffers = &vb;
-  desc.fragment = &fragment;
-  desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
-  desc.primitive.stripIndexFormat = WGPUIndexFormat_Undefined;
-  desc.primitive.frontFace = WGPUFrontFace_CCW;
-  desc.primitive.cullMode = WGPUCullMode_None;
-  desc.multisample.count = 1;
-  desc.multisample.mask = 0xFFFFFFFF;
-  desc.multisample.alphaToCoverageEnabled = false;
-
-  pipeline = wgpuDeviceCreateRenderPipeline(dev, &desc);
-
-  wgpuPipelineLayoutRelease(plLayout);
-  wgpuShaderModuleRelease(shader);
+  std::string src = std::string(wgsl_common()) + kQuadWGSL;
+  pipeline = pipeline_instanced(dev, format, src.c_str(), "quad", sizeof(QuadInstance),
+                                &uniformLayout, 1);
 }
 
 void QuadBatch::upload(WGPUQueue queue, const QuadInstance* data, uint32_t count) {
@@ -121,9 +92,16 @@ void QuadBatch::upload(WGPUQueue queue, const QuadInstance* data, uint32_t count
   wgpuQueueWriteBuffer(queue, instances, 0, data, sizeof(QuadInstance) * count);
 }
 
-void QuadBatch::draw(WGPURenderPassEncoder pass, uint32_t first, uint32_t count) const {
+void QuadBatch::draw(WGPURenderPassEncoder pass, uint32_t first, uint32_t count,
+                     WGPURenderPipeline& lastPipe, WGPUBuffer& lastVB) const {
   if (count == 0) return;
-  wgpuRenderPassEncoderSetPipeline(pass, pipeline);
-  wgpuRenderPassEncoderSetVertexBuffer(pass, 0, instances, 0, WGPU_WHOLE_SIZE);
+  if (pipeline != lastPipe) {
+    wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+    lastPipe = pipeline;
+  }
+  if (instances != lastVB) {
+    wgpuRenderPassEncoderSetVertexBuffer(pass, 0, instances, 0, WGPU_WHOLE_SIZE);
+    lastVB = instances;
+  }
   wgpuRenderPassEncoderDraw(pass, 6, count, 0, first);
 }

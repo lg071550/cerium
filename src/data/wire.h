@@ -32,6 +32,7 @@ enum Cmd : uint32_t {
   CmdResyncVenue = 1,
   CmdSetSymbol = 2,
   CmdSetVenueEnabled = 3,
+  CmdSetCandles = 4, // arg = interval minutes
 };
 
 struct Event {

@@ -49,6 +49,7 @@ export const CMD = {
   ResyncVenue: 1,
   SetSymbol: 2,
   SetVenueEnabled: 3,
+  SetCandles: 4, // arg = interval minutes
 } as const;
 
 const HEADER = 64;

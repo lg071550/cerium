@@ -22,5 +22,6 @@ struct TextBatch {
             WGPUTextureView atlasView, WGPUSampler atlasSampler);
   void setAtlas(WGPUTextureView view, WGPUSampler sampler); // after atlas rebake
   void upload(WGPUQueue queue, const GlyphInstance* data, uint32_t count);
-  void draw(WGPURenderPassEncoder pass, uint32_t first, uint32_t count) const;
+  void draw(WGPURenderPassEncoder pass, uint32_t first, uint32_t count,
+            WGPURenderPipeline& lastPipe, WGPUBuffer& lastVB) const;
 };

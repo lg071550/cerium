@@ -18,3 +18,14 @@ void shell_storage_set(const char* key, const char* value);
 // Sets the OS cursor over the canvas ("default", "pointer", "col-resize",
 // "row-resize", "grabbing", ...). Cheap to call every frame — no-ops on repeat.
 void shell_set_cursor(const char* cursor);
+
+// Replaces the boot splash text with an error message (fatal init failures).
+void shell_boot_error(const char* msg);
+
+// Hidden-DOM-input text editing bridge (IME-compatible). One shared input is
+// positioned over the focused field; we render text/caret ourselves in WASM.
+void shell_ime_focus(float x, float y, float w, float h); // logical px
+void shell_ime_blur();
+int shell_ime_get(char* buf, int cap); // current value → buf, returns byte length
+void shell_ime_set(const char* value);
+int shell_ime_caret(); // selectionStart (byte index)

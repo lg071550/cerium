@@ -14,15 +14,13 @@ import {
   type FuturesSyncState,
 } from "./binanceSync";
 
-const WS_URL = "wss://fstream.binance.com/ws/ethusdt@depth@100ms";
-const TRADE_WS_URL = "wss://fstream.binance.com/ws/ethusdt@trade";
-const REST_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=ETHUSDT&limit=1000";
-
 export class BinancePerpAdapter implements VenueAdapter {
   readonly id = "binance-perp";
-  readonly symbol = "ETHUSDT-PERP";
+  readonly symbol: string;
 
   private readonly deps: AdapterDeps;
+  private readonly wsUrl: string;
+  private readonly restUrl: string;
   private ws: WebSocket | null = null;
   private state: FuturesSyncState = { updateId: 0, mode: "buffering" };
   private buffer: FuturesDepthEvent[] = [];
@@ -30,14 +28,18 @@ export class BinancePerpAdapter implements VenueAdapter {
   private readonly conn: Reconnect;
   private readonly tape: AggTradeSocket;
 
-  constructor(deps: AdapterDeps) {
+  constructor(deps: AdapterDeps, inst = "ETHUSDT") {
     this.deps = deps;
+    this.symbol = `${inst}-PERP`;
+    const lower = inst.toLowerCase();
+    this.wsUrl = `wss://fstream.binance.com/ws/${lower}@depth@100ms`;
+    this.restUrl = `https://fapi.binance.com/fapi/v1/depth?symbol=${inst}&limit=1000`;
     this.conn = new Reconnect(
       deps.setState,
       () => this.open(),
       () => this.teardown(),
     );
-    this.tape = new AggTradeSocket(TRADE_WS_URL, deps.onTrade);
+    this.tape = new AggTradeSocket(`wss://fstream.binance.com/ws/${lower}@trade`, deps.onTrade);
   }
 
   start(): void {
@@ -55,7 +57,7 @@ export class BinancePerpAdapter implements VenueAdapter {
     this.deps.setState("connecting");
     this.state = { updateId: 0, mode: "buffering" };
     this.buffer = [];
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
     ws.onopen = () => {
       this.deps.setState("syncing");
@@ -128,7 +130,7 @@ export class BinancePerpAdapter implements VenueAdapter {
 
     let snap: FuturesSnapshot;
     try {
-      const res = await fetch(REST_URL, { signal: abort.signal });
+      const res = await fetch(this.restUrl, { signal: abort.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = parseSnapshotResponse(await res.json());
       if (!data) throw new Error("malformed snapshot");

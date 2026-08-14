@@ -12,12 +12,25 @@ struct GpuContext {
   WGPUDevice device = nullptr;
   WGPUQueue queue = nullptr;
   WGPUTextureFormat surfaceFormat = WGPUTextureFormat_Undefined;
+  // Format each frame is rendered into: the sRGB sibling of surfaceFormat for
+  // 8-bit unorm surfaces (so alpha blend composites in linear light), else
+  // equal to surfaceFormat. The frame view and all batch pipelines use this.
+  WGPUTextureFormat renderFormat = WGPUTextureFormat_Undefined;
   int width = 0, height = 0; // physical px currently configured
   bool ready = false;        // device acquired + surface capabilities known
 };
 
 // Creates instance+surface and kicks off async adapter/device acquisition.
 void gpu_begin_init(GpuContext& g, const char* canvasSelector);
+
+// Fatal-error channel (boot failures: no adapter/device, font load, ...).
+// Default is a no-op beyond stderr diagnostics; the host app installs a
+// handler (e.g. splash-screen message) at startup.
+using GpuErrorFn = void (*)(const char* msg);
+void gpu_set_error_handler(GpuErrorFn fn);
+// Reports a fatal error to the installed handler (+ stderr). Shared by the
+// gpu and render layers of the library.
+void gpu_report_error(const char* msg);
 
 // Call every frame. Returns true once device+queue+surface format are available.
 bool gpu_poll(GpuContext& g);
