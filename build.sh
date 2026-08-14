@@ -53,15 +53,16 @@ fi
 "$ESBUILD" feeds/main.ts --bundle --format=esm --target=es2020 \
   --outfile=build/feeds.worker.js --log-level=warning --minify
 
-SOURCES=$(find src -name '*.cpp' | sort)
+# app sources + the lanthanum renderer submodule (third_party/lanthanum/src)
+SOURCES=$(find src third_party/lanthanum/src -name '*.cpp' | sort)
 
 # shellcheck disable=SC2086
 em++ -std=c++20 $OPT -fno-exceptions -fno-rtti \
   -Wall -Wextra -Wno-unused-parameter \
-  -Ithird_party \
+  -Ithird_party -Ithird_party/lanthanum/src \
   --use-port=emdawnwebgpu \
   -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web \
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_cerium_on_candles \
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_cerium_on_candles,_cerium_perf \
   --embed-file assets@/assets \
   $SOURCES \
   -o build/cerium.js

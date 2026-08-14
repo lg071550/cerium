@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../render/color.h"
+#include "render/color.h"
 
 // Tokyo Night–flavored dark theme. Depth model: raised cards are lighter with
 // soft shadows; recessed zones (tab strips, inputs) are darker. No outlines —
@@ -14,6 +14,7 @@ struct Theme {
 
   Color text = hexColor(0xc0caf5);
   Color textDim = hexColor(0x565f89);
+  Color textShadow = hexColor(0x0d0e14, 0.55f); // soft drop shadow behind key text
 
   Color accent = hexColor(0x7aa2f7);
   Color accentSoft = hexColor(0x7aa2f7, 0.22f);

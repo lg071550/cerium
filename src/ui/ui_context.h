@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../platform/input.h"
-#include "../render/draw_list.h"
+#include "render/draw_list.h"
 
 #include <cstdint>
 #include <vector>

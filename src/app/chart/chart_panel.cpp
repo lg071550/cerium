@@ -162,16 +162,51 @@ static uint64_t candleSig(const CandleSeries& cs) {
   return h;
 }
 
+// shape signature = everything except the live candle's mutating fields: a
+// change here means history was appended or replaced (klines load, interval or
+// symbol switch) and indicators need a full recompute. A change of candleSig
+// with an unchanged shape is just the live candle ticking.
+static uint64_t shapeSig(const CandleSeries& cs) {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint64_t x) {
+    h ^= x;
+    h *= 1099511628211ull;
+  };
+  mix(cs.v.size());
+  mix((uint64_t)cs.intervalMin);
+  mix((uint64_t)(cs.sym + 1));
+  if (!cs.v.empty()) {
+    uint64_t u;
+    std::memcpy(&u, &cs.v.back().ts, 8);
+    mix(u);
+  }
+  return h;
+}
+
 void ChartPanel::ensureComputed(const CandleSeries& cs) {
-  uint64_t sig = candleSig(cs);
-  if (sig == m_computedSig) return;
-  m_computedSig = sig;
+  uint64_t data = candleSig(cs);
+  if (data == m_computedSig && m_calcToggles == m_calcGen) return;
+
+  // fast path: the live candle mutated in place — rewrite only out[n-1]
+  if (data != m_computedSig && shapeSig(cs) == m_shapeSig &&
+      m_calcToggles == m_calcGen && updateLastBar(cs)) {
+    m_computedSig = data;
+    return;
+  }
+  computeAll(cs);
+  m_computedSig = data;
+  m_shapeSig = shapeSig(cs);
+  m_calcToggles = m_calcGen;
+}
+
+void ChartPanel::computeAll(const CandleSeries& cs) {
   int regN = indicatorCount();
   m_cache.resize((size_t)regN);
   for (int i = 0; i < regN; ++i)
     if (m_enabled[(size_t)i]) kRegistry[i].compute(cs, m_cache[(size_t)i]);
 
   // MACD signal line: EMA9 over the cached MACD series
+  const size_t n = cs.v.size();
   m_macdSignal.clear();
   if (m_enabled[IndMacd] && !m_cache[IndMacd].empty()) {
     const std::vector<float>& macd = m_cache[IndMacd];
@@ -185,6 +220,110 @@ void ChartPanel::ensureComputed(const CandleSeries& cs) {
       if (++valid >= 9) m_macdSignal[i] = (float)ema;
     }
   }
+
+  // capture O(1) tail state (through n-2) so live ticks can skip this pass —
+  // full computes are rare (load/append/interval/symbol/toggle)
+  m_liveState = n >= 2;
+  if (m_enabled[IndCvd]) {
+    if (m_cache[IndCvd].size() == n) m_cvdAcc = (double)m_cache[IndCvd][n - 2];
+    else m_liveState = false;
+  }
+  if (m_enabled[IndRsi]) {
+    if (n >= 16) { // Wilder recursion through n-2
+      double gain = 0, loss = 0;
+      for (size_t i = 1; i <= n - 2; ++i) {
+        double d = cs.v[i].c - cs.v[i - 1].c;
+        if (i <= 14) {
+          if (d > 0) gain += d;
+          else loss -= d;
+          if (i == 14) {
+            gain /= 14;
+            loss /= 14;
+          }
+        } else {
+          gain = (gain * 13 + (d > 0 ? d : 0)) / 14;
+          loss = (loss * 13 + (d < 0 ? -d : 0)) / 14;
+        }
+      }
+      m_rsiGain = gain;
+      m_rsiLoss = loss;
+    } else m_liveState = false;
+  }
+  if (m_enabled[IndMacd]) {
+    if (n >= 27 && m_cache[IndMacd].size() == n && m_macdSignal.size() == n) {
+      double e12 = cs.v[0].c, e26 = cs.v[0].c;
+      for (size_t i = 1; i <= n - 2; ++i) {
+        e12 += (cs.v[i].c - e12) * (2.0 / 13);
+        e26 += (cs.v[i].c - e26) * (2.0 / 27);
+      }
+      m_e12 = e12;
+      m_e26 = e26;
+      double ema = 0;
+      int valid = 0;
+      for (size_t i = 0; i <= n - 2; ++i) {
+        if (std::isnan(m_cache[IndMacd][i])) continue;
+        ema = valid == 0 ? m_cache[IndMacd][i]
+                         : ema + (m_cache[IndMacd][i] - ema) * (2.0 / 10);
+        ++valid;
+      }
+      m_sigEma = ema;
+      m_sigValid = valid;
+    } else m_liveState = false;
+  }
+}
+
+// Live-candle tick: rewrite only the last element of each enabled series.
+// Returns false (cache untouched-but-for-partial-writes is fine — the caller
+// falls back to computeAll) when any required state is missing.
+bool ChartPanel::updateLastBar(const CandleSeries& cs) {
+  const size_t n = cs.v.size();
+  if (n < 2 || !m_liveState || m_cache.empty()) return false;
+  const Candle& c = cs.v[n - 1];
+  const double d = c.c - cs.v[n - 2].c;
+  auto sized = [&](int ri) { return m_cache[(size_t)ri].size() == n; };
+
+  if (m_enabled[IndVol]) {
+    if (!sized(IndVol)) return false;
+    m_cache[IndVol][n - 1] = (float)c.vol;
+  }
+  if (m_enabled[IndCvd]) {
+    if (!sized(IndCvd)) return false;
+    m_cache[IndCvd][n - 1] = (float)(m_cvdAcc + c.delta);
+  }
+  if (m_enabled[IndEma]) {
+    if (!sized(IndEma) || n < 22 || std::isnan(m_cache[IndEma][n - 2])) return false;
+    double e = m_cache[IndEma][n - 2];
+    m_cache[IndEma][n - 1] = (float)(e + (c.c - e) * (2.0 / 22));
+  }
+  if (m_enabled[IndSma]) {
+    if (!sized(IndSma) || n < 50) return false;
+    double sum = 0;
+    for (size_t i = n - 50; i < n; ++i) sum += cs.v[i].c;
+    m_cache[IndSma][n - 1] = (float)(sum / 50);
+  }
+  if (m_enabled[IndBoll]) {
+    if (!sized(IndBoll) || n < 20) return false;
+    double sum = 0;
+    for (size_t i = n - 20; i < n; ++i) sum += cs.v[i].c;
+    m_cache[IndBoll][n - 1] = (float)(sum / 20);
+  }
+  if (m_enabled[IndRsi]) {
+    if (!sized(IndRsi)) return false;
+    double g = (m_rsiGain * 13 + (d > 0 ? d : 0)) / 14;
+    double l = (m_rsiLoss * 13 + (d < 0 ? -d : 0)) / 14;
+    m_cache[IndRsi][n - 1] =
+        l == 0 ? 100.0f : (float)(100.0 - 100.0 / (1.0 + g / l));
+  }
+  if (m_enabled[IndMacd]) {
+    if (!sized(IndMacd) || m_macdSignal.size() != n) return false;
+    double e12 = m_e12 + (c.c - m_e12) * (2.0 / 13);
+    double e26 = m_e26 + (c.c - m_e26) * (2.0 / 27);
+    double macdNow = e12 - e26;
+    m_cache[IndMacd][n - 1] = (float)macdNow;
+    double se = m_sigValid == 0 ? macdNow : m_sigEma + (macdNow - m_sigEma) * (2.0 / 10);
+    if (m_sigValid + 1 >= 9) m_macdSignal[n - 1] = (float)se;
+  }
+  return true;
 }
 
 // latest non-NaN value of a cached series
@@ -238,13 +377,16 @@ static void drawSeries(DrawList& d, const ChartPane& pane, const std::vector<flo
 static void drawCornerTag(DrawList& d, const ChartPane& pane, const char* name,
                           float value, ChartFmt fmt) {
   Rect r{pane.area.x + 6, pane.area.y + 3, pane.area.w - 12, 14};
-  d.textAligned(r, name, theme().textDim, DrawList::Left);
+  // pane label in SemiBold with a soft shadow so it reads over the series
+  d.setFont(FontMonoSemibold);
+  d.textAligned(r, name, theme().textDim, DrawList::Left, 0, true);
+  float nw = d.measure(name);
+  d.setFont(FontMono);
   if (std::isnan(value)) return;
   char vb[24];
   fmt(vb, sizeof(vb), value);
-  float nw = d.measure(name);
   d.textAligned({r.x + nw + 10, r.y, r.w - nw - 10, r.h}, vb, theme().text,
-                DrawList::Left);
+                DrawList::Left, 0, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -268,8 +410,10 @@ void ChartPanel::draw(
   // header: symbol bright, venue/interval dim (segmented, no separator glyphs)
   char sym[16];
   snprintf(sym, sizeof(sym), "%sUSDT", kSyms[feeds.symbol]);
-  u.draw.textAligned({r.x, r.y, r.w, 26}, sym, t.text, DrawList::Left, 12);
+  u.draw.setFont(FontMonoSemibold);
+  u.draw.textAligned({r.x, r.y, r.w, 26}, sym, t.text, DrawList::Left, 12, true);
   float symW = u.draw.measure(sym);
+  u.draw.setFont(FontMono);
   char sub[32];
   snprintf(sub, sizeof(sub), "Binance Perp  %dm", cs.intervalMin);
   u.draw.textAligned({r.x + 12 + symW + 12, r.y, r.w - symW - 36, 26}, sub, t.textDim,
@@ -290,7 +434,8 @@ void ChartPanel::draw(
                kRegistry[i].name);
       items.push_back({label, [this, i] {
         m_enabled[(size_t)i] = !m_enabled[(size_t)i];
-        ++m_rngGen; // pane set changed: visible ranges are stale
+        ++m_rngGen;   // pane set changed: visible ranges are stale
+        ++m_calcGen;  // indicator set changed: series need a recompute
       }});
     }
     openMenu(u.input.mouseX, u.input.mouseY, std::move(items));
@@ -423,8 +568,12 @@ void ChartPanel::draw(
   bool cross = price.area.contains(u.input.mouseX, u.input.mouseY);
   float crossTagY = cross ? u.input.mouseY : -1e9f;
 
-  // recessed indicator pane backgrounds (tone only — no borders)
-  for (int p = 0; p < nPanes; ++p) u.draw.rect(ind[p].area, t.chartPaneBg, 4.0f);
+  // recessed indicator pane backgrounds + 1px card border (one hollow quad
+  // each — same cmd, no extra draw call or per-frame allocation)
+  for (int p = 0; p < nPanes; ++p) {
+    u.draw.rect(ind[p].area, t.chartPaneBg, 4.0f);
+    u.draw.rectOutline(ind[p].area, t.border, 1.0f, 4.0f);
+  }
 
   // price grid: nice ticks, horizontal lines confined to the price pane
   {
@@ -508,14 +657,14 @@ void ChartPanel::draw(
       drawSeries(u.draw, price, m_cache[(size_t)i], vis0, vis1, startIdx, bw, c);
       float v = lastValid(m_cache[(size_t)i]);
       u.draw.textAligned({price.area.x + 6, legendY, price.area.w - 12, 14},
-                         kRegistry[i].name, c, DrawList::Left);
+                         kRegistry[i].name, c, DrawList::Left, 0, true);
       if (!std::isnan(v)) {
         char vb[24];
         chartFmtPrice(vb, sizeof(vb), v);
         float nw = u.draw.measure(kRegistry[i].name);
         u.draw.textAligned(
             {price.area.x + 6 + nw + 10, legendY, price.area.w - nw - 28, 14}, vb,
-            t.text, DrawList::Left);
+            t.text, DrawList::Left, 0, true);
       }
       legendY += 16;
     }

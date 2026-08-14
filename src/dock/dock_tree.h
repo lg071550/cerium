@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../render/draw_list.h"
+#include "render/draw_list.h"
 
 #include <memory>
 #include <utility>

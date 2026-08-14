@@ -4,7 +4,7 @@
 #include "../data/merge.h"
 #include "../dock/dock_drag.h"
 #include "../dock/dock_tree.h"
-#include "../render/renderer.h"
+#include "render/renderer.h"
 #include "../ui/ui_context.h"
 #include "../ui/widgets.h"
 #include "chart/chart_panel.h"
@@ -29,6 +29,9 @@ struct Terminal {
 
   void init(Renderer* renderer);
   void frame(const Input& input, float dt, float cssW, float cssH);
+
+  // perf: merged orderbook ladder size (diagnostics readout)
+  int debugLadderLevels() const { return (int)m_ladder.size(); }
 
 private:
   std::vector<PanelDef> m_panels;
@@ -71,7 +74,8 @@ private:
   struct ObLevel {
     double price, size, cum;
     bool ask;
-    char priceLbl[24] = {}, sizeLbl[24] = {}; // formatted once at ladder build time
+    char priceLbl[24] = {}, sizeLbl[24] = {}; // formatted lazily, visible rows only
+    double fmtP = -1.0, fmtS = -1.0;          // price/size as of last format
   };
   std::vector<ObLevel> m_ladder;      // descending price; cum from mid outward
   int m_ladderMid = 0;                // index of first bid in the ladder

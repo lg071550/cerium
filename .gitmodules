@@ -1,0 +1,3 @@
+[submodule "third_party/lanthanum"]
+	path = third_party/lanthanum
+	url = https://github.com/lg071550/lanthanum

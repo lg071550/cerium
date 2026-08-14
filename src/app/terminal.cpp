@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <ctime>
 
+// 1s rolling frame-cost window maintained by main.cpp (index → metric)
+extern "C" double cerium_perf(int i);
+
 static const char* kLayoutKey = "cerium.layout.v1";
 
 // canonical symbols — index matches feeds/registry.ts SYMBOLS
@@ -65,6 +68,7 @@ int Terminal::panelId(const char* title) const {
 void Terminal::init(Renderer* renderer) {
   m_renderer = renderer;
   ui.init(renderer->atlas());
+  ui.draw.setTextShadowColor(theme().textShadow);
 
   addPanel("Chart", [this](Ui& u, Rect r) { drawChart(u, r); });
   addPanel("Orderbook", [this](Ui& u, Rect r) { drawOrderbook(u, r); });
@@ -242,15 +246,17 @@ void Terminal::drawTopBar(float w) {
   }
   ui.tip(ui.id("symcyc"), symBtn, "switch symbol (ETH / BTC / SOL)");
 
-  char stats[64];
+  char stats[96];
   if (m_showStats && m_renderer) {
     const Renderer::Stats& st = m_renderer->stats();
     char q[12], g[12], l[12];
     fmtCount(q, sizeof(q), st.quads);
     fmtCount(g, sizeof(g), st.glyphs);
     fmtCount(l, sizeof(l), st.lines);
-    snprintf(stats, sizeof(stats), "%d dc · %s q · %s g · %s l",
-             st.drawCalls, q, g, l);
+    // 1s rolling frame-cost split (main.cpp) — feed drain / ui build / gpu submit
+    snprintf(stats, sizeof(stats),
+             "%d dc · %s q · %s g · %s l · %.1f/%.1f/%.1f ms", st.drawCalls, q, g,
+             l, cerium_perf(0), cerium_perf(1), cerium_perf(2));
   } else if (themeScale() != 1.0f)
     snprintf(stats, sizeof(stats), "%.0f fps · ui %.0f%%", (double)m_fps,
              (double)(themeScale() * 100.0f));
@@ -657,10 +663,18 @@ void Terminal::drawOrderbook(Ui& u, Rect r) {
       bidSides.push_back(&feeds.venues[i].book.bids);
     }
     static thread_local std::vector<MergedLevel> asks, bids;
+    // cap each side at the levels nearest mid — the ladder only ever shows a
+    // screenful around mid (plus scroll), and 27 full-depth books otherwise
+    // merge tens of thousands of levels every frame
+    static constexpr size_t kMaxLadderSide = 1500;
     mergeSideWindow(askSides.data(), askSides.size(), mid, mid * 1.15, m_obBin, true,
-                    asks);
+                    asks, kMaxLadderSide);
     mergeSideWindow(bidSides.data(), bidSides.size(), mid * 0.85, mid, m_obBin, false,
-                    bids);
+                    bids, kMaxLadderSide);
+    // cap the MERGED ladder too: 27 venues × 1500 input levels can still fuse
+    // into ~10k+ distinct prices; both vectors are sorted nearest-mid-first
+    if (asks.size() > kMaxLadderSide) asks.resize(kMaxLadderSide);
+    if (bids.size() > kMaxLadderSide) bids.resize(kMaxLadderSide);
 
     m_ladder.clear();
     m_ladderMid = (int)asks.size();
@@ -680,11 +694,8 @@ void Terminal::drawOrderbook(Ui& u, Rect r) {
       cum += b.size;
       m_ladder.push_back({b.price, b.size, cum, false, {}, {}});
     }
-    // row labels are stable for the life of the ladder — format once here
-    for (auto& L : m_ladder) {
-      snprintf(L.priceLbl, sizeof(L.priceLbl), "%.2f", L.price);
-      snprintf(L.sizeLbl, sizeof(L.sizeLbl), "%.3f", L.size);
-    }
+    // row labels are formatted lazily in the draw loop — only visible rows
+    // ever need them, which keeps snprintf off the rebuild path
   }
 
   const float rowH = 18.0f;
@@ -713,7 +724,15 @@ void Terminal::drawOrderbook(Ui& u, Rect r) {
       y += rowH;
       if (y + rowH > area.y + area.h) break;
     }
-    const ObLevel& L = m_ladder[(size_t)i];
+    ObLevel& L = m_ladder[(size_t)i];
+    if (L.fmtP != L.price) { // label caches survive price-stable frames
+      snprintf(L.priceLbl, sizeof(L.priceLbl), "%.2f", L.price);
+      L.fmtP = L.price;
+    }
+    if (L.fmtS != L.size) {
+      snprintf(L.sizeLbl, sizeof(L.sizeLbl), "%.3f", L.size);
+      L.fmtS = L.size;
+    }
     Color c = L.ask ? t.red : t.green;
     float bw = (float)(L.cum / maxCum) * (area.w * 0.45f);
     u.draw.rect({area.x + area.w - bw, y + 2, bw, rowH - 4}, withAlpha(c, 0.15f));
