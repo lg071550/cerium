@@ -68,6 +68,11 @@ static void frame() {
     // a missing file simply degrades to face 0 at draw time
     g_renderer.atlas()->addFace("/assets/fonts/IBMPlexMono-SemiBold.ttf");
     g_renderer.setClearColor(theme().bg.r, theme().bg.g, theme().bg.b);
+    // software-adapter fast path (Renderer::Mode::Auto): pair the renderer's
+    // raw-view/blend mode with the matching DrawList quality so SwiftShader
+    // sessions get the reduced-coverage path too (hardware stays Full)
+    g_terminal.ui.draw.setQuality(g_renderer.fastPath() ? DrawList::Quality::Fast
+                                                        : DrawList::Quality::Full);
     g_termInited = true;
   }
 
