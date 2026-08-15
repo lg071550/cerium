@@ -44,6 +44,11 @@ fi
 
 mkdir -p build
 
+# venue index contract: feeds/registry.ts VENUES must exactly equal kVenues in
+# src/data/feeds.cpp (ids, order, labels, shorts, class flags). Fails hard
+# before any compilation on drift.
+node tools/check-venues.mjs
+
 # feeds worker bundle (TS → JS)
 ESBUILD="$ROOT/tools/esbuild/esbuild.exe"
 if [[ ! -x "$ESBUILD" ]]; then

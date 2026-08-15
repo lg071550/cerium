@@ -1,15 +1,12 @@
 #include "terminal.h"
 
-#include "../data/merge.h"
 #include "../dock/dock_layout.h"
 #include "../platform/shell.h"
 #include "../ui/theme.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <ctime>
 
 // 1s rolling frame-cost window maintained by main.cpp (index → metric)
 extern "C" double cerium_perf(int i);
@@ -19,37 +16,11 @@ static const char* kLayoutKey = "cerium.layout.v1";
 // canonical symbols — index matches feeds/registry.ts SYMBOLS
 static const char* kSyms[] = {"ETH", "BTC", "SOL"};
 
-// deterministic pseudo-random per (i, tick) — drives the fake market data
-static float frand(uint32_t i, uint32_t tick) {
-  uint32_t h = i * 2654435761u ^ tick * 2246822519u;
-  h ^= h >> 13;
-  h *= 3266489917u;
-  h ^= h >> 16;
-  return (float)(h & 0xffff) / 65535.0f;
-}
-
 // compact count for the stats readout: 950 → "950", 3200 → "3.2k", 41000 → "41k"
 static void fmtCount(char* out, size_t n, int v) {
   if (v >= 10000) snprintf(out, n, "%dk", v / 1000);
   else if (v >= 1000) snprintf(out, n, "%.1fk", v / 1000.0);
   else snprintf(out, n, "%d", v);
-}
-
-// cached "HH:MM:SS" for a second-resolution timestamp — tape rows re-render
-// the same entries every frame; the cache keeps localtime_r + snprintf off
-// that path. Direct-mapped and bounded (64 slots).
-const char* Terminal::timeLabel(int64_t secs) {
-  TimeLabels::Slot& s =
-      m_timeLabels.slots[(size_t)(((uint64_t)secs * 0x9E3779B97F4A7C15ull) >> 58)];
-  if (s.key != secs + 1) {
-    time_t t = (time_t)secs;
-    struct tm tmv;
-    localtime_r(&t, &tmv);
-    s.key = secs + 1;
-    snprintf(s.text, sizeof(s.text), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min,
-             tmv.tm_sec);
-  }
-  return s.text;
 }
 
 int Terminal::addPanel(const char* title, std::function<void(Ui&, Rect)> fn) {
@@ -71,10 +42,12 @@ void Terminal::init(Renderer* renderer) {
   ui.draw.setTextShadowColor(theme().textShadow);
 
   addPanel("Chart", [this](Ui& u, Rect r) { drawChart(u, r); });
-  addPanel("Orderbook", [this](Ui& u, Rect r) { drawOrderbook(u, r); });
-  addPanel("Tape", [this](Ui& u, Rect r) { drawTape(u, r); });
-  addPanel("Watchlist", [this](Ui& u, Rect r) { drawWatchlist(u, r); });
-  addPanel("Feeds", [this](Ui& u, Rect r) { drawFeeds(u, r); });
+  addPanel("Orderbook",
+           [this](Ui& u, Rect r) { drawOrderbook(u, r, m_orderbook, feeds); });
+  addPanel("Tape", [this](Ui& u, Rect r) { drawTape(u, r, m_tape, feeds); });
+  addPanel("Watchlist", [](Ui& u, Rect r) { drawWatchlist(u, r); });
+  addPanel("Feeds",
+           [this](Ui& u, Rect r) { drawFeeds(u, r, m_feedsPanel, feeds); });
 
   buildDefaultLayout();
   feeds.init();
@@ -571,7 +544,7 @@ void Terminal::drawSymbolPicker() {
 }
 
 // ---------------------------------------------------------------------------
-// demo panels (stand-ins for the real widgets)
+// chart panel hookup (panel draw lives in chart/chart_panel.cpp)
 // ---------------------------------------------------------------------------
 
 void Terminal::drawChart(Ui& u, Rect r) {
@@ -583,261 +556,4 @@ void Terminal::drawChart(Ui& u, Rect r) {
                    menu.push_back({std::move(it.label), std::move(it.action)});
                  openMenu(x, y, std::move(menu), m_winW, m_winH);
                });
-}
-static const char* statusText(uint8_t s) {
-  switch (s) {
-    case wire::Connecting: return "connecting";
-    case wire::Syncing: return "syncing";
-    case wire::Live: return "live";
-    case wire::Reconnecting: return "reconnecting";
-    case wire::Error: return "error";
-    default: return "offline";
-  }
-}
-
-static Color statusColor(uint8_t s, const Theme& t) {
-  switch (s) {
-    case wire::Live: return t.green;
-    case wire::Connecting:
-    case wire::Syncing: return t.accent;
-    case wire::Reconnecting:
-    case wire::Error: return t.red;
-    default: return t.textDim;
-  }
-}
-
-void Terminal::drawOrderbook(Ui& u, Rect r) {
-  const Theme& t = theme();
-
-  // header: Price | Size — cumulative is the translucent bar behind each row
-  Rect header{r.x, r.y, r.w, 20};
-  u.draw.textAligned(header, "Price (USDT)", t.textDim, DrawList::Left, 10);
-  u.draw.textAligned(header, "Size", t.textDim, DrawList::Right, 10);
-
-  // control row: class filter chips + bin selector + recenter
-  float cx = r.x + 8;
-  float cy = r.y + 22;
-  if (chip(u, {cx, cy, 48, 18}, "spot", m_obMask & ClassSpot)) m_obMask ^= ClassSpot;
-  cx += 52;
-  if (chip(u, {cx, cy, 48, 18}, "perp", m_obMask & ClassPerp)) m_obMask ^= ClassPerp;
-  cx += 52;
-  if (chip(u, {cx, cy, 48, 18}, "dex", m_obMask & ClassDex)) m_obMask ^= ClassDex;
-  cx += 58;
-  static const double kBins[] = {0, 0.5, 1, 2.5, 5, 10};
-  static const char* kBinLabels[] = {"raw", "0.5", "1", "2.5", "5", "10"};
-  char binLabel[24];
-  snprintf(binLabel, sizeof(binLabel), "bin %s", kBinLabels[m_obBinSel]);
-  if (chip(u, {cx, cy, 64, 18}, binLabel, m_obBin > 0)) {
-    m_obBinSel = (m_obBinSel + 1) % 6;
-    m_obBin = kBins[m_obBinSel];
-  }
-  cx += 70;
-  if (m_obScroll != 0 && chip(u, {cx, cy, 58, 18}, "recenter", false)) m_obScroll = 0;
-
-  // live venue count at the right end of the control row
-  char live[24];
-  snprintf(live, sizeof(live), "%d live", feeds.liveCount());
-  u.draw.textAligned({r.x, cy, r.w, 18}, live,
-                     feeds.liveCount() > 0 ? t.green : t.textDim, DrawList::Right, 10);
-
-  Rect area{r.x, r.y + 44, r.w, r.h - 44};
-  double mid = feeds.aggMid();
-  if (mid <= 0) {
-    u.draw.textAligned(area, "syncing…", t.textDim, DrawList::Center);
-    return;
-  }
-
-  // rebuild the ladder only when version/filter/bin changed
-  uint64_t ver = feeds.booksVersion();
-  if (ver != m_mergeVersion || m_obMask != m_mergeMask || m_obBin != m_mergeBin) {
-    m_mergeVersion = ver;
-    m_mergeMask = m_obMask;
-    m_mergeBin = m_obBin;
-
-    bool healthy[64];
-    feeds.collectHealthy(50.0, healthy);
-    std::vector<const BookSide*> askSides, bidSides;
-    for (size_t i = 0; i < feeds.venues.size(); ++i) {
-      if (!healthy[i] || !(feeds.venues[i].cls & m_obMask)) continue;
-      askSides.push_back(&feeds.venues[i].book.asks);
-      bidSides.push_back(&feeds.venues[i].book.bids);
-    }
-    static thread_local std::vector<MergedLevel> asks, bids;
-    // cap each side at the levels nearest mid — the ladder only ever shows a
-    // screenful around mid (plus scroll), and 27 full-depth books otherwise
-    // merge tens of thousands of levels every frame
-    static constexpr size_t kMaxLadderSide = 1500;
-    mergeSideWindow(askSides.data(), askSides.size(), mid, mid * 1.15, m_obBin, true,
-                    asks, kMaxLadderSide);
-    mergeSideWindow(bidSides.data(), bidSides.size(), mid * 0.85, mid, m_obBin, false,
-                    bids, kMaxLadderSide);
-    // cap the MERGED ladder too: 27 venues × 1500 input levels can still fuse
-    // into ~10k+ distinct prices; both vectors are sorted nearest-mid-first
-    if (asks.size() > kMaxLadderSide) asks.resize(kMaxLadderSide);
-    if (bids.size() > kMaxLadderSide) bids.resize(kMaxLadderSide);
-
-    m_ladder.clear();
-    m_ladderMid = (int)asks.size();
-    m_ladder.reserve(asks.size() + bids.size());
-    double cum = 0;
-    static thread_local std::vector<double> askCum;
-    askCum.clear();
-    for (auto& a : asks) { // asks ascend from best: cum accumulates from mid outward
-      cum += a.size;
-      askCum.push_back(cum);
-    }
-    for (int i = (int)asks.size() - 1; i >= 0; --i) // desc: deepest ask first
-      m_ladder.push_back({asks[(size_t)i].price, asks[(size_t)i].size,
-                          askCum[(size_t)i], true, {}, {}});
-    cum = 0;
-    for (auto& b : bids) {
-      cum += b.size;
-      m_ladder.push_back({b.price, b.size, cum, false, {}, {}});
-    }
-    // row labels are formatted lazily in the draw loop — only visible rows
-    // ever need them, which keeps snprintf off the rebuild path
-  }
-
-  const float rowH = 18.0f;
-  int rows = std::max(1, (int)(area.h / rowH));
-
-  // wheel scrolls the ladder window away from mid
-  if (ui.hovered(area) && ui.input.wheelY != 0)
-    m_obScroll += ui.input.wheelY > 0 ? 3 : -3;
-  int maxStart = std::max(0, (int)m_ladder.size() - rows);
-  int startIdx = std::clamp(m_ladderMid - rows / 2 + m_obScroll, 0, maxStart);
-  m_obScroll = startIdx - (m_ladderMid - rows / 2); // keep scroll bounded
-
-  double maxCum = 1;
-  for (int i = startIdx; i < std::min((int)m_ladder.size(), startIdx + rows); ++i)
-    maxCum = std::max(maxCum, m_ladder[(size_t)i].cum);
-
-  float y = area.y;
-  for (int i = startIdx; i < (int)m_ladder.size() && y + rowH <= area.y + area.h; ++i) {
-    if (i == m_ladderMid) { // spread band at the ask/bid boundary
-      double bb = feeds.aggBestBid(), ba = feeds.aggBestAsk();
-      char spread[48];
-      double sp = ba - bb;
-      snprintf(spread, sizeof(spread), "Spread  %.2f  (%.2f bps)", sp, sp / mid * 1e4);
-      u.draw.rect({area.x, y, area.w, rowH}, t.panelAlt);
-      u.draw.textAligned({area.x, y, area.w, rowH}, spread, t.textDim, DrawList::Center);
-      y += rowH;
-      if (y + rowH > area.y + area.h) break;
-    }
-    ObLevel& L = m_ladder[(size_t)i];
-    if (L.fmtP != L.price) { // label caches survive price-stable frames
-      snprintf(L.priceLbl, sizeof(L.priceLbl), "%.2f", L.price);
-      L.fmtP = L.price;
-    }
-    if (L.fmtS != L.size) {
-      snprintf(L.sizeLbl, sizeof(L.sizeLbl), "%.3f", L.size);
-      L.fmtS = L.size;
-    }
-    Color c = L.ask ? t.red : t.green;
-    float bw = (float)(L.cum / maxCum) * (area.w * 0.45f);
-    u.draw.rect({area.x + area.w - bw, y + 2, bw, rowH - 4}, withAlpha(c, 0.15f));
-
-    u.draw.textAligned({area.x, y, area.w, rowH}, L.priceLbl, c, DrawList::Left, 10);
-    u.draw.textAligned({area.x, y, area.w, rowH}, L.sizeLbl, t.text, DrawList::Right,
-                       10);
-    y += rowH;
-  }
-}
-
-void Terminal::drawTape(Ui& u, Rect r) {
-  const Theme& t = theme();
-
-  Rect header{r.x, r.y, r.w, 20};
-  u.draw.textAligned(header, "Time", t.textDim, DrawList::Left, 10);
-  u.draw.textAligned({r.x + 80, r.y, 60, 20}, "Venue", t.textDim, DrawList::Left);
-  u.draw.textAligned({r.x + 150, r.y, 90, 20}, "Price", t.textDim, DrawList::Left);
-  u.draw.textAligned(header, "Amount", t.textDim, DrawList::Right, 10);
-  u.draw.rect({r.x, r.y + 20, r.w, 1}, t.border);
-
-  Rect area{r.x, r.y + 21, r.w, r.h - 21};
-  const Tape& tape = feeds.tape;
-  if (tape.count == 0) {
-    u.draw.textAligned(area, "waiting for trades…", t.textDim, DrawList::Center);
-    return;
-  }
-
-  // newest first; listView adds wheel + scrollbar when the tape overflows
-  listView(u, area, (int)tape.count, 16.0f, m_tapeList,
-           [&](DrawList& d, Rect row, int i) {
-             const TapeEntry* e = tape.latest((size_t)i);
-             if (!e) return;
-             Color c = e->side == 0 ? t.green : t.red;
-
-             const char* timeBuf = timeLabel((int64_t)(e->ts / 1000.0));
-             char price[32], amount[32];
-             snprintf(price, sizeof(price), "%.2f", e->price);
-             snprintf(amount, sizeof(amount), "%.3f", e->qty);
-
-             const char* vtag = "?";
-             if (e->venue < feeds.venues.size())
-               vtag = feeds.venues[e->venue].shortLabel.c_str();
-
-             d.textAligned(row, timeBuf, t.textDim, DrawList::Left, 10);
-             d.textAligned({row.x + 80, row.y, 60, row.h}, vtag, t.textDim,
-                           DrawList::Left);
-             d.textAligned({row.x + 150, row.y, 90, row.h}, price, c, DrawList::Left);
-             d.textAligned(row, amount, t.textDim, DrawList::Right, 10);
-           });
-}
-
-void Terminal::drawFeeds(Ui& u, Rect r) {
-  const Theme& t = theme();
-
-  Rect header{r.x, r.y, r.w, 20};
-  panelHeader(u, header, "Venue", "Status");
-
-  Rect area{r.x, r.y + 21, r.w, r.h - 21};
-  listView(u, area, (int)feeds.venues.size(), 24.0f, m_feedsList,
-           [&](Ui& ru, DrawList& d, Rect row, int i) {
-             VenueState& v = feeds.venues[(size_t)i];
-
-             Behavior b = behavior(ru, row, ru.id(v.id.c_str()));
-             if (b.hovered) d.rect(row, t.bgHover);
-             if (b.clicked) feeds.setVenueEnabled((int)i, !v.enabled);
-
-             Color dot = v.enabled ? statusColor(v.status, t) : t.textDim;
-             float cy = row.y + row.h * 0.5f;
-             d.rect({row.x + 10, cy - 3, 6, 6}, dot, 3.0f);
-             Color nameCol = v.enabled ? t.text : t.textDim;
-             d.textAligned(row, v.label.c_str(), nameCol, DrawList::Left, 24);
-             d.textAligned(row, v.enabled ? statusText(v.status) : "off",
-                           v.enabled ? statusColor(v.status, t) : t.textDim,
-                           DrawList::Right, 10);
-           });
-}
-
-void Terminal::drawWatchlist(Ui& u, Rect r) {
-  const Theme& t = theme();
-  static const char* syms[] = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-                               "DOGEUSDT", "ARBUSDT", "LINKUSDT", "AVAXUSDT", "NEARUSDT"};
-
-  Rect header{r.x, r.y, r.w, 20};
-  u.draw.textAligned(header, "Symbol", t.textDim, DrawList::Left, 10);
-  u.draw.textAligned(header, "Last", t.textDim, DrawList::Right, r.w * 0.35f);
-  u.draw.textAligned(header, "24h %", t.textDim, DrawList::Right, 10);
-  u.draw.rect({r.x, r.y + 20, r.w, 1}, t.border);
-
-  float rowH = 24.0f;
-  for (int i = 0; i < 10; ++i) {
-    Rect row{r.x, r.y + 21 + i * rowH, r.w, rowH};
-    if (i % 2) u.draw.rect(row, t.panelAlt);
-
-    bool up = frand((uint32_t)i, 11u) > 0.45f;
-    Color c = up ? t.green : t.red;
-
-    char price[24], pct[24];
-    snprintf(price, sizeof(price), "%.2f",
-             100.0 + (double)frand((uint32_t)i, 5u) * 60000.0);
-    snprintf(pct, sizeof(pct), "%s%.2f%%", up ? "+" : "-",
-             (double)(frand((uint32_t)i, 9u) * 8.0f));
-
-    u.draw.textAligned(row, syms[i], t.text, DrawList::Left, 10);
-    u.draw.textAligned(row, price, t.text, DrawList::Right, r.w * 0.35f);
-    u.draw.textAligned(row, pct, c, DrawList::Right, 10);
-  }
 }

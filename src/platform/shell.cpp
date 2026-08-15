@@ -23,7 +23,7 @@ EM_JS(void, storage_set_js, (const char* key, const char* value), {
 ShellSize shell_sync_canvas() {
   ShellSize s{};
   double w = 0, h = 0;
-  emscripten_get_element_css_size("#canvas", &w, &h);
+  emscripten_get_element_css_size(kCanvasSelector, &w, &h);
   s.cssW = (float)w;
   s.cssH = (float)h;
   s.dpr = (float)emscripten_get_device_pixel_ratio();
@@ -34,7 +34,7 @@ ShellSize shell_sync_canvas() {
 
   static int curW = 0, curH = 0;
   if (s.physW != curW || s.physH != curH) {
-    emscripten_set_canvas_element_size("#canvas", s.physW, s.physH);
+    emscripten_set_canvas_element_size(kCanvasSelector, s.physW, s.physH);
     curW = s.physW;
     curH = s.physH;
   }

@@ -32,7 +32,7 @@ static const struct {
     {"bitfinex", "Bitfinex", "BFX", 1},          {"bitfinex-perp", "BFX Perp", "BFX-P", 2},
     {"deribit", "Deribit", "DRB", 2},            {"kraken-perp", "Kraken Perp", "KR-P", 2},
     {"mexc-perp", "MEXC Perp", "MX-P", 2},       {"coinbase-perp", "CB Perp", "CB-P", 2},
-    {"coinbase-us-perp", "CB US Perp", "CBU-P", 2}, {"aster", "Aster", "AST", 4},
+    {"coinbase-us-perp", "CB US Perp", "CBUS-P", 2}, {"aster", "Aster", "AST", 4},
     {"lighter", "Lighter", "LTR", 4},            {"dydx", "dYdX", "DYX", 4},
     {"extended", "Extended", "EXT", 4},
 };

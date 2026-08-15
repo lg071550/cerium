@@ -143,7 +143,7 @@ static void frame() {
 int main() {
   input_install_hooks();
   gpu_set_error_handler(shell_boot_error); // render/gpu fatal errors → splash
-  g_renderer.beginInit("#canvas");
+  g_renderer.beginInit(kCanvasSelector);
   emscripten_set_main_loop(frame, 0, true);
   return 0;
 }

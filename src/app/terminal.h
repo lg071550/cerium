@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../data/feeds.h"
-#include "../data/merge.h"
+#include "panels/panels.h"
 #include "../dock/dock_drag.h"
 #include "../dock/dock_tree.h"
 #include "render/renderer.h"
@@ -31,7 +31,7 @@ struct Terminal {
   void frame(const Input& input, float dt, float cssW, float cssH);
 
   // perf: merged orderbook ladder size (diagnostics readout)
-  int debugLadderLevels() const { return (int)m_ladder.size(); }
+  int debugLadderLevels() const { return (int)m_orderbook.ladder.size(); }
 
 private:
   std::vector<PanelDef> m_panels;
@@ -43,8 +43,6 @@ private:
   Renderer* m_renderer = nullptr;
   float m_fps = 60.0f;
   bool m_showStats = false; // top-bar readout: fps ↔ frame stats (click to toggle)
-  ListState m_feedsList;
-  ListState m_tapeList;
   bool m_restored = false;
   float m_winW = 0, m_winH = 0;
 
@@ -62,29 +60,11 @@ private:
 
   // panels
   void drawChart(Ui& u, Rect r);
-  void drawOrderbook(Ui& u, Rect r);
-  void drawTape(Ui& u, Rect r);
-  void drawWatchlist(Ui& u, Rect r);
-  void drawFeeds(Ui& u, Rect r);
 
-  // merged-book cache (recomputed when version/filter/bin change)
-  uint64_t m_mergeVersion = ~0ull;
-  uint8_t m_mergeMask = 0xff;
-  double m_mergeBin = -1;
-  struct ObLevel {
-    double price, size, cum;
-    bool ask;
-    char priceLbl[24] = {}, sizeLbl[24] = {}; // formatted lazily, visible rows only
-    double fmtP = -1.0, fmtS = -1.0;          // price/size as of last format
-  };
-  std::vector<ObLevel> m_ladder;      // descending price; cum from mid outward
-  int m_ladderMid = 0;                // index of first bid in the ladder
-
-  // orderbook view state
-  uint8_t m_obMask = 7;   // ClassSpot|ClassPerp|ClassDex
-  double m_obBin = 0;     // 0 = raw prices
-  int m_obScroll = 0;     // ladder rows scrolled away from mid
-  int m_obBinSel = 0;     // index into the bin options
+  // panel view state (draw functions live in panels/*.cpp)
+  OrderbookPanel m_orderbook; // ladder cache + class/bin filters
+  TapePanel m_tape;           // row list state + time-label cache
+  FeedsPanel m_feedsPanel;    // venue list state
 
   // chart panel (view state + indicator toggles live in ChartPanel)
   ChartPanel m_chart;
@@ -107,16 +87,4 @@ private:
   Rect m_pickerRect{};
   bool m_autoFocusPicker = false;
   void drawSymbolPicker();
-
-  // bounded cache: second-resolution timestamp → "HH:MM:SS" (direct-mapped)
-  struct TimeLabels {
-    static constexpr int kSlots = 64;
-    struct Slot {
-      int64_t key = 0; // secs + 1; 0 = empty
-      char text[12] = {};
-    };
-    Slot slots[kSlots];
-  };
-  TimeLabels m_timeLabels;
-  const char* timeLabel(int64_t secs);
 };

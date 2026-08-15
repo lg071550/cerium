@@ -1,4 +1,5 @@
 #include "input.h"
+#include "shell.h"
 
 #include <emscripten/html5.h>
 #include <cstring>
@@ -92,7 +93,7 @@ static EM_BOOL on_key_up(int, const EmscriptenKeyboardEvent* e, void*) {
 }
 
 void input_install_hooks() {
-  const char* canvas = "#canvas";
+  const char* canvas = kCanvasSelector;
   emscripten_set_mousemove_callback(canvas, nullptr, false, on_mouse_move);
   emscripten_set_mousedown_callback(canvas, nullptr, false, on_mouse_down);
   // mouseup on window so releasing outside the canvas still ends drags

@@ -1,5 +1,9 @@
 #pragma once
 
+// DOM selector of the app canvas. index.html owns the element; this is the
+// single definition of the selector string — shell/input/main all use it.
+inline constexpr const char* kCanvasSelector = "#canvas";
+
 struct ShellSize {
   float cssW, cssH;   // logical size
   float dpr;          // device pixel ratio
