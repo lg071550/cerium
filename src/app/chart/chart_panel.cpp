@@ -1701,28 +1701,78 @@ void ChartPanel::ensureFootprint(const Feeds& feeds, double step) {
     return lo;
   };
 
-  auto addTrade = [&](const OrderFlowTrade& trade) {
-    int bar = barForTrade(trade);
-    if (bar < 0) return;
-    int64_t tick = (int64_t)std::llround(trade.price / step);
-    int begin = m_footprintOffsets[(size_t)bar];
-    int end = m_footprintOffsets[(size_t)bar + 1];
-    auto first = m_footprint.begin() + begin;
-    auto last = m_footprint.begin() + end;
-    auto at = std::lower_bound(first, last, tick,
-                               [](const FootprintCell& cell, int64_t value) {
-                                 return cell.tick < value;
-                               });
-    if (at != last && at->tick == tick) {
-      if (trade.side == 0) at->buy += trade.qty;
-      else at->sell += trade.qty;
-    } else {
-      FootprintCell cell{bar, tick, 0, 0};
-      if (trade.side == 0) cell.buy = trade.qty;
-      else cell.sell = trade.qty;
-      m_footprint.insert(at, cell);
-      for (size_t oi = (size_t)bar + 1; oi < m_footprintOffsets.size(); ++oi) ++m_footprintOffsets[oi];
+  // Batched fold of trade range [firstTi, endTi): aggregate by (bar, tick),
+  // sort once, then single-pass merge against the existing per-bar ranges.
+  // The per-print insert used to memmove the tail of a tens-of-thousands-cell
+  // vector on every unseen price and shift every later bar's offset entry,
+  // per print, on the live render thread.
+  auto addTradesBatch = [&](size_t firstTi, size_t endTi) {
+    struct NewCell {
+      int bar;
+      int64_t tick;
+      double buy, sell;
+    };
+    static thread_local std::vector<NewCell> fresh;
+    static thread_local std::vector<FootprintCell> merged;
+    static thread_local std::vector<int> offsetsNew;
+    fresh.clear();
+    for (size_t ti = firstTi; ti < endTi; ++ti) {
+      const OrderFlowTrade& t = feeds.orderFlow.v[ti];
+      int bar = barForTrade(t);
+      if (bar < 0) continue;
+      int64_t tick = (int64_t)std::llround(t.price / step);
+      fresh.push_back({bar, tick, t.side == 0 ? t.qty : 0.0,
+                       t.side == 1 ? t.qty : 0.0});
     }
+    if (fresh.empty()) return;
+    std::sort(fresh.begin(), fresh.end(),
+              [](const NewCell& a, const NewCell& b) {
+                return a.bar != b.bar ? a.bar < b.bar : a.tick < b.tick;
+              });
+    size_t w = 0;
+    for (size_t r = 1; r < fresh.size(); ++r) {
+      if (fresh[w].bar == fresh[r].bar && fresh[w].tick == fresh[r].tick) {
+        fresh[w].buy += fresh[r].buy;
+        fresh[w].sell += fresh[r].sell;
+      } else {
+        fresh[++w] = fresh[r];
+      }
+    }
+    fresh.resize(w + 1);
+
+    const int barN = (int)m_footprintOffsets.size() - 1;
+    merged.clear();
+    merged.reserve(m_footprint.size() + fresh.size());
+    offsetsNew.assign((size_t)barN + 1, 0);
+    size_t fi = 0;
+    for (int bar = 0; bar < barN; ++bar) {
+      size_t oldIdx = (size_t)m_footprintOffsets[(size_t)bar];
+      size_t oldEnd = (size_t)m_footprintOffsets[(size_t)bar + 1];
+      size_t fEnd = fi;
+      while (fEnd < fresh.size() && fresh[fEnd].bar == bar) ++fEnd;
+      while (oldIdx < oldEnd || fi < fEnd) {
+        bool takeOld = fi >= fEnd ||
+                       (oldIdx < oldEnd &&
+                        m_footprint[oldIdx].tick <= fresh[fi].tick);
+        if (takeOld && fi < fEnd &&
+            m_footprint[oldIdx].tick == fresh[fi].tick) {
+          FootprintCell c = m_footprint[oldIdx++];
+          c.buy += fresh[fi].buy;
+          c.sell += fresh[fi++].sell;
+          merged.push_back(c);
+        } else if (takeOld) {
+          merged.push_back(m_footprint[oldIdx++]);
+        } else {
+          FootprintCell c{bar, fresh[fi].tick, fresh[fi].buy, fresh[fi].sell};
+          merged.push_back(c);
+          ++fi;
+        }
+      }
+      fi = fEnd;
+      offsetsNew[(size_t)bar + 1] = (int)merged.size();
+    }
+    m_footprint.swap(merged);
+    m_footprintOffsets.swap(offsetsNew);
   };
 
   // Append path, tolerant of bar-open growth: same axis (symbol/TF/front ts)
@@ -1740,8 +1790,7 @@ void ChartPanel::ensureFootprint(const Feeds& feeds, double step) {
   if (canAppend) {
     while (m_footprintOffsets.size() < cs.v.size() + 1)
       m_footprintOffsets.push_back(m_footprintOffsets.back());
-    for (size_t ti = m_footprintTradeCount; ti < feeds.orderFlow.v.size(); ++ti)
-      addTrade(feeds.orderFlow.v[ti]);
+    addTradesBatch(m_footprintTradeCount, feeds.orderFlow.v.size());
     m_footprintTradeCount = feeds.orderFlow.v.size();
     m_footprintVersion = feeds.orderFlow.version;
     m_footprintShape = shape;
@@ -1759,8 +1808,9 @@ void ChartPanel::ensureFootprint(const Feeds& feeds, double step) {
     const double oldFront = m_footprintFrontTs;
     const size_t oldN = m_footprintTradeCount;
     size_t ti = 0;
-    for (; ti < feeds.orderFlow.v.size() && feeds.orderFlow.v[ti].ts < oldFront; ++ti) addTrade(feeds.orderFlow.v[ti]);
-    for (size_t k = ti + oldN; k < feeds.orderFlow.v.size(); ++k) addTrade(feeds.orderFlow.v[k]);
+    for (; ti < feeds.orderFlow.v.size() && feeds.orderFlow.v[ti].ts < oldFront; ++ti) {}
+    addTradesBatch(0, ti);
+    addTradesBatch(ti + oldN, feeds.orderFlow.v.size());
     m_footprintTradeCount = feeds.orderFlow.v.size();
     m_footprintFrontTs = feeds.orderFlow.v.front().ts;
     m_footprintPrepends = feeds.orderFlow.prepends;
@@ -4196,7 +4246,12 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       static constexpr double kMinCellPct[] = {0.0, 0.01, 0.02, 0.05, 0.10};
       double minCell = maxCell * kMinCellPct[std::clamp(m_footprintMinCell, 0, 4)];
 
-      std::vector<uint8_t> imbalance((size_t)(b - a), 0);
+      // Per-bar scratch reused across frames and bars — two fresh heap
+      // allocations per visible bar per frame was pure churn (spans repeat
+      // frame-to-frame; the running max only grows).
+      static thread_local std::vector<uint8_t> imbalance, stacked;
+      if ((size_t)(b - a) > imbalance.size()) imbalance.resize((size_t)(b - a), 0);
+      std::fill_n(imbalance.begin(), b - a, 0);
       for (int ci = a; ci < b; ++ci) {
         const FootprintCell& cell = m_footprint[(size_t)ci];
         double lowerSell = 0, higherBuy = 0;
@@ -4213,7 +4268,8 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       // Runs of three or more consecutive diagonal imbalances form a stacked
       // rail. Instead of drawing a bar hugging the footprint edge, mark the
       // member cells so the highlight stays on the cells themselves.
-      std::vector<uint8_t> stacked((size_t)(b - a), 0);
+      if ((size_t)(b - a) > stacked.size()) stacked.resize((size_t)(b - a), 0);
+      std::fill_n(stacked.begin(), b - a, 0);
       if (m_showFootprintStacked) {
         for (uint8_t sideBit : {uint8_t(1), uint8_t(2)}) {
           int run = -1;
