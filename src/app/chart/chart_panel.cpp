@@ -4111,74 +4111,100 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
     // is event-driven, so rays cover all loaded history without a per-frame
     // scan over the retained prints.
     if (m_showFootprintPoc && ctx.bw >= 14.0f) {
-      uint64_t pocCandleSig = candleSig(cs);
-      bool lifecycleChanged =
+      // Ray lifecycle is incremental: closed bars finalize exactly once into
+      // m_footprintPocActive (watermark), and the last two bars stay
+      // provisional — refreshed every frame without joining the active set.
+      // Within one shape generation the series is append-only and only the
+      // forming bar's cells mutate, so this matches the old rebuild-on-every-
+      // print pass without re-walking all history per feed tick. Candle wicks
+      // only extend while forming, so a provisional hit is final and applying
+      // it early is safe; the two-bar trailing window also absorbs prints
+      // that drain after their bar has already closed.
+      bool pocStructural =
           m_footprintPocVersion != m_footprintVersion ||
           m_footprintPocShape != m_footprintShape ||
           m_footprintPocStep != groupStep ||
-          m_footprintPocCandleSig != pocCandleSig ||
-          m_footprintPocTicks.size() != cs.v.size();
-      if (lifecycleChanged) {
+          (int)cs.v.size() < (int)m_footprintPocTicks.size();
+      if (pocStructural) {
         m_footprintPocVersion = m_footprintVersion;
         m_footprintPocShape = m_footprintShape;
         m_footprintPocStep = groupStep;
-        m_footprintPocCandleSig = pocCandleSig;
         m_footprintPocTicks.assign(cs.v.size(),
                                    std::numeric_limits<int64_t>::min());
         m_footprintPocHits.assign(cs.v.size(), -1);
+        m_footprintPocActive.clear();
+        m_footprintPocActive.reserve((size_t)(ctx.vis1 + 8) * 2);
+        m_footprintPocBuilt = 0;
+      } else if ((int)cs.v.size() > (int)m_footprintPocTicks.size()) {
+        m_footprintPocTicks.resize(cs.v.size(),
+                                   std::numeric_limits<int64_t>::min());
+        m_footprintPocHits.resize(cs.v.size(), -1);
+      }
 
-        static thread_local std::unordered_map<int64_t, std::vector<int>> activePocs;
-        activePocs.clear();
-        activePocs.reserve(cs.v.size() * 2);
-
-        for (int bar = 0; bar < (int)cs.v.size(); ++bar) {
-          int a = bar < (int)m_footprintOffsets.size()
-                      ? m_footprintOffsets[(size_t)bar]
-                      : 0;
-          int b = bar + 1 < (int)m_footprintOffsets.size()
-                      ? m_footprintOffsets[(size_t)bar + 1]
-                      : a;
-          double maxVolume = 0;
-          for (int ci = a; ci < b; ++ci) {
-            const FootprintCell& cell = m_footprint[(size_t)ci];
-            double volume = cell.buy + cell.sell;
-            if (volume > maxVolume) {
-              maxVolume = volume;
-              m_footprintPocTicks[(size_t)bar] = cell.tick;
-            }
+      auto pocScan = [&](int bar) -> int64_t {
+        int a = bar < (int)m_footprintOffsets.size()
+                    ? m_footprintOffsets[(size_t)bar]
+                    : 0;
+        int b = bar + 1 < (int)m_footprintOffsets.size()
+                    ? m_footprintOffsets[(size_t)bar + 1]
+                    : a;
+        double maxVolume = 0;
+        int64_t tick = std::numeric_limits<int64_t>::min();
+        for (int ci = a; ci < b; ++ci) {
+          const FootprintCell& cell = m_footprint[(size_t)ci];
+          double volume = cell.buy + cell.sell;
+          if (volume > maxVolume) {
+            maxVolume = volume;
+            tick = cell.tick;
           }
-
-          const Candle& touch = cs.v[(size_t)bar];
-          int64_t loTick = (int64_t)std::ceil(touch.l / groupStep - 1e-9);
-          int64_t hiTick = (int64_t)std::floor(touch.h / groupStep + 1e-9);
-          if (hiTick >= loTick) {
-            // Normal candles cover only a handful of footprint rows. For a
-            // flash wick, iterate the active set instead of a huge tick range.
-            if (hiTick - loTick <= 512) {
-              for (int64_t tick = loTick; tick <= hiTick; ++tick) {
-                auto it = activePocs.find(tick);
-                if (it == activePocs.end()) continue;
-                for (int source : it->second)
-                  m_footprintPocHits[(size_t)source] = bar;
-                activePocs.erase(it);
-              }
-            } else {
-              for (auto it = activePocs.begin(); it != activePocs.end();) {
-                if (it->first >= loTick && it->first <= hiTick) {
-                  for (int source : it->second)
-                    m_footprintPocHits[(size_t)source] = bar;
-                  it = activePocs.erase(it);
-                } else {
-                  ++it;
-                }
-              }
-            }
-          }
-
-          int64_t pocTick = m_footprintPocTicks[(size_t)bar];
-          if (pocTick != std::numeric_limits<int64_t>::min())
-            activePocs[pocTick].push_back(bar); // its own candle cannot hit it
         }
+        return tick;
+      };
+      auto pocHitCheck = [&](int bar) {
+        const Candle& touch = cs.v[(size_t)bar];
+        int64_t loTick = (int64_t)std::ceil(touch.l / groupStep - 1e-9);
+        int64_t hiTick = (int64_t)std::floor(touch.h / groupStep + 1e-9);
+        if (hiTick < loTick) return;
+        // Normal candles cover only a handful of footprint rows. For a flash
+        // wick, iterate the active set instead of a huge tick range.
+        if (hiTick - loTick <= 512) {
+          for (int64_t tick = loTick; tick <= hiTick; ++tick) {
+            auto it = m_footprintPocActive.find(tick);
+            if (it == m_footprintPocActive.end()) continue;
+            for (int source : it->second)
+              m_footprintPocHits[(size_t)source] = bar;
+            m_footprintPocActive.erase(it);
+          }
+        } else {
+          for (auto it = m_footprintPocActive.begin();
+               it != m_footprintPocActive.end();) {
+            if (it->first >= loTick && it->first <= hiTick) {
+              for (int source : it->second)
+                m_footprintPocHits[(size_t)source] = bar;
+              it = m_footprintPocActive.erase(it);
+            } else {
+              ++it;
+            }
+          }
+        }
+      };
+
+      const int nBars = (int)cs.v.size();
+      int finalizeTarget = std::max(0, nBars - 2);
+      for (int bar = m_footprintPocBuilt; bar < finalizeTarget; ++bar) {
+        m_footprintPocTicks[(size_t)bar] = pocScan(bar);
+        pocHitCheck(bar);
+        int64_t pocTick = m_footprintPocTicks[(size_t)bar];
+        if (pocTick != std::numeric_limits<int64_t>::min())
+          m_footprintPocActive[pocTick].push_back(bar); // own candle can't hit it
+      }
+      m_footprintPocBuilt = finalizeTarget;
+
+      // Provisional tail: refresh ticks and take hits, but never seed rays
+      // for future bars until the bar closes into the watermark pass.
+      for (int bar = std::max(0, nBars - 2); bar < nBars; ++bar) {
+        m_footprintPocTicks[(size_t)bar] = pocScan(bar);
+        pocHitCheck(bar);
       }
 
       for (int source = 0; source <= ctx.vis1; ++source) {

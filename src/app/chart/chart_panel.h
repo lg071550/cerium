@@ -197,9 +197,14 @@ private:
   double m_footprintFrontTs = 0;
   std::vector<int64_t> m_footprintPocTicks;
   std::vector<int> m_footprintPocHits;
+  // POC ray lifecycle: closed bars are finalized once (watermark) and their
+  // rays join the active set; the last two bars stay provisional — their
+  // wicks only extend, so provisional hits are final, and late-arriving
+  // prints for the newest closed bar are still picked up.
+  std::unordered_map<int64_t, std::vector<int>> m_footprintPocActive;
+  int m_footprintPocBuilt = 0;
   uint64_t m_footprintPocVersion = ~0ull;
   uint64_t m_footprintPocShape = 0;
-  uint64_t m_footprintPocCandleSig = 0;
   double m_footprintPocStep = 0;
 
 
