@@ -74,6 +74,7 @@ export class AsterAdapter implements VenueAdapter {
   private fallbackActive = false;
   private fallbackLive = false;
   private lastFallbackTradeId: number | null = null;
+  private fallbackPolls = 0;
   private readonly conn: Reconnect;
 
   constructor(deps: AdapterDeps, inst = "ETHUSDT") {
@@ -368,12 +369,40 @@ export class AsterAdapter implements VenueAdapter {
     } finally {
       if (this.abortController === abort) this.abortController = null;
       if (this.conn.isRunning && this.fallbackActive) {
+        // A plain 1006 close must not demote this venue to REST polling
+        // forever — every ~30 polls, leave the loop and retry the WebSocket
+        // through Reconnect.
+        if (++this.fallbackPolls >= 30) {
+          this.fallbackPolls = 0;
+          this.probeWebSocket();
+          return;
+        }
         this.fallbackTimer = setTimeout(() => {
           this.fallbackTimer = null;
           void this.pollRestFallback();
         }, FALLBACK_INTERVAL_MS);
       }
     }
+  }
+
+  // Leave REST-fallback state and route through Reconnect so the WebSocket is
+  // retried with real backoff. If it fails again (1006 / silent error), the
+  // existing handlers re-enter startRestFallback — polling stays available as
+  // the fallback instead of becoming a one-way trap.
+  private probeWebSocket(): void {
+    if (!this.conn.isRunning || !this.fallbackActive) return;
+    if (this.fallbackTimer) {
+      clearTimeout(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    this.fallbackActive = false;
+    this.fallbackLive = false;
+    this.lastFallbackTradeId = null;
+    this.conn.dropped("rest fallback: probing websocket");
   }
 
   private resync(detail: string): void {

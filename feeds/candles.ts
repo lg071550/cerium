@@ -425,6 +425,8 @@ function diag(text: string): void {
 // arrive, so CLUSTER paints live; `onTick` gets the full working window
 // after each growth step so bar bucketing can repaint progressively.
 // Progress banks into the per-symbol flow cache under `canon` (null skips).
+// `isStale` cancels superseded walks at wave boundaries — checked before new
+// REST work starts, never mid-wave, so in-flight pages always complete.
 async function walkAggTrades(
   sym: string,
   canon: string | null,
@@ -432,10 +434,11 @@ async function walkAggTrades(
   need: number,
   sink?: FlowSink,
   onTick?: (trades: AggTrade[]) => void,
+  isStale?: () => boolean,
 ): Promise<AggTrade[]> {
   flowWalks++;
   try {
-    return await walkAggTradesInner(sym, canon, seed, need, sink, onTick);
+    return await walkAggTradesInner(sym, canon, seed, need, sink, onTick, isStale);
   } finally {
     flowWalks--;
   }
@@ -480,6 +483,7 @@ async function walkAggTradesInner(
   need: number,
   sink?: FlowSink,
   onTick?: (trades: AggTrade[]) => void,
+  isStale?: () => boolean,
 ): Promise<AggTrade[]> {
   need = clampNeed(need);
   let trades = seed;
@@ -552,6 +556,7 @@ async function walkAggTradesInner(
   await fillHoles();
   bank();
   if (onTick) onTick(trades);
+  if (isStale && isStale()) return trades;
   if (sink && trades.length && !sink(packTail(), false)) return trades;
 
   // Steady walk goes left from the oldest id we hold. Hole repair is
@@ -570,6 +575,7 @@ async function walkAggTradesInner(
   };
   let emptyLimited = 0;
   while (trades.length < need) {
+    if (isStale && isStale()) break;
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     const wave = await pullOlder(conc);
     if (wave.older.length === 0) {
@@ -593,6 +599,7 @@ async function walkAggTradesInner(
   }
   bank();
   if (!flushPending()) return trades;
+  if (isStale && isStale()) return trades;
   const endHoles = await fillHoles();
   if (endHoles) {
     bank();
@@ -618,6 +625,7 @@ async function fetchAggBars(
   value: number,
   includeFlow: boolean,
   onProgress?: BarsProgress,
+  isStale?: () => boolean,
 ): Promise<CandleBootstrap | null> {
   const sym = `${canon}USDT`;
   const latest = await fetchAggPageRetry(sym);
@@ -679,12 +687,14 @@ async function fetchAggBars(
           );
         }
       : undefined,
+    isStale,
   );
   flowCachePut(canon, all);
   if (all.length === 0) return null;
   diag(
     `[bars] ${canon} ${tfLabel(kind, value)} need=${need} seed=${seed.length}` +
-    ` pages=${aggPagesFetched - pages0} in ${Date.now() - t0}ms`,
+    ` pages=${aggPagesFetched - pages0} in ${Date.now() - t0}ms` +
+    (isStale && isStale() ? " (cancelled)" : ""),
   );
   return {
     bars: bucket(all),
@@ -698,6 +708,7 @@ export async function fetchCandles(
   value: number,
   includeFlow = false,
   onProgress?: BarsProgress,
+  isStale?: () => boolean,
 ): Promise<CandleBootstrap | null> {
   if (kind === TF_TIME) {
     // Time OHLC comes from klines. Footprints are a separate aggTrade pull
@@ -707,7 +718,7 @@ export async function fetchCandles(
     if (!bars) return null;
     return { bars, flow: new Float64Array() };
   }
-  return fetchAggBars(canon, kind, value, includeFlow, onProgress);
+  return fetchAggBars(canon, kind, value, includeFlow, onProgress, isStale);
 }
 
 // Footprint bootstrap only — does not touch the kline/OHLC series. Switching

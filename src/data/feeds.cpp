@@ -3,6 +3,7 @@
 #include "bridge.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 
@@ -142,6 +143,18 @@ int Feeds::frame() {
             dropped);
     for (size_t i = 0; i < venues.size(); ++i)
       if (venues[i].enabled) requestResync((int)i);
+  }
+
+  // Surgical recovery: the worker reports exactly which venues lost
+  // book-affecting events to pre-ring eviction; only those books are stale.
+  uint32_t lostVenues = bridge::takeLostVenues();
+  while (lostVenues) {
+    int v = std::countr_zero(lostVenues);
+    lostVenues &= lostVenues - 1;
+    if (v < (int)venues.size() && venues[(size_t)v].enabled) {
+      fprintf(stderr, "feeds: book events lost pre-ring for venue %d — resyncing\n", v);
+      requestResync(v);
+    }
   }
   return applied;
 }

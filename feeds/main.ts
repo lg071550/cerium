@@ -79,7 +79,13 @@ function refreshCandles(): void {
       [bars.buffer, flow.buffer],
     );
   };
-  fetchCandles(sym, tf.kind, tf.value, orderFlowRequested && tf.kind !== TF_TIME, postPartial).then((history) => {
+  // Supersede check for the network work itself, not just the result: without
+  // it a symbol/TF switch mid-walk leaves the old walk paging to completion
+  // (~6400 fapi weight per abandoned pull).
+  const stale = (): boolean =>
+    request !== candleRequest || forSymbol !== symbolIndex ||
+    tf.kind !== candleTf.kind || tf.value !== candleTf.value;
+  fetchCandles(sym, tf.kind, tf.value, orderFlowRequested && tf.kind !== TF_TIME, postPartial, stale).then((history) => {
     if (!history || request !== candleRequest || forSymbol !== symbolIndex ||
         tf.kind !== candleTf.kind || tf.value !== candleTf.value) return;
     const { bars, flow } = history;

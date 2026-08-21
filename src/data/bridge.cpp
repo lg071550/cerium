@@ -3,7 +3,8 @@
 #include <emscripten.h>
 
 // Ring control block (bytes): see feeds/wire.ts for the full layout.
-//   0 magic | 4 writeIdx | 8 readIdx | 12 capacity | 16 dropped | 20..63 reserved
+//   0 magic | 4 writeIdx | 8 readIdx | 12 capacity | 16 dropped |
+//   20 lostVenues mask | 24..63 reserved
 
 EM_JS(void, bridge_init_js, (int capacity), {
   try {
@@ -160,6 +161,12 @@ EM_JS(int, bridge_take_dropped_js, (), {
   return Atomics.exchange(R.u32, 4, 0);
 });
 
+EM_JS(unsigned, bridge_take_lost_venues_js, (), {
+  var R = Module._ceriumRing;
+  if (!R) return 0;
+  return Atomics.exchange(R.u32, 5, 0);
+});
+
 EM_JS(void, bridge_cmd_js, (unsigned type, unsigned venue, double arg), {
   var worker = Module._ceriumWorker;
   if (!worker) return;
@@ -184,6 +191,8 @@ int drain(wire::Event* dest, int maxEvents) {
 }
 
 int takeDropped() { return bridge_take_dropped_js(); }
+
+uint32_t takeLostVenues() { return bridge_take_lost_venues_js(); }
 
 void sendCommand(uint32_t type, uint32_t venue, double arg) {
   bridge_cmd_js(type, venue, arg);

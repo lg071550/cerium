@@ -17,6 +17,11 @@ int drain(wire::Event* dest, int maxEvents);
 // Returns and resets the ring's dropped-event counter.
 int takeDropped();
 
+// Returns and resets the per-venue book-loss mask: bit v set means venue v's
+// book-affecting events were evicted pre-ring (see feeds/wire.ts) and the
+// venue needs a resync before its book can be trusted again.
+uint32_t takeLostVenues();
+
 // Sends a command to the worker (wire::Cmd).
 void sendCommand(uint32_t type, uint32_t venue, double arg);
 
