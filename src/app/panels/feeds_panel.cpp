@@ -28,7 +28,15 @@ void drawFeeds(Ui& u, Rect r, FeedsPanel& st, Feeds& feeds) {
   const Theme& t = theme();
 
   Rect header{r.x, r.y, r.w, 20};
-  panelHeader(u, header, "Venue", "Status");
+  u.draw.rect(header, t.panelAlt);
+  const bool showStatus = r.w >= 150.0f;
+  if (showStatus) {
+    panelHeader(u, header, "VENUE", "STATUS");
+  } else {
+    u.draw.textFit({header.x + 8, header.y, header.w - 16, header.h}, "VENUE",
+                   t.textDim, DrawList::Left);
+    u.draw.rect({header.x, header.y + header.h, header.w, 1}, t.border);
+  }
 
   Rect area{r.x, r.y + 21, r.w, r.h - 21};
   listView(u, area, (int)feeds.venues.size(), 24.0f, st.list,
@@ -43,9 +51,14 @@ void drawFeeds(Ui& u, Rect r, FeedsPanel& st, Feeds& feeds) {
              float cy = row.y + row.h * 0.5f;
              d.rect({row.x + 10, cy - 3, 6, 6}, dot, 3.0f);
              Color nameCol = v.enabled ? t.text : t.textDim;
-             d.textAligned(row, v.label.c_str(), nameCol, DrawList::Left, 24);
-             d.textAligned(row, v.enabled ? statusText(v.status) : "off",
-                           v.enabled ? statusColor(v.status, t) : t.textDim,
-                           DrawList::Right, 10);
+             Rect nameCell{row.x + 24.0f, row.y,
+                           std::max(0.0f, row.w - (showStatus ? 116.0f : 30.0f)),
+                           row.h};
+             d.textFit(nameCell, v.label.c_str(), nameCol, DrawList::Left);
+             if (showStatus)
+               d.textFit({row.x + row.w - 82.0f, row.y, 72.0f, row.h},
+                         v.enabled ? statusText(v.status) : "off",
+                         v.enabled ? statusColor(v.status, t) : t.textDim,
+                         DrawList::Right);
            });
 }

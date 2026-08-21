@@ -94,6 +94,31 @@ static bool parseKey(Cur& c, const char* key) {
   return eat(c, ':');
 }
 
+void dockCollectTabTitles(const char* json, std::vector<std::string>& out) {
+  out.clear();
+  if (!json) return;
+  const char* p = json;
+  while ((p = std::strstr(p, "\"tabs\""))) {
+    p += 6;
+    while (*p && *p != '[') ++p;
+    if (!*p) break;
+    Cur c{p + 1};
+    ws(c);
+    while (*c.p && *c.p != ']') {
+      std::string title;
+      if (!parseString(c, title)) break;
+      out.push_back(std::move(title));
+      ws(c);
+      if (*c.p == ',') {
+        ++c.p;
+        continue;
+      }
+      break;
+    }
+    p = c.p;
+  }
+}
+
 static bool parseNum(Cur& c, double& v) {
   ws(c);
   char* end = nullptr;
@@ -110,7 +135,8 @@ static int findTitle(const std::vector<std::string>& titles, const std::string& 
 }
 
 static DockNode* parseNode(DockTree& tree, Cur& c,
-                           const std::vector<std::string>& titles) {
+                           const std::vector<std::string>& titles, int depth) {
+  if (depth > 64) return nullptr; // corrupt-blob recursion guard
   if (!eat(c, '{')) return nullptr;
 
   std::string t;
@@ -118,11 +144,13 @@ static DockNode* parseNode(DockTree& tree, Cur& c,
 
   if (t == "l") {
     std::vector<int> tabs;
+    bool hadSerializedTabs = false;
     if (!eat(c, ',') || !parseKey(c, "tabs") || !eat(c, '[')) return nullptr;
     if (!eat(c, ']')) {
       for (;;) {
         std::string name;
         if (!parseString(c, name)) return nullptr;
+        hadSerializedTabs = true;
         int id = findTitle(titles, name);
         if (id >= 0) tabs.push_back(id);
         if (eat(c, ',')) continue;
@@ -133,9 +161,14 @@ static DockNode* parseNode(DockTree& tree, Cur& c,
     double a = 0;
     if (!eat(c, ',') || !parseKey(c, "a") || !parseNum(c, a) || !eat(c, '}'))
       return nullptr;
-    if (tabs.empty()) return nullptr; // all panels unknown → drop the leaf
+    // An explicitly empty leaf is valid: it is how closing the final tab is
+    // persisted. Only reject a non-empty serialized leaf when every panel name
+    // is unknown; treating [] as corruption resurrects the default layout.
+    if (hadSerializedTabs && tabs.empty()) return nullptr;
     DockNode* n = tree.makeLeaf(std::move(tabs));
-    n->active = std::clamp((int)a, 0, (int)n->tabs.size() - 1);
+    n->active = n->tabs.empty()
+                    ? 0
+                    : std::clamp((int)a, 0, (int)n->tabs.size() - 1);
     return n;
   }
 
@@ -144,9 +177,9 @@ static DockNode* parseNode(DockTree& tree, Cur& c,
     if (!eat(c, ',') || !parseKey(c, "d") || !parseNum(c, d)) return nullptr;
     if (!eat(c, ',') || !parseKey(c, "r") || !parseNum(c, r)) return nullptr;
     if (!eat(c, ',') || !parseKey(c, "a")) return nullptr;
-    DockNode* a = parseNode(tree, c, titles);
+    DockNode* a = parseNode(tree, c, titles, depth + 1);
     if (!eat(c, ',') || !parseKey(c, "b")) return nullptr;
-    DockNode* b = parseNode(tree, c, titles);
+    DockNode* b = parseNode(tree, c, titles, depth + 1);
     if (!eat(c, '}')) return nullptr;
     if (!a) return b; // collapse half-valid splits
     if (!b) return a;
@@ -161,7 +194,7 @@ bool dockDeserialize(DockTree& tree, const char* json,
                      const std::vector<std::string>& titles) {
   if (!json || !*json) return false;
   Cur c{json};
-  DockNode* root = parseNode(tree, c, titles);
+  DockNode* root = parseNode(tree, c, titles, 0);
   ws(c);
   if (!root || *c.p != '\0') return false;
   root->parent = nullptr;

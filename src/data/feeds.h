@@ -2,6 +2,8 @@
 
 #include "book.h"
 #include "candles.h"
+#include "market.h"
+#include "orderflow.h"
 #include "tape.h"
 #include "wire.h"
 
@@ -14,6 +16,16 @@
 // Venue class flags (orderbook filter chips)
 enum VenueClass : uint8_t { ClassSpot = 1, ClassPerp = 2, ClassDex = 4 };
 
+// Number of venues (wire-protocol contract with feeds/registry.ts — see
+// kVenues in feeds.cpp). A per-venue flow selection is a bitmask over these
+// indices: bit i set = venue i's live prints feed the aggregated flow.
+static constexpr int kVenueCount = 27;
+static constexpr uint32_t kAllVenuesMask = (1u << kVenueCount) - 1;
+
+// Per-venue bitmask for every venue whose class intersects `cls` — translates
+// the SPOT/PERP/DEX quick toggles into concrete venue bits.
+uint32_t venueMaskForClass(uint8_t cls);
+
 struct VenueState {
   std::string id;
   std::string label;
@@ -22,13 +34,19 @@ struct VenueState {
   bool enabled = true;
   uint8_t status = wire::StatusNone; // wire::Status*
   L2Book book;
+  double bookUpdatedAtMs = 0; // worker receive time of the latest complete depth mutation
 };
 
 struct Feeds {
   std::vector<VenueState> venues;
   Tape tape;
   CandleSeries candles; // chart series (venue 0 klines + live trades)
+  OrderFlowSeries orderFlow; // exact prints for footprint chart modes
+  MarketSeries market;  // aggregated OI / funding / liquidations
   int symbol = 0; // 0 = ETH, 1 = BTC, 2 = SOL (feeds/registry.ts SYMBOLS)
+  // Venues (bit i = venue i) whose live prints feed the aggregated volume,
+  // CVD delta, and footprint orderflow series. Default = every venue.
+  uint32_t flowMask = kAllVenuesMask;
 
   void init();               // registers venues + spawns the worker bridge
   int frame();               // drain + apply pending events; returns events applied
@@ -36,7 +54,10 @@ struct Feeds {
 
   void setSymbol(int sym);                 // switches the whole feed set
   void setVenueEnabled(int i, bool on);
-  void setCandleInterval(int minutes);     // refetch klines at a new interval
+  void setTimeframe(Timeframe tf);         // refetch/rebootstrap candle history
+  void requestOrderFlow();                 // lazy exact trade history for footprints
+  void refreshOrderFlow();                 // re-bootstrap even if already requested
+  void setFlowMask(uint32_t mask);         // venues feeding volume/CVD/footprint
 
   VenueState* venue(size_t i) { return i < venues.size() ? &venues[i] : nullptr; }
   int liveCount() const;
@@ -67,6 +88,7 @@ private:
   mutable bool m_aggHealthy[64] = {};
 
   bool m_started = false;
+  bool m_orderFlowRequested = false;
   // snapshot assembly scratch
   bool m_collecting = false;
   uint8_t m_collectVenue = 0;

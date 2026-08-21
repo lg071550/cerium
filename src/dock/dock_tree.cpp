@@ -110,7 +110,10 @@ void DockTree::removeTab(DockNode* leaf, int tabId) {
   if (!leaf || !leaf->isLeaf()) return;
   auto it = std::find(leaf->tabs.begin(), leaf->tabs.end(), tabId);
   if (it == leaf->tabs.end()) return;
+  int erased = (int)(it - leaf->tabs.begin());
   leaf->tabs.erase(it);
+  // Tabs left of the selection slide it left with them.
+  if (erased < leaf->active) --leaf->active;
   if (leaf->active >= (int)leaf->tabs.size())
     leaf->active = std::max(0, (int)leaf->tabs.size() - 1);
   changed = true;

@@ -27,13 +27,15 @@ struct ListState {
 };
 
 void listView(Ui& ui, Rect area, int rowCount, float rowH, ListState& state,
-              const std::function<void(DrawList&, Rect rowRect, int row)>& drawRow);
+              const std::function<void(DrawList&, Rect rowRect, int row)>& drawRow,
+              bool showScrollbar = true);
 
 // Row callback also receives the Ui so rows can host interactive widgets
 // without capturing ui (push your own id scope per row). The overload above
 // delegates to this one.
 void listView(Ui& ui, Rect area, int rowCount, float rowH, ListState& state,
-              const std::function<void(Ui&, DrawList&, Rect rowRect, int row)>& drawRow);
+              const std::function<void(Ui&, DrawList&, Rect rowRect, int row)>& drawRow,
+              bool showScrollbar = true);
 
 // Text field backed by a hidden DOM input (IME-compatible). We render the
 // text and caret ourselves; the DOM element carries editing/IME semantics.
@@ -56,14 +58,13 @@ bool toggle(Ui& ui, Rect r, const char* label, bool& value);
 // Returns true on commit.
 bool slider(Ui& ui, Rect r, const char* id, float& v, float lo, float hi);
 
-// Toggle-style chip: accentSoft when on, bgHover when hovered, panelAlt
-// otherwise. Returns true on click.
+// Flat toggle action: a restrained raised tone when active, hover tone when
+// interactive, and no idle capsule. Returns true on click.
 bool chip(Ui& ui, Rect r, const char* label, bool on);
 
 // Panel header row: title left in textDim (pad 10), optional right-aligned
 // text (pad 10), 1px border separator line beneath it.
 void panelHeader(Ui& ui, Rect r, const char* title, const char* right = nullptr);
 
-// Chart gutter tag: soft shadow, bgRaised rounded rect (3px), centered text.
+// Chart gutter tag: compact shadow, bgRaised rect, centered text.
 void gutterTag(DrawList& d, Rect r, const char* text, Color c);
-

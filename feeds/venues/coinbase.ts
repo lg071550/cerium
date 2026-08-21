@@ -175,14 +175,27 @@ export class CoinbaseL2Adapter implements VenueAdapter {
 
     const parsed = parseCoinbaseL2(raw, this.sizeMultiplier);
     if (!parsed) {
-
-      if (isRecord(raw) && raw.channel === "heartbeats") this.deps.book.noteActivity();
+      if (isRecord(raw) && raw.channel === "heartbeats") {
+        this.deps.book.noteActivity();
+      } else if (isRecord(raw) && raw.channel === "l2_data") {
+        // A malformed l2 batch is discarded unread — the book can no longer
+        // be trusted, so force a fresh subscribe + snapshot.
+        this.conn.dropped("malformed l2_data frame");
+      }
       return;
     }
 
-    if (this.lastSeq !== null && parsed.seq <= this.lastSeq) {
-      this.conn.dropped(`sequence regression: last ${this.lastSeq}, got ${parsed.seq}`);
-      return;
+    if (this.lastSeq !== null) {
+      if (parsed.seq <= this.lastSeq) {
+        this.conn.dropped(`sequence regression: last ${this.lastSeq}, got ${parsed.seq}`);
+        return;
+      }
+      if (parsed.seq > this.lastSeq + 1) {
+        // A skipped sequence means updates were lost upstream; applying them
+        // over the current book would silently corrupt it.
+        this.conn.dropped(`sequence gap: last ${this.lastSeq}, got ${parsed.seq}`);
+        return;
+      }
     }
     this.lastSeq = parsed.seq;
 

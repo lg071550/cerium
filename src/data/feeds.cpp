@@ -8,9 +8,71 @@
 
 static Feeds* g_feedsInstance = nullptr;
 
-extern "C" void cerium_on_candles(double* data, int n, int interval, int sym) {
-  if (g_feedsInstance && sym == g_feedsInstance->symbol)
-    g_feedsInstance->candles.load(data, n, interval, sym);
+extern "C" void cerium_on_candles(double* data, int n, int tfKind, double tfValue,
+                                  int sym) {
+  if (!g_feedsInstance || sym != g_feedsInstance->symbol) return;
+  Timeframe tf{(Timeframe::Kind)(uint8_t)tfKind, tfValue};
+  if (!(tf == g_feedsInstance->candles.tf)) return; // stale in-flight bootstrap
+  g_feedsInstance->candles.load(data, n, tf, sym);
+}
+
+extern "C" void cerium_on_orderflow(double* data, int n, int tfKind,
+                                     double tfValue, int sym, int prepend) {
+  if (!g_feedsInstance || sym != g_feedsInstance->symbol) return;
+  Timeframe tf{(Timeframe::Kind)(uint8_t)tfKind, tfValue};
+  if (!(tf == g_feedsInstance->candles.tf)) return;
+  g_feedsInstance->orderFlow.load(data, n, tf, sym, prepend != 0);
+}
+
+extern "C" void cerium_on_market(double* oi, int oiN, double* funding, int fundingN,
+                                 double* liq, int liqN, int sym, double liqBase) {
+  if (!g_feedsInstance || sym != g_feedsInstance->symbol) return;
+  g_feedsInstance->market.loadOi(oi, oiN, sym);
+  g_feedsInstance->market.loadFunding(funding, fundingN, sym);
+  g_feedsInstance->market.loadLiq(liq, liqN, sym, (int64_t)liqBase);
+}
+
+// Incremental liquidation prints: [ts, price, qty, side] × n starting at the
+// worker-global record index `start` — displays per print, no full re-copy.
+extern "C" void cerium_on_liq(double* liq, int n, double start, int sym) {
+  if (!g_feedsInstance || sym != g_feedsInstance->symbol) return;
+  g_feedsInstance->market.appendLiq(liq, n, (int64_t)start, sym);
+}
+
+// Probe diagnostics: per-venue book shape at the moment of the call.
+// [enabled, status, bidLevels, askLevels, minBid, maxBid, minAsk, maxAsk, mid]
+// Probe diagnostics: live liquidation series state.
+// [count, version, newestTs, newestPrice]
+extern "C" double* cerium_liq_debug() {
+  static double out[4] = {};
+  if (!g_feedsInstance) return out;
+  const MarketSeries& m = g_feedsInstance->market;
+  out[0] = (double)m.liq.size();
+  out[1] = (double)m.version;
+  out[2] = m.liq.empty() ? 0 : m.liq.back().ts;
+  out[3] = m.liq.empty() ? 0 : m.liq.back().price;
+  return out;
+}
+
+extern "C" double* cerium_venue_debug(int i) {
+  static double out[9] = {};
+  if (!g_feedsInstance || i < 0 ||
+      (size_t)i >= g_feedsInstance->venues.size())
+    return out;
+  const VenueState& v = g_feedsInstance->venues[(size_t)i];
+  out[0] = v.enabled ? 1 : 0;
+  out[1] = v.status;
+  out[2] = (double)v.book.bids.prices.size();
+  out[3] = (double)v.book.asks.prices.size();
+  out[4] = v.book.bids.prices.empty() ? 0 : v.book.bids.prices.front();
+  out[5] = v.book.bids.prices.empty() ? 0 : v.book.bids.prices.back();
+  out[6] = v.book.asks.prices.empty() ? 0 : v.book.asks.prices.front();
+  out[7] = v.book.asks.prices.empty() ? 0 : v.book.asks.prices.back();
+  double mid = 0;
+  if (!v.book.bids.prices.empty() && !v.book.asks.prices.empty())
+    mid = (v.book.bids.prices.back() + v.book.asks.prices.front()) * 0.5;
+  out[8] = mid;
+  return out;
 }
 
 // Index contract with feeds/registry.ts — do not reorder.
@@ -36,6 +98,16 @@ static const struct {
     {"lighter", "Lighter", "LTR", 4},            {"dydx", "dYdX", "DYX", 4},
     {"extended", "Extended", "EXT", 4},
 };
+
+static_assert(sizeof(kVenues) / sizeof(kVenues[0]) == kVenueCount,
+              "kVenueCount must match the kVenues registry");
+
+uint32_t venueMaskForClass(uint8_t cls) {
+  uint32_t mask = 0;
+  for (int i = 0; i < kVenueCount; ++i)
+    if (kVenues[i].cls & cls) mask |= (1u << i);
+  return mask;
+}
 
 void Feeds::init() {
   for (auto& v : kVenues) {
@@ -85,10 +157,12 @@ void Feeds::setSymbol(int sym) {
   for (auto& v : venues) {
     v.book.clear();
     v.status = wire::StatusNone;
+    v.bookUpdatedAtMs = 0;
   }
-  tape.count = 0;
-  tape.head = 0;
+  tape.clear();
   candles.v.clear();
+  orderFlow.clear();
+  market.clear();
   bridge::sendCommand(wire::CmdSetSymbol, 0, (double)sym);
 }
 
@@ -100,15 +174,42 @@ void Feeds::setVenueEnabled(int i, bool on) {
   if (!on) {
     v->book.clear();
     v->status = wire::StatusNone;
+    v->bookUpdatedAtMs = 0;
   }
   bridge::sendCommand(wire::CmdSetVenueEnabled, (uint32_t)i, on ? 1.0 : 0.0);
 }
 
-void Feeds::setCandleInterval(int minutes) {
-  if (minutes == candles.intervalMin) return;
-  candles.intervalMin = minutes;
+void Feeds::setTimeframe(Timeframe tf) {
+  if (tf.kind == Timeframe::Time) tf.value = std::round(tf.value);
+  if (!(tf.value > 0) || tf.value > 1e6) return;
+  if (tf == candles.tf) return;
+  candles.tf = tf;
   candles.v.clear();
-  bridge::sendCommand(wire::CmdSetCandles, 0, (double)minutes);
+  candles.barCount = 0;
+  // orderFlow stays: raw aggressor prints are timeframe-independent, so
+  // wiping them here blanked footprints/CVD on every TF switch until a full
+  // REST re-walk finished. The worker's bootstrap replace stitches the
+  // cached window in front of whatever live prints accumulated meanwhile.
+  bridge::sendCommand(wire::CmdSetCandles, (uint32_t)tf.kind, tf.value);
+}
+
+void Feeds::requestOrderFlow() {
+  if (m_orderFlowRequested) return;
+  refreshOrderFlow();
+}
+
+void Feeds::refreshOrderFlow() {
+  m_orderFlowRequested = true;
+  bridge::sendCommand(wire::CmdRequestOrderFlow, 0, 1.0);
+}
+
+void Feeds::setFlowMask(uint32_t mask) {
+  mask &= kAllVenuesMask;
+  if (mask == flowMask) return;
+  flowMask = mask;
+  // Live prints follow the new mask from this point. Do not drop the Binance
+  // bootstrap window — the next symbol/timeframe load replaces it, and a clear
+  // here left footprint charts with only a few minutes of live tape.
 }
 
 int Feeds::liveCount() const {
@@ -264,6 +365,7 @@ void Feeds::apply(const wire::Event& e) {
       v.book.bids.loadSorted(m_snapBidP.data(), m_snapBidS.data(), m_snapBidP.size());
       v.book.asks.loadSorted(m_snapAskP.data(), m_snapAskS.data(), m_snapAskP.size());
       v.book.version++;
+      v.bookUpdatedAtMs = e.ts;
       break;
     }
 
@@ -272,11 +374,34 @@ void Feeds::apply(const wire::Event& e) {
       if (e.side == wire::BidOrBuy) v.book.bids.set(e.price, e.qty);
       else v.book.asks.set(e.price, e.qty);
       v.book.version++;
+      v.bookUpdatedAtMs = e.ts;
       break;
 
     case wire::Trade:
       tape.push(e.price, e.qty, e.ts, e.venue, e.side);
-      if (e.venue == 0) candles.onTrade(e.price, e.qty, e.side, e.ts); // chart venue
+      if (e.venue == 0) candles.onTrade(e.price, e.qty, e.side, e.ts); // Binance OHLC
+      if (flowMask & (1u << e.venue)) {
+        candles.onAgg(e.price, e.qty, e.side, e.ts); // aggregated volume + CVD (mask-filtered)
+        if (m_orderFlowRequested) {
+          // Each venue quotes its own mid; mixed-venue footprints otherwise
+          // scatter the "same" price level across the inter-venue drift. Rebase
+          // every print onto the Binance (venue 0) reference axis: print -
+          // venueMid + refMid. Venue 0 prints pass through unchanged (its mid
+          // *is* the reference), which also preserves the bootstrap overlap
+          // dedup. If the reference book is unavailable, fall back to the
+          // aggregate mid, then to the raw print.
+          double ref = 0;
+          if (venues[0].book.bestBid() > 0 && venues[0].book.bestAsk() > 0)
+            ref = (venues[0].book.bestBid() + venues[0].book.bestAsk()) * 0.5;
+          if (!(ref > 0)) ref = aggMid();
+          double vm = 0;
+          if (v.book.bestBid() > 0 && v.book.bestAsk() > 0)
+            vm = (v.book.bestBid() + v.book.bestAsk()) * 0.5;
+          double px = e.price;
+          if (vm > 0 && ref > 0) px = e.price - vm + ref;
+          orderFlow.onTrade(px, e.qty, e.side, e.ts);
+        }
+      }
       break;
 
     case wire::FeedStatus:

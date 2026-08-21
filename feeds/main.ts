@@ -5,23 +5,99 @@ import { CMD, EV, STATUS, WireWriter } from "./wire";
 import type { L2Update, PriceLevel, TradePrint } from "./types";
 import type { AdapterDeps, VenueAdapter } from "./venues/types";
 import { SYMBOLS, VENUES, type VenueDef } from "./registry";
-import { fetchKlines } from "./candles";
+import { fetchCandles, fetchOrderFlow, TF_TIME } from "./candles";
+import { startMarketFeed } from "./market";
 
 let writer: WireWriter | null = null;
 let symbolIndex = 0;
-let candleInterval = 1;
+let candleTf = { kind: TF_TIME, value: 1 }; // kind: 0=time(min) 1=tick 2=volume
+let orderFlowRequested = false;
+let candleRequest = 0;
+let flowRequest = 0;
+let orderFlowRetries = 0;
 const adapters: (VenueAdapter | null)[] = new Array(VENUES.length).fill(null);
 const enabled = new Set<number>(VENUES.map((v) => v.index)); // all on by default
 
+function postOrderFlow(
+  forSymbol: number,
+  tf: { kind: number; value: number },
+  flow: Float64Array,
+  prepend: boolean,
+): void {
+  (self as unknown as Worker).postMessage(
+    {
+      kind: "orderflow",
+      sym: forSymbol,
+      tfKind: tf.kind,
+      tfValue: tf.value,
+      flow,
+      prepend: prepend ? 1 : 0,
+    },
+    [flow.buffer],
+  );
+}
+
+function refreshOrderFlow(): void {
+  const sym = SYMBOLS[symbolIndex];
+  const tf = candleTf;
+  const forSymbol = symbolIndex;
+  const request = ++flowRequest;
+  fetchOrderFlow(sym, tf.kind, tf.value, (flow, prepend) => {
+    if (request !== flowRequest || forSymbol !== symbolIndex ||
+        tf.kind !== candleTf.kind || tf.value !== candleTf.value) return false;
+    if (flow.length === 0) return true;
+    orderFlowRetries = 0;
+    postOrderFlow(forSymbol, tf, flow, prepend);
+    return true;
+  }).then((n) => {
+    if (request !== flowRequest || forSymbol !== symbolIndex) return;
+    if (n === 0 && orderFlowRetries < 3) {
+      const delay = 1500 * ++orderFlowRetries;
+      setTimeout(() => {
+        if (request === flowRequest && forSymbol === symbolIndex) refreshOrderFlow();
+      }, delay);
+    }
+  });
+}
+
 function refreshCandles(): void {
   const sym = SYMBOLS[symbolIndex];
-  const interval = candleInterval;
+  const tf = candleTf;
   const forSymbol = symbolIndex;
-  fetchKlines(sym, interval).then((data) => {
-    if (!data) return;
+  const request = ++candleRequest;
+  // Progressive bootstrap for tick/volume TFs: post partial bar/flow
+  // snapshots as the walk streams older pages, instead of leaving the chart
+  // blank until the whole pull completes.
+  const postPartial = (bars: Float64Array, flow: Float64Array): void => {
+    if (request !== candleRequest || forSymbol !== symbolIndex ||
+        tf.kind !== candleTf.kind || tf.value !== candleTf.value) return;
     (self as unknown as Worker).postMessage(
-      { kind: "candles", sym: forSymbol, interval, data },
-      [data.buffer],
+      {
+        kind: "candles", sym: forSymbol, tfKind: tf.kind, tfValue: tf.value,
+        data: bars, flow,
+      },
+      [bars.buffer, flow.buffer],
+    );
+  };
+  fetchCandles(sym, tf.kind, tf.value, orderFlowRequested && tf.kind !== TF_TIME, postPartial).then((history) => {
+    if (!history || request !== candleRequest || forSymbol !== symbolIndex ||
+        tf.kind !== candleTf.kind || tf.value !== candleTf.value) return;
+    const { bars, flow } = history;
+    if (tf.kind !== TF_TIME && orderFlowRequested && flow.length === 0 &&
+        orderFlowRetries < 3) {
+      const delay = 1500 * ++orderFlowRetries;
+      setTimeout(() => {
+        if (request === candleRequest && forSymbol === symbolIndex) refreshCandles();
+      }, delay);
+    } else if (flow.length > 0) {
+      orderFlowRetries = 0;
+    }
+    (self as unknown as Worker).postMessage(
+      {
+        kind: "candles", sym: forSymbol, tfKind: tf.kind, tfValue: tf.value,
+        data: bars, flow,
+      },
+      [bars.buffer, flow.buffer],
     );
   });
 }
@@ -68,15 +144,7 @@ function stopVenue(index: number): void {
   a?.stop();
 }
 
-let lastCmdSeq = 0;
-
-function pollCommands(): void {
-  if (!writer) return;
-  const seq = writer.cmdSeq();
-  if (seq === lastCmdSeq) return;
-  lastCmdSeq = seq;
-  const { type, venue, arg } = writer.command();
-
+function handleCommand(type: number, venue: number, arg: number): void {
   if (type === CMD.ResyncVenue) {
     const a = adapters[venue];
     if (a) {
@@ -105,17 +173,35 @@ function pollCommands(): void {
     const next = Math.floor(arg);
     if (next === symbolIndex || next < 0 || next >= SYMBOLS.length) return;
     symbolIndex = next;
+    orderFlowRetries = 0;
+    ++flowRequest;
     for (const v of VENUES) stopVenue(v.index);
     for (const v of VENUES) if (enabled.has(v.index)) startVenue(v);
     refreshCandles();
+    if (orderFlowRequested && candleTf.kind === TF_TIME) refreshOrderFlow();
+    startMarketFeed(symbolIndex);
     return;
   }
 
   if (type === CMD.SetCandles) {
-    const minutes = Math.floor(arg);
-    if (minutes <= 0 || minutes === candleInterval) return;
-    candleInterval = minutes;
+    // venue carries the timeframe kind (0=time 1=tick 2=volume), arg the value
+    const kind = venue;
+    const value = kind === TF_TIME ? Math.round(arg) : arg;
+    if (kind < 0 || kind > 2 || !(value > 0) || value > 1e6) return;
+    if (kind === candleTf.kind && value === candleTf.value) return;
+    candleTf = { kind, value };
+    orderFlowRetries = 0;
+    ++flowRequest;
     refreshCandles();
+    if (orderFlowRequested && candleTf.kind === TF_TIME) refreshOrderFlow();
+    return;
+  }
+
+  if (type === CMD.RequestOrderFlow) {
+    orderFlowRequested = true;
+    orderFlowRetries = 0;
+    refreshOrderFlow();
+    return;
   }
 }
 
@@ -125,6 +211,15 @@ self.onmessage = (e: MessageEvent) => {
     writer = new WireWriter(data.sab, data.capacity ?? 0);
     for (const v of VENUES) if (enabled.has(v.index)) startVenue(v);
     refreshCandles();
-    setInterval(pollCommands, 100);
+    startMarketFeed(symbolIndex);
+    return;
+  }
+  if (data?.kind === "command" && writer) {
+    const type = Number(data.type);
+    const venue = Number(data.venue);
+    const arg = Number(data.arg);
+    if (Number.isSafeInteger(type) && Number.isSafeInteger(venue) && Number.isFinite(arg)) {
+      handleCommand(type, venue, arg);
+    }
   }
 };

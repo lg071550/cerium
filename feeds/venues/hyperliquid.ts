@@ -141,7 +141,10 @@ export class HyperliquidAdapter implements VenueAdapter {
     ws.onopen = () => {
       this.conn.connected();
       this.deps.setState("syncing");
-      ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "l2Book", coin: this.symbol } }));
+      ws.send(JSON.stringify({
+        method: "subscribe",
+        subscription: { type: "l2Book", coin: this.symbol, nLevels: 100 },
+      }));
       ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "bbo", coin: this.symbol } }));
       ws.send(JSON.stringify({ method: "subscribe", subscription: { type: "trades", coin: this.symbol } }));
 

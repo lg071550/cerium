@@ -93,13 +93,13 @@ void DockDrag::drawOverlay(Ui& ui, const DockTree& tree, const char* tabTitle) c
   if (zone != DropZone::None && (zoneOnRoot || hoverLeaf)) {
     Rect target = zoneOnRoot ? tree.root->rect : hoverLeaf->rect;
     Rect p = previewRect(target, zone, zoneOnRoot);
-    ui.draw.rect(p, t.accentSoft, t.radius);
+    ui.draw.rect(p, t.accentSoft, 2.0f);
   }
 
   // dragged tab chip following the cursor
   float w = ui.draw.measure(tabTitle) + 2 * t.pad;
   Rect chip{ui.input.mouseX + 12, ui.input.mouseY + 12, w, 24};
-  ui.draw.shadow(chip, t.radius, 8.0f, 2.0f, hexColor(0x000000, 0.4f));
-  ui.draw.rect(chip, t.bgRaised, t.radius);
+  ui.draw.shadow(chip, 3.0f, 5.0f, 1.0f, hexColor(0x000000, 0.32f));
+  ui.draw.rect(chip, t.bgRaised, 3.0f);
   ui.draw.textAligned(chip, tabTitle, t.text, DrawList::Center);
 }

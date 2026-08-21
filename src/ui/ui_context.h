@@ -71,6 +71,12 @@ struct Ui {
     if (!overlayOpen(id)) overlays.push_back({id, r});
   }
 
+  // resize a live overlay (e.g. a list popup whose row count changed)
+  void updateOverlayRect(uint64_t id, Rect r) {
+    for (auto& o : overlays)
+      if (o.id == id) o.rect = r;
+  }
+
   void closeOverlay(uint64_t id) {
     for (size_t i = 0; i < overlays.size(); ++i)
       if (overlays[i].id == id) {

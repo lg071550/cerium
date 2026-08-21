@@ -104,7 +104,7 @@ export class DeribitAdapter implements VenueAdapter {
   constructor(deps: AdapterDeps, inst = DEFAULT_INST) {
     this.deps = deps;
     this.symbol = inst;
-    this.channel = `book.${inst}.100ms`;
+    this.channel = `book.${inst}.none.100ms`;
     this.tradesChannel = `trades.${inst}.100ms`;
     this.conn = new Reconnect(
       deps.setState,

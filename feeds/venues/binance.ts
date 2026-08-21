@@ -61,7 +61,8 @@ export class BinanceAdapter implements VenueAdapter {
     const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
     ws.onopen = () => {
-      this.conn.connected();
+      // No conn.connected() here: the REST depth snapshot can still fail
+      // (429/418), and resetting backoff on open would pin reconnects at 1 s.
       this.deps.setState("syncing");
 
       void this.fetchSnapshot();
@@ -157,6 +158,9 @@ export class BinanceAdapter implements VenueAdapter {
 
     this.state = newState;
     this.buffer = [];
+    // WS is streaming and the snapshot reconciled — only now is the venue
+    // healthy enough to reset reconnect backoff.
+    this.conn.connected();
     this.deps.setState("live");
   }
 

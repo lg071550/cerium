@@ -1,11 +1,11 @@
 // cerium dev server — zero-dep static file server with correct WASM MIME.
-// usage: node tools/serve.mjs [port]   (default 8787)
+// usage: node tools/serve.mjs [port]   (default 8788)
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize, sep } from 'node:path';
 
 const root = process.cwd();
-const port = Number(process.argv[2] || 8787);
+const port = Number(process.argv[2] || 8788);
 
 const mime = {
   '.html': 'text/html; charset=utf-8',

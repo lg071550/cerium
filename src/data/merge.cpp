@@ -23,7 +23,7 @@ void mergeSideWindow(const BookSide* const* sides, size_t count, double lo, doub
   struct KV {
     double key, size;
   };
-  static std::vector<KV> flat; // reused scratch (single-threaded render loop)
+  thread_local std::vector<KV> flat; // reused scratch (matches heatmap/draw scratch)
   flat.clear();
 
   for (size_t s = 0; s < count; ++s) {

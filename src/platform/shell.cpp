@@ -20,6 +20,12 @@ EM_JS(void, storage_set_js, (const char* key, const char* value), {
   } catch (e) { /* quota / privacy mode — ignore */ }
 });
 
+EM_JS(void, storage_remove_js, (const char* key), {
+  try {
+    localStorage.removeItem(UTF8ToString(key));
+  } catch (e) { /* privacy mode — ignore */ }
+});
+
 ShellSize shell_sync_canvas() {
   ShellSize s{};
   double w = 0, h = 0;
@@ -56,6 +62,8 @@ EM_JS(void, boot_error_js, (const char* msg), {
 char* shell_storage_get(const char* key) { return storage_get_js(key); }
 
 void shell_storage_set(const char* key, const char* value) { storage_set_js(key, value); }
+
+void shell_storage_remove(const char* key) { storage_remove_js(key); }
 
 void shell_set_cursor(const char* cursor) {
   static char last[32] = "";

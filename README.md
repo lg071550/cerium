@@ -42,7 +42,7 @@ system python — always invoke `emsdk.py` via `tools/python/python.exe`.
 
 ```sh
 bash build.sh          # bundles feeds worker + release wasm;  bash build.sh dev for debug
-node tools/serve.mjs   # → http://localhost:8787 (sets COOP/COEP for SharedArrayBuffer)
+node tools/serve.mjs   # → http://localhost:8788 (sets COOP/COEP for SharedArrayBuffer)
 ```
 
 Open in Chrome or Edge (WebGPU required). Drag tabs between panels / to panel
@@ -52,7 +52,7 @@ localStorage (`cerium.layout.v1`).
 Headless verification screenshot (no deps, drives Chrome via CDP):
 
 ```sh
-node tools/shoot.mjs http://localhost:8787 build/shot.png 8000
+node tools/shoot.mjs http://localhost:8788 build/shot.png 8000
 ```
 
 ## Layout

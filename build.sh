@@ -67,7 +67,7 @@ em++ -std=c++20 $OPT -fno-exceptions -fno-rtti \
   -Ithird_party -Ithird_party/lanthanum/src \
   --use-port=emdawnwebgpu \
   -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web \
-  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_cerium_on_candles,_cerium_perf \
+  -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_cerium_on_candles,_cerium_on_orderflow,_cerium_on_market,_cerium_on_liq,_cerium_perf,_cerium_frame_pump,_cerium_set_tf,_cerium_venue_debug,_cerium_liq_debug \
   --embed-file assets@/assets \
   $SOURCES \
   -o build/cerium.js

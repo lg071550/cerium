@@ -12,22 +12,151 @@
 extern "C" double cerium_perf(int i);
 
 static const char* kLayoutKey = "cerium.layout.v1";
+static const char* kTabCloseKey = "cerium.tabs.close.visible.v1";
+static const char* kTabStripsKey = "cerium.tabs.visible.v1";
 
 // canonical symbols — index matches feeds/registry.ts SYMBOLS
 static const char* kSyms[] = {"ETH", "BTC", "SOL"};
+static constexpr PanelKind kPanelKinds[] = {
+    PanelKind::Chart, PanelKind::Orderbook, PanelKind::Dom, PanelKind::Tape,
+    PanelKind::Liquidations, PanelKind::Watchlist, PanelKind::Feeds};
 
-// compact count for the stats readout: 950 → "950", 3200 → "3.2k", 41000 → "41k"
-static void fmtCount(char* out, size_t n, int v) {
-  if (v >= 10000) snprintf(out, n, "%dk", v / 1000);
-  else if (v >= 1000) snprintf(out, n, "%.1fk", v / 1000.0);
-  else snprintf(out, n, "%d", v);
+static const char* panelKindTitle(PanelKind kind) {
+  switch (kind) {
+    case PanelKind::Chart: return "Chart";
+    case PanelKind::Orderbook: return "Orderbook";
+    case PanelKind::Dom: return "DOM";
+    case PanelKind::Tape: return "Tape";
+    case PanelKind::Liquidations: return "Liquidations";
+    case PanelKind::Watchlist: return "Watchlist";
+    case PanelKind::Feeds: return "Feeds";
+  }
+  return "Panel";
 }
 
-int Terminal::addPanel(const char* title, std::function<void(Ui&, Rect)> fn) {
+static bool titleKind(const std::string& title, PanelKind& kind, int& ordinal) {
+  for (PanelKind candidate : kPanelKinds) {
+    const std::string base = panelKindTitle(candidate);
+    if (title == base) {
+      kind = candidate;
+      ordinal = 1;
+      return true;
+    }
+    if (title.size() <= base.size() + 1 || title.compare(0, base.size(), base) != 0 ||
+        title[base.size()] != ' ')
+      continue;
+    char* end = nullptr;
+    long value = std::strtol(title.c_str() + base.size() + 1, &end, 10);
+    if (end && *end == '\0' && value >= 2 && value <= 1000000) {
+      kind = candidate;
+      ordinal = (int)value;
+      return true;
+    }
+  }
+  return false;
+}
+
+static std::string panelSettingsKey(PanelKind kind, int ordinal) {
+  const char* base = kind == PanelKind::Chart       ? "cerium.chart.settings.v1"
+                     : kind == PanelKind::Orderbook ? "cerium.orderbook.settings.v1"
+                     : kind == PanelKind::Dom       ? "cerium.dom.settings.v1"
+                     : kind == PanelKind::Tape      ? "cerium.tape.settings.v1"
+                     : kind == PanelKind::Liquidations ? "cerium.liquidations.settings.v1"
+                                                    : "";
+  if (!*base || ordinal == 1) return base;
+  return std::string(base) + "." + std::to_string(ordinal);
+}
+
+int Terminal::addPanel(PanelKind kind, const std::string& requestedTitle) {
+  std::string title = requestedTitle;
+  if (title.empty()) {
+    title = panelKindTitle(kind);
+    if (panelId(title.c_str()) >= 0) {
+      for (int n = 2;; ++n) {
+        title = std::string(panelKindTitle(kind)) + " " + std::to_string(n);
+        if (panelId(title.c_str()) < 0) break;
+      }
+    }
+  }
+
+  PanelKind parsedKind = kind;
+  int ordinal = 1;
+  if (!titleKind(title, parsedKind, ordinal) || parsedKind != kind) return -1;
   int id = (int)m_panels.size();
-  m_panels.push_back({id, title, std::move(fn)});
+  std::function<void(Ui&, Rect)> draw;
+  if (kind == PanelKind::Chart) {
+    auto state = std::make_unique<ChartPanel>();
+    state->setStorageKey(panelSettingsKey(kind, ordinal));
+    ChartPanel* ptr = state.get();
+    m_charts.push_back(std::move(state));
+    draw = [this, ptr](Ui& u, Rect r) { ptr->draw(u, r, feeds); };
+  } else if (kind == PanelKind::Orderbook) {
+    auto state = std::make_unique<OrderbookPanel>();
+    state->settingsKey = panelSettingsKey(kind, ordinal);
+    OrderbookPanel* ptr = state.get();
+    m_orderbooks.push_back(std::move(state));
+    draw = [this, ptr](Ui& u, Rect r) { drawOrderbook(u, r, *ptr, feeds); };
+  } else if (kind == PanelKind::Dom) {
+    auto state = std::make_unique<DomPanel>();
+    state->settingsKey = panelSettingsKey(kind, ordinal);
+    DomPanel* ptr = state.get();
+    m_doms.push_back(std::move(state));
+    draw = [this, ptr](Ui& u, Rect r) { drawDom(u, r, *ptr, feeds); };
+  } else if (kind == PanelKind::Tape) {
+    auto state = std::make_unique<TapePanel>();
+    state->settingsKey = panelSettingsKey(kind, ordinal);
+    TapePanel* ptr = state.get();
+    m_tapes.push_back(std::move(state));
+    draw = [this, ptr](Ui& u, Rect r) { drawTape(u, r, *ptr, feeds); };
+  } else if (kind == PanelKind::Liquidations) {
+    auto state = std::make_unique<LiquidationsPanel>();
+    state->settingsKey = panelSettingsKey(kind, ordinal);
+    LiquidationsPanel* ptr = state.get();
+    m_liquidations.push_back(std::move(state));
+    draw = [this, ptr](Ui& u, Rect r) { drawLiquidations(u, r, *ptr, feeds); };
+  } else if (kind == PanelKind::Feeds) {
+    auto state = std::make_unique<FeedsPanel>();
+    FeedsPanel* ptr = state.get();
+    m_feedPanels.push_back(std::move(state));
+    draw = [this, ptr](Ui& u, Rect r) { drawFeeds(u, r, *ptr, feeds); };
+  } else {
+    draw = [this](Ui& u, Rect r) { drawWatchlist(u, r, feeds); };
+  }
+
+  m_panels.push_back({id, kind, title, std::move(draw)});
   m_titles.push_back(title);
   return id;
+}
+
+int Terminal::addWidget(PanelKind kind, DockNode* host) {
+  if (!host) return -1;
+  std::vector<int> present;
+  dock.collectTabs(present);
+  for (const PanelDef& panel : m_panels) {
+    bool inDock = std::find(present.begin(), present.end(), panel.id) != present.end();
+    if (panel.kind == kind && !inDock) {
+      dock.insertTab(host, panel.id);
+      return panel.id;
+    }
+  }
+  int id = addPanel(kind);
+  if (id >= 0) dock.insertTab(host, id);
+  return id;
+}
+
+void Terminal::ensurePanelsForLayout(const char* json) {
+  std::vector<std::string> titles;
+  dockCollectTabTitles(json, titles);
+  for (const std::string& title : titles) {
+    if (panelId(title.c_str()) >= 0) continue;
+    PanelKind kind;
+    int ordinal = 0;
+    if (titleKind(title, kind, ordinal)) addPanel(kind, title);
+  }
+}
+
+int Terminal::debugLadderLevels() const {
+  return m_orderbooks.empty() ? 0 : (int)m_orderbooks.front()->ladder.size();
 }
 
 int Terminal::panelId(const char* title) const {
@@ -41,28 +170,32 @@ void Terminal::init(Renderer* renderer) {
   ui.init(renderer->atlas());
   ui.draw.setTextShadowColor(theme().textShadow);
 
-  addPanel("Chart", [this](Ui& u, Rect r) { drawChart(u, r); });
-  addPanel("Orderbook",
-           [this](Ui& u, Rect r) { drawOrderbook(u, r, m_orderbook, feeds); });
-  addPanel("Tape", [this](Ui& u, Rect r) { drawTape(u, r, m_tape, feeds); });
-  addPanel("Watchlist", [](Ui& u, Rect r) { drawWatchlist(u, r); });
-  addPanel("Feeds",
-           [this](Ui& u, Rect r) { drawFeeds(u, r, m_feedsPanel, feeds); });
+  for (PanelKind kind : kPanelKinds) addPanel(kind);
 
   buildDefaultLayout();
   feeds.init();
+  loadLayoutIndex();
 
   if (char* sc = shell_storage_get("cerium.uiscale")) {
     float s = (float)atof(sc);
     if (s >= 0.5f && s <= 2.5f) themeApplyScale(s);
     free(sc);
   }
+  if (char* visible = shell_storage_get(kTabCloseKey)) {
+    m_showTabClose = visible[0] != '0';
+    free(visible);
+  }
+  if (char* visible = shell_storage_get(kTabStripsKey)) {
+    m_showTabStrips = visible[0] != '0';
+    free(visible);
+  }
 }
 
 void Terminal::buildDefaultLayout() {
   DockNode* chart = dock.makeLeaf({panelId("Chart")});
-  DockNode* ob = dock.makeLeaf({panelId("Orderbook")});
-  DockNode* tape = dock.makeLeaf({panelId("Tape"), panelId("Watchlist"), panelId("Feeds")});
+  DockNode* ob = dock.makeLeaf({panelId("Orderbook"), panelId("DOM")});
+  DockNode* tape = dock.makeLeaf({panelId("Tape"), panelId("Liquidations"),
+                                  panelId("Watchlist"), panelId("Feeds")});
   DockNode* right = dock.makeSplit(DockDir::Vertical, ob, tape, 0.5f);
   dock.setRoot(dock.makeSplit(DockDir::Horizontal, chart, right, 0.66f));
 }
@@ -70,16 +203,9 @@ void Terminal::buildDefaultLayout() {
 void Terminal::restoreLayout() {
   char* json = shell_storage_get(kLayoutKey);
   if (json) {
+    ensurePanelsForLayout(json);
     if (dockDeserialize(dock, json, m_titles)) {
       free(json);
-      // panels added since the layout was saved must still appear
-      std::vector<int> present;
-      dock.collectTabs(present);
-      DockNode* host = dock.firstLeaf();
-      for (size_t pid = 0; pid < m_panels.size(); ++pid) {
-        bool found = std::find(present.begin(), present.end(), (int)pid) != present.end();
-        if (!found && host) dock.insertTab(host, (int)pid);
-      }
       return;
     }
     free(json);
@@ -92,14 +218,15 @@ void Terminal::saveLayout() {
   if (!json.empty()) shell_storage_set(kLayoutKey, json.c_str());
 }
 
-void Terminal::frame(const Input& input, float dt, float cssW, float cssH) {
+void Terminal::frame(const Input& input, float frameDt, float uiDt,
+                     float cssW, float cssH) {
   if (!m_restored) {
     restoreLayout();
     m_restored = true;
   }
-  if (dt > 0) m_fps = m_fps * 0.95f + (1.0f / dt) * 0.05f;
+  if (frameDt > 0) m_fps = m_fps * 0.95f + (1.0f / frameDt) * 0.05f;
 
-  ui.begin(input, dt);
+  ui.begin(input, uiDt);
   ui.overlayGate();
   const Theme& t = theme();
 
@@ -151,6 +278,12 @@ void Terminal::frame(const Input& input, float dt, float cssW, float cssH) {
   const char* cursor = "default";
   if (drag.active) {
     cursor = "grabbing";
+  } else if (std::any_of(m_charts.begin(), m_charts.end(),
+                         [](const auto& chart) { return chart->paneResizing(); })) {
+    cursor = "row-resize";
+  } else if (std::any_of(m_charts.begin(), m_charts.end(),
+                         [](const auto& chart) { return chart->panning(); })) {
+    cursor = "grabbing";
   } else if (m_splitDrag) {
     cursor = m_splitDrag->dir == DockDir::Horizontal ? "col-resize" : "row-resize";
   } else {
@@ -174,8 +307,19 @@ void Terminal::frame(const Input& input, float dt, float cssW, float cssH) {
   }
 
   ui.inOverlayPass = true;
-  drawMenu();
   drawSymbolPicker();
+  drawWidgetsPicker();
+  drawLayoutsMenu();
+  for (auto& chart : m_charts) {
+    chart->drawIndicatorPicker(ui);
+    chart->drawIndicatorSettings(ui);
+    chart->drawTfPicker(ui, feeds);
+    chart->drawFlowPicker(ui, feeds);
+  }
+  for (auto& dom : m_doms) dom->drawVenuePicker(ui, feeds);
+  for (auto& ob : m_orderbooks) ob->drawFlowPicker(ui, feeds);
+  for (auto& dom : m_doms) dom->drawFlowPicker(ui, feeds);
+  drawMenu(); // context menus stack above the other popups
   drawTooltip();
   ui.inOverlayPass = false;
 
@@ -197,12 +341,36 @@ void Terminal::drawTopBar(float w) {
   Rect bar{0, 0, w, t.topBarH};
   ui.draw.rect(bar, t.bg);
 
-  Rect logo{0, 0, 120, t.topBarH};
-  ui.draw.textAligned(logo, "C E R I U M", t.accent, DrawList::Left, 14);
+  auto separator = [&](float x) {
+    ui.draw.rect({x, 0, 1, t.topBarH - 1}, t.border);
+  };
+
+  // Compact terminal identity and market selector. Functional groups use
+  // full-height separators so the bar reads as one command surface rather
+  // than a set of unrelated floating labels.
+  ui.draw.setFont(FontMonoSemibold);
+  ui.draw.textAligned({14, 0, 66, t.topBarH}, "CERIUM", t.text, DrawList::Left);
+  ui.draw.setFont(FontMono);
+  separator(82);
 
   // symbol button → picker popover
-  Rect symBtn{130, 6, 64, t.topBarH - 12};
-  if (button(ui, symBtn, kSyms[feeds.symbol])) {
+  Rect symBtn{83, 1, 130, t.topBarH - 2};
+  uint64_t symId = ui.id("##symbol");
+  Behavior sym = behavior(ui, symBtn, symId);
+  if (sym.held || sym.hovered)
+    ui.draw.rect(symBtn, sym.held ? t.accentSoft : t.bgHover);
+  ui.draw.setFont(FontMonoSemibold);
+  ui.draw.textAligned({symBtn.x + 12, symBtn.y, 34, symBtn.h}, kSyms[feeds.symbol],
+                      t.accent, DrawList::Left);
+  ui.draw.setFont(FontMono);
+  Color quietText = withAlpha(t.text, 0.60f);
+  ui.draw.textAligned({symBtn.x + 47, symBtn.y, 55, symBtn.h}, "/ USDT", quietText,
+                      DrawList::Left);
+  Color caret = sym.hovered ? t.text : quietText;
+  float cx = symBtn.x + symBtn.w - 14, cy = symBtn.y + symBtn.h * 0.5f;
+  ui.draw.line(cx - 3, cy - 1, cx, cy + 2, caret, 1.0f);
+  ui.draw.line(cx, cy + 2, cx + 3, cy - 1, caret, 1.0f);
+  if (sym.clicked) {
     m_pickerId = ui.id("##sympicker");
     if (ui.overlayOpen(m_pickerId)) {
       ui.closeOverlay(m_pickerId);
@@ -217,39 +385,115 @@ void Terminal::drawTopBar(float w) {
       m_autoFocusPicker = true;
     }
   }
-  ui.tip(ui.id("symcyc"), symBtn, "switch symbol (ETH / BTC / SOL)");
+  ui.tip(symId, symBtn, "switch market (ETH / BTC / SOL)");
+  separator(symBtn.x + symBtn.w);
 
-  char stats[96];
+  char stats[72];
   if (m_showStats && m_renderer) {
     const Renderer::Stats& st = m_renderer->stats();
-    char q[12], g[12], l[12];
-    fmtCount(q, sizeof(q), st.quads);
-    fmtCount(g, sizeof(g), st.glyphs);
-    fmtCount(l, sizeof(l), st.lines);
-    // 1s rolling frame-cost split (main.cpp) — feed drain / ui build / gpu submit
-    snprintf(stats, sizeof(stats),
-             "%d dc · %s q · %s g · %s l · %.1f/%.1f/%.1f ms", st.drawCalls, q, g,
-             l, cerium_perf(0), cerium_perf(1), cerium_perf(2));
-  } else if (themeScale() != 1.0f)
-    snprintf(stats, sizeof(stats), "%.0f fps · ui %.0f%%", (double)m_fps,
-             (double)(themeScale() * 100.0f));
-  else
-    snprintf(stats, sizeof(stats), "%.0f fps", (double)m_fps);
+    double frameMs = cerium_perf(0) + cerium_perf(1) + cerium_perf(2);
+    snprintf(stats, sizeof(stats), "%d draws  /  %.1f ms", st.drawCalls, frameMs);
+  } else {
+    int live = feeds.liveCount();
+    if (themeScale() != 1.0f)
+      snprintf(stats, sizeof(stats), "%d feeds  /  %.0f fps  /  %.0f%%", live,
+               (double)m_fps, (double)(themeScale() * 100.0f));
+    else
+      snprintf(stats, sizeof(stats), "%d feeds  /  %.0f fps", live, (double)m_fps);
+  }
 
-  // clickable: toggles fps ↔ frame stats
-  Rect statsR{w - 340, 0, 220, t.topBarH};
-  uint64_t sid = ui.id("##statstoggle");
-  Behavior sb = behavior(ui, statsR, sid);
-  if (sb.clicked) m_showStats = !m_showStats;
-  ui.draw.textAligned(statsR, stats, sb.hovered ? t.text : t.textDim, DrawList::Right);
-  ui.tip(sid, statsR, "frame stats (click to toggle)");
+  const float resetW = 76.0f;
+  const float layoutsW = 92.0f;
+  const float tabsW = 72.0f;
+  const float panelW = 88.0f;
+  const float statsW = 176.0f;
+  const float activeW = 118.0f;
+  Rect resetBtn{w - resetW, 1, resetW, t.topBarH - 2};
+  Rect layoutsBtn{resetBtn.x - layoutsW, 1, layoutsW, t.topBarH - 2};
+  Rect tabsBtn{layoutsBtn.x - tabsW, 1, tabsW, t.topBarH - 2};
+  Rect addBtn{tabsBtn.x - panelW, 1, panelW, t.topBarH - 2};
 
-  Rect btn{w - 104, 6, 92, t.topBarH - 12};
-  if (button(ui, btn, "reset layout")) {
+  // Runtime telemetry is deliberately textual—no decorative health light.
+  // Click the segment to switch between feed/fps and frame-cost readouts.
+  if (w > 720) {
+    Rect statsR{addBtn.x - statsW, 1, statsW, t.topBarH - 2};
+    uint64_t sid = ui.id("##statstoggle");
+    Behavior sb = behavior(ui, statsR, sid);
+    if (sb.clicked) m_showStats = !m_showStats;
+    ui.draw.rect(statsR, sb.hovered ? t.bgHover : t.panelAlt);
+    ui.draw.textAligned(statsR, stats, sb.hovered ? t.text : t.textDim,
+                        DrawList::Center);
+    separator(statsR.x);
+    ui.tip(sid, statsR, "runtime stats (click to toggle)");
+
+    // Active snapshot is a quiet workspace breadcrumb in its own segment.
+    if (!m_activeLayout.empty() && w > 980) {
+      Rect activeR{statsR.x - activeW, 1, activeW, t.topBarH - 2};
+      ui.draw.textFit(activeR, m_activeLayout.c_str(), t.accent,
+                      DrawList::Center, 10);
+      separator(activeR.x);
+    }
+  }
+
+  // Persistent low-contrast cells keep workspace actions discoverable. The
+  // active overlay uses the accent, while hover remains a tone shift only.
+  auto topAction = [&](Rect r, const char* id, const char* label, bool active) {
+    Behavior b = behavior(ui, r, ui.id(id));
+    Color bg = b.held || active ? t.accentSoft : b.hovered ? t.bgHover : t.panelAlt;
+    ui.draw.rect(r, bg);
+    ui.draw.setFont(FontMonoSemibold);
+    ui.draw.textAligned(r, label, active ? t.accent : b.hovered ? t.text : quietText,
+                        DrawList::Center);
+    ui.draw.setFont(FontMono);
+    separator(r.x);
+    return b.clicked;
+  };
+
+  // Panel → popup creates/reopens independent widget instances and carries the
+  // global tab-close visibility preference.
+  if (!m_widgetsId) m_widgetsId = ui.id("##widgets");
+  if (topAction(addBtn, "##top-add", "Panel", ui.overlayOpen(m_widgetsId))) {
+    if (ui.overlayOpen(m_widgetsId)) {
+      ui.closeOverlay(m_widgetsId);
+    } else {
+      const float pw = 220.0f;
+      const float ph = 32.0f + (float)(sizeof(kPanelKinds) / sizeof(kPanelKinds[0])) * 24.0f + 16.0f;
+      m_widgetsRect = {addBtn.x + addBtn.w - pw, t.topBarH + 4, pw, ph};
+      ui.openOverlay(m_widgetsId, m_widgetsRect);
+      ui.input.pressed = false;
+    }
+  }
+
+  // Global workspace chrome toggle. The dock tree and active tabs remain
+  // untouched; hiding strips simply returns their height to panel content.
+  if (topAction(tabsBtn, "##top-tabs", "Tabs", !m_showTabStrips)) {
+    m_showTabStrips = !m_showTabStrips;
+    shell_storage_set(kTabStripsKey, m_showTabStrips ? "1" : "0");
+    drag.cancel();
+  }
+  ui.tip(ui.id("##top-tabs"), tabsBtn,
+         m_showTabStrips ? "hide widget tab bars" : "show widget tab bars");
+
+  // Layouts → snapshot manager popup.
+  if (!m_layoutsId) m_layoutsId = ui.id("##layouts");
+  if (topAction(layoutsBtn, "##top-layouts", "Layouts",
+                ui.overlayOpen(m_layoutsId))) {
+    if (ui.overlayOpen(m_layoutsId)) {
+      ui.closeOverlay(m_layoutsId);
+    } else {
+      m_layoutsRect = {layoutsBtn.x + layoutsBtn.w - 300, t.topBarH + 4, 300, 120};
+      ui.openOverlay(m_layoutsId, m_layoutsRect); // height syncs per frame
+      ui.input.pressed = false;
+      m_layoutError.clear();
+      m_renaming = -1;
+    }
+  }
+
+  if (topAction(resetBtn, "##top-reset", "Reset", false)) {
     buildDefaultLayout();
     saveLayout();
   }
-  ui.tip(ui.id("resetbtn"), btn, "restore the default layout");
+  ui.draw.rect({0, t.topBarH - 1, w, 1}, t.border);
 }
 
 void Terminal::handleSplitters() {
@@ -282,25 +526,25 @@ void Terminal::handleSplitters() {
 
 void Terminal::drawLeaf(DockNode* leaf) {
   const Theme& t = theme();
-  Rect card = leaf->rect.inset(2.5f); // shadow room
+  Rect card = leaf->rect;
 
-  // raised card with soft shadow
-  ui.draw.shadow(card, t.radius, 8.0f, 2.0f, hexColor(0x000000, 0.30f));
-  ui.draw.rect(card, t.panel, t.radius);
+  // Flat, contiguous work surface. Dock gaps are the only panel separators.
+  ui.draw.rect(card, t.panel);
 
-  // recessed tab strip, rounded only at the card's top corners
-  Rect strip{card.x, card.y, card.w, t.tabStripH};
-  ui.draw.rect(strip, t.tabStrip, t.radius);
-  ui.draw.rect({strip.x, strip.y + t.radius, strip.w, strip.h - t.radius}, t.tabStrip);
-  drawTabStrip(leaf, strip);
-
-  Rect content{card.x, card.y + t.tabStripH, card.w, card.h - t.tabStripH};
+  Rect content = card;
+  if (m_showTabStrips) {
+    Rect strip{card.x, card.y, card.w, t.tabStripH};
+    ui.draw.rect(strip, t.tabStrip);
+    ui.draw.rect({strip.x, strip.y + strip.h - 1, strip.w, 1}, t.border);
+    drawTabStrip(leaf, strip);
+    content = {card.x, card.y + t.tabStripH, card.w, card.h - t.tabStripH};
+  }
   if (leaf->tabs.empty()) {
     ui.draw.textAligned(content, "empty workspace", t.textDim, DrawList::Center);
   } else {
     int pid = leaf->tabs[(size_t)leaf->active];
     ui.pushId(m_titles[(size_t)pid].c_str());
-    ui.draw.pushClip(content.inset(2));
+    ui.draw.pushClip(content);
     m_panels[(size_t)pid].draw(ui, content);
     ui.draw.popClip();
     ui.popId();
@@ -314,9 +558,12 @@ void Terminal::drawTabStrip(DockNode* leaf, Rect strip) {
 
   // natural widths; compress with truncation when they don't fit
   float naturalTotal = 0;
+  const bool allowClose = m_showTabClose &&
+                          (n <= 0 || availW / std::max(1, n) >= 48.0f);
+  const float closeSpace = allowClose ? 24.0f : 10.0f;
   for (int i = 0; i < n; ++i)
     naturalTotal += ui.draw.measure(m_titles[(size_t)leaf->tabs[(size_t)i]].c_str()) +
-                    2 * t.pad + 20;
+                    2 * t.pad + closeSpace;
   float share = n > 0 ? availW / n : availW;
 
   ui.draw.pushClip(strip);
@@ -324,33 +571,36 @@ void Terminal::drawTabStrip(DockNode* leaf, Rect strip) {
   for (int i = 0; i < n; ++i) {
     int pid = leaf->tabs[(size_t)i];
     const char* title = m_titles[(size_t)pid].c_str();
-    float naturalW = ui.draw.measure(title) + 2 * t.pad + 18;
+    float naturalW = ui.draw.measure(title) + 2 * t.pad + closeSpace;
     float w = naturalTotal <= availW ? naturalW : std::min(naturalW, share);
-    Rect tabR{x, strip.y + 4, w, strip.h - 4};
+    Rect tabR{x, strip.y, w, strip.h - 1};
     bool isActive = i == leaf->active;
     bool hov = ui.hovered(tabR);
     if (hov) ui.hot = ui.id(title);
 
-    // active tab is raised to the panel tone — visually continuous with the
-    // card below; no underline, no outline
+    // Active tab joins the work surface; inactive tabs stay in navigation tone.
     if (isActive) {
-      ui.draw.rect(tabR, t.panel, 6.0f);
-      ui.draw.rect({tabR.x, tabR.y + tabR.h - 6, tabR.w, 6}, t.panel);
+      ui.draw.rect(tabR, t.panel);
     } else if (hov) {
-      ui.draw.rect(tabR, t.bgHover, 6.0f);
+      ui.draw.rect(tabR, t.bgHover);
     }
-    // title centered in the text region (excludes the close-button zone)
-    ui.draw.textFit({tabR.x, tabR.y, tabR.w - 16, tabR.h}, title,
-                    isActive ? t.text : t.textDim, DrawList::Center, 4.0f);
+    // Left-aligned labels scan like workspace tabs, not segmented game buttons.
+    ui.draw.textFit({tabR.x, tabR.y,
+                     tabR.w - (allowClose ? 16.0f : 4.0f), tabR.h}, title,
+                    isActive ? t.text : t.textDim, DrawList::Left, 8.0f);
 
     // close glyph (×) on the tab's right edge — font-drawn, not AA lines
     Rect closeR{tabR.x + tabR.w - 16, tabR.y, 14, tabR.h};
-    bool closeHov = closeR.contains(ui.input.mouseX, ui.input.mouseY);
-    ui.draw.textAligned(closeR, "\xc3\x97", closeHov ? t.red : t.textDim,
-                        DrawList::Center);
+    bool closeHov = allowClose &&
+                    closeR.contains(ui.input.mouseX, ui.input.mouseY);
+    if (allowClose && (isActive || hov))
+      ui.draw.textAligned(closeR, "\xc3\x97", closeHov ? t.red : t.textDim,
+                          DrawList::Center);
 
     if (closeHov && ui.input.pressed) {
       dock.removeTab(leaf, pid); // collapses the leaf when emptied
+      // tabs shifted left under this loop — one close per press
+      break;
     } else if (hov && ui.input.pressed) {
       leaf->active = i;
       dock.changed = true;
@@ -375,35 +625,28 @@ void Terminal::drawTabStrip(DockNode* leaf, Rect strip) {
                  }}},
                m_winW, m_winH);
     }
-    x += w + 4;
+    x += w + 2;
   }
 
-  // "+" — add a panel that isn't currently in any leaf
-  Rect plusR{x, strip.y + 4, 22, strip.h - 6};
+  // "+" — add another independent widget instance to this leaf. A closed
+  // instance of that type is reused first so its local state is not lost.
+  Rect plusR{x, strip.y, 22, strip.h - 1};
   bool plusHov = ui.hovered(plusR);
   uint64_t plusId = ui.id("##addpanel");
   if (plusHov) {
     ui.hot = plusId;
-    ui.draw.rect(plusR, t.bgHover, 4.0f);
+    ui.draw.rect(plusR, t.bgHover);
   }
   ui.draw.textAligned(plusR, "+", plusHov ? t.text : t.textDim, DrawList::Center);
   if (plusHov && ui.input.pressed) ui.active = plusId;
   if (plusHov && ui.input.released && ui.active == plusId) {
     ui.active = 0;
-    std::vector<int> presentTabs;
-    dock.collectTabs(presentTabs);
     std::vector<MenuItem> items;
-    for (size_t p = 0; p < m_panels.size(); ++p) {
-      bool present =
-          std::find(presentTabs.begin(), presentTabs.end(), (int)p) != presentTabs.end();
-      if (!present) {
-        DockNode* leafPtr = leaf;
-        int pid = (int)p;
-        items.push_back(
-            {m_titles[p], [this, leafPtr, pid] { dock.insertTab(leafPtr, pid); }});
-      }
+    for (PanelKind kind : kPanelKinds) {
+      DockNode* leafPtr = leaf;
+      items.push_back({panelKindTitle(kind),
+                       [this, leafPtr, kind] { addWidget(kind, leafPtr); }});
     }
-    if (items.empty()) items.push_back({"(all panels in use)", [] {}});
     openMenu(ui.input.mouseX, ui.input.mouseY, std::move(items), m_winW, m_winH);
   }
   ui.draw.popClip();
@@ -435,6 +678,7 @@ void Terminal::drawMenu() {
   Rect r = m_menuRect;
   ui.draw.shadow(r, t.radius, 14.0f, 3.0f, hexColor(0x000000, 0.45f));
   ui.draw.rect(r, t.panel, t.radius);
+  ui.draw.rectOutline(r, t.border, 1.0f, t.radius);
 
   float y = r.y + 4;
   for (size_t i = 0; i < m_menu.size(); ++i) {
@@ -493,6 +737,7 @@ void Terminal::drawSymbolPicker() {
 
   ui.draw.shadow(r, t.radius, 14.0f, 3.0f, hexColor(0x000000, 0.45f));
   ui.draw.rect(r, t.panel, t.radius);
+  ui.draw.rectOutline(r, t.border, 1.0f, t.radius);
 
   Rect searchR{r.x + 8, r.y + 8, r.w - 16, 26};
   if (m_autoFocusPicker) {
@@ -544,16 +789,65 @@ void Terminal::drawSymbolPicker() {
 }
 
 // ---------------------------------------------------------------------------
-// chart panel hookup (panel draw lives in chart/chart_panel.cpp)
+// add-widget popup (overlay)
 // ---------------------------------------------------------------------------
 
-void Terminal::drawChart(Ui& u, Rect r) {
-  m_chart.draw(u, r, feeds,
-               [this](float x, float y, std::vector<ChartMenuItem> items) {
-                 std::vector<MenuItem> menu;
-                 menu.reserve(items.size());
-                 for (auto& it : items)
-                   menu.push_back({std::move(it.label), std::move(it.action)});
-                 openMenu(x, y, std::move(menu), m_winW, m_winH);
-               });
+// Fixed widget catalog. Clicking a type always adds another instance (or
+// reopens the first closed instance of that type), so the registry can grow
+// without turning this menu into an unbounded list of numbered copies.
+void Terminal::drawWidgetsPicker() {
+  if (!ui.overlayOpen(m_widgetsId)) return;
+  const Theme& t = theme();
+  Rect r = m_widgetsRect;
+  ui.draw.shadow(r, t.radius, 14.0f, 3.0f, hexColor(0x000000, 0.45f));
+  ui.draw.rect(r, t.panel, t.radius);
+  ui.draw.rectOutline(r, t.border, 1.0f, t.radius);
+
+  std::vector<int> present;
+  dock.collectTabs(present);
+
+  float y = r.y + 4;
+  Rect closeRow{r.x + 4, y, r.w - 8, 24};
+  bool closeHov = ui.hovered(closeRow);
+  if (closeHov) {
+    ui.hot = m_widgetsId + 100;
+    ui.draw.rect(closeRow, t.bgHover, 3.0f);
+  }
+  ui.draw.textAligned(closeRow, "TAB CLOSE BUTTONS", t.text, DrawList::Left, 8);
+  ui.draw.textAligned(closeRow, m_showTabClose ? "VISIBLE" : "HIDDEN",
+                      m_showTabClose ? t.accent : t.textDim, DrawList::Right, 8);
+  if (closeHov && ui.input.released) {
+    m_showTabClose = !m_showTabClose;
+    shell_storage_set(kTabCloseKey, m_showTabClose ? "1" : "0");
+    ui.input.released = false;
+  }
+  y += 28;
+  ui.draw.rect({r.x + 8, y - 2, r.w - 16, 1}, t.border);
+
+  for (size_t i = 0; i < sizeof(kPanelKinds) / sizeof(kPanelKinds[0]); ++i) {
+    PanelKind kind = kPanelKinds[i];
+    int open = 0;
+    for (int id : present)
+      if (id >= 0 && id < (int)m_panels.size() && m_panels[(size_t)id].kind == kind)
+        ++open;
+    Rect row{r.x + 4, y, r.w - 8, 24};
+    bool hov = ui.hovered(row);
+    if (hov) {
+      ui.hot = m_widgetsId + (uint64_t)i + 1;
+      ui.draw.rect(row, t.bgHover, 3.0f);
+    }
+    ui.draw.textAligned(row, panelKindTitle(kind), t.text, DrawList::Left, 8);
+    char count[24];
+    snprintf(count, sizeof(count), "%d OPEN", open);
+    ui.draw.textAligned(row, count, open > 0 ? t.accent : t.textDim,
+                        DrawList::Right, 8);
+    if (hov && ui.input.released) {
+      DockNode* host = dock.firstLeaf();
+      addWidget(kind, host);
+      ui.closeOverlay(m_widgetsId);
+      ui.input.released = false;
+      return;
+    }
+    y += 24;
+  }
 }

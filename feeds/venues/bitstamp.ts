@@ -121,7 +121,7 @@ export class BitstampAdapter implements VenueAdapter {
     const ws = new WebSocket(WS_URL);
     this.ws = ws;
     ws.onopen = () => {
-      this.conn.connected();
+      // Backoff resets only after the snapshot lands (see fetchSnapshot).
       this.deps.setState("syncing");
       ws.send(JSON.stringify({ event: "bts:subscribe", data: { channel: this.channel } }));
 
@@ -212,6 +212,9 @@ export class BitstampAdapter implements VenueAdapter {
     this.deps.book.applySnapshot(snap.bids, snap.asks);
     for (const d of remaining) this.deps.book.applyUpdates(d.updates);
     this.buffer = null;
+    // Snapshot applied and diffs bridged — reset reconnect backoff here, not
+    // on socket open.
+    this.conn.connected();
     this.deps.setState("live");
   }
 

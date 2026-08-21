@@ -18,6 +18,7 @@ ShellSize shell_sync_canvas();
 // frees) or nullptr when the key is absent.
 char* shell_storage_get(const char* key);
 void shell_storage_set(const char* key, const char* value);
+void shell_storage_remove(const char* key);
 
 // Sets the OS cursor over the canvas ("default", "pointer", "col-resize",
 // "row-resize", "grabbing", ...). Cheap to call every frame — no-ops on repeat.

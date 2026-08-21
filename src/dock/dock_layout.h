@@ -12,6 +12,10 @@
 
 std::string dockSerialize(const DockTree& tree, const std::vector<std::string>& titles);
 
+// Extracts serialized tab titles before deserialization so the app can create
+// dynamic widget instances (for example "Chart 3") referenced by a layout.
+void dockCollectTabTitles(const char* json, std::vector<std::string>& out);
+
 // Rebuilds the tree from json. Returns false (tree untouched apart from pool
 // allocs) when the json is missing/corrupt or references no known panels —
 // caller should fall back to the default layout.

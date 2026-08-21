@@ -1,6 +1,8 @@
 #include "input.h"
+
 #include "shell.h"
 
+#include <cstdio>
 #include <emscripten/html5.h>
 #include <cstring>
 

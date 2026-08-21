@@ -25,7 +25,8 @@ static double g_pFeedMs, g_pUiMs, g_pRenderMs, g_pRafFps, g_pFps, g_pEvents;
 
 // index: 0 feed drain ms  1 ui build ms  2 render submit ms  3 rAF fps
 //        4 rendered fps   5 events/frame 6 draw calls  7 quads  8 glyphs
-//        9 lines         10 ob ladder levels 11 candles
+//        9 lines         10 ob ladder levels 11 candles 12 atlas height
+//        13 retained chart order-flow prints
 extern "C" EMSCRIPTEN_KEEPALIVE double cerium_perf(int i) {
   switch (i) {
     case 0: return g_pFeedMs;
@@ -40,8 +41,17 @@ extern "C" EMSCRIPTEN_KEEPALIVE double cerium_perf(int i) {
     case 9: return (double)g_renderer.stats().lines;
     case 10: return (double)g_terminal.debugLadderLevels();
     case 11: return (double)g_terminal.feeds.candles.v.size();
+    case 12: return (double)g_renderer.atlas()->height();
+    case 13: return (double)g_terminal.feeds.orderFlow.v.size();
+    case 14: return (double)g_terminal.feeds.candles.tf.kind;
+    case 15: return g_terminal.feeds.candles.tf.value;
     default: return 0;
   }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE double cerium_set_tf(int kind, double value) {
+  g_terminal.feeds.setTimeframe({(Timeframe::Kind)(uint8_t)kind, value});
+  return g_terminal.feeds.candles.tf.value;
 }
 
 #ifdef CERIUM_STRESS
@@ -55,13 +65,13 @@ static float stressRand() {
 }
 #endif
 
-static void frame() {
+static bool frame() {
   ShellSize s = shell_sync_canvas();
 
   // wait for GPU + pipelines + font
   if (!g_renderer.ready("/assets/fonts/IBMPlexMono-Regular.ttf", theme().fontSize,
                         s.dpr))
-    return;
+    return false;
   if (!g_termInited) {
     g_terminal.init(&g_renderer);
     // second face for emphasis (headers/values) — shares the atlas texture;
@@ -96,9 +106,12 @@ static void frame() {
   g_lastMY = in.mouseY;
   bool heartbeat = (now - g_lastRender) > 250.0; // fps text + time-driven widgets
 
-  if (applied > 0 || inputEdge || moved || heartbeat || g_terminal.drag.active) {
+  bool busy = applied > 0 || inputEdge || moved || heartbeat ||
+             g_terminal.drag.active;
+  if (busy) {
     double tUi0 = emscripten_performance_now();
-    g_terminal.frame(in, dt, s.cssW, s.cssH);
+    float uiDt = g_lastRender > 0 ? (float)((now - g_lastRender) / 1000.0) : dt;
+    g_terminal.frame(in, dt, uiDt, s.cssW, s.cssH);
     double tUi1 = emscripten_performance_now();
 #ifdef CERIUM_STRESS
     {
@@ -143,12 +156,53 @@ static void frame() {
   }
 
   input_end_frame();
+  return busy;
 }
+
+// Uncapped frame pump. The rAF main loop capped ticks at the display refresh
+// rate; this MessageChannel pump dispatches immediately (browser engines clamp
+// chained setTimeout to ~4ms; MessageChannel tasks are not clamped), so while
+// anything is happening — feed events, input, drag, animation — the loop runs
+// as fast as the event loop allows. Input events, worker postMessages, and
+// timers interleave between ticks, so data and input are consumed with
+// sub-frame latency. The canvas still composites at the browser's rate; what
+// uncapping buys is that every compositor frame presents the very latest
+// data. A fully idle tick (nothing drained, no input, no render) hops through
+// a 4ms timeout instead so an idle terminal doesn't spin a core — the first
+// event resumes immediate pacing.
+EM_JS(void, cerium_run_uncapped_loop, (), {
+  var tick = Module._cerium_frame_pump;
+  if (typeof tick !== 'function') {
+    console.error('cerium: frame pump export missing');
+    return;
+  }
+  var chan = new MessageChannel();
+  var running = false;
+  var step = function () {
+    if (running) return;
+    running = true;
+    chan.port1.onmessage = function () {
+      var busy = false;
+      try {
+        busy = tick() !== 0;
+      } catch (e) {
+        console.error('cerium: frame pump aborted', e); // stop, no error storm
+        return;
+      }
+      if (busy) chan.port2.postMessage(0); // active: next tick immediately
+      else setTimeout(function () { chan.port2.postMessage(0); }, 4); // idle hop
+    };
+    chan.port2.postMessage(0);
+  };
+  step();
+});
+
+extern "C" EMSCRIPTEN_KEEPALIVE int cerium_frame_pump() { return frame() ? 1 : 0; }
 
 int main() {
   input_install_hooks();
   gpu_set_error_handler(shell_boot_error); // render/gpu fatal errors → splash
   g_renderer.beginInit(kCanvasSelector);
-  emscripten_set_main_loop(frame, 0, true);
+  cerium_run_uncapped_loop(); // uncapped MessageChannel pump keeps the app alive
   return 0;
 }

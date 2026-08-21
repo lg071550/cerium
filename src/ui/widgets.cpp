@@ -41,20 +41,22 @@ bool button(Ui& ui, Rect r, const char* label) {
 
   const Theme& t = theme();
   Color bg = b.held ? t.accentSoft : (b.hovered ? t.bgHover : t.bgRaised);
-  ui.draw.rect(r, bg, t.radius * 0.75f);
+  ui.draw.rect(r, bg, 2.0f);
   ui.draw.textAligned(r, label, t.text, DrawList::Center);
   return b.clicked;
 }
 
 void listView(Ui& ui, Rect area, int rowCount, float rowH, ListState& state,
-              const std::function<void(DrawList&, Rect, int)>& drawRow) {
+              const std::function<void(DrawList&, Rect, int)>& drawRow,
+              bool showScrollbar) {
   std::function<void(Ui&, DrawList&, Rect, int)> fwd =
       [&](Ui&, DrawList& d, Rect row, int i) { drawRow(d, row, i); };
-  listView(ui, area, rowCount, rowH, state, fwd);
+  listView(ui, area, rowCount, rowH, state, fwd, showScrollbar);
 }
 
 void listView(Ui& ui, Rect area, int rowCount, float rowH, ListState& state,
-              const std::function<void(Ui&, DrawList&, Rect, int)>& drawRow) {
+              const std::function<void(Ui&, DrawList&, Rect, int)>& drawRow,
+              bool showScrollbar) {
   const Theme& t = theme();
   float contentH = rowCount * rowH;
   float maxScroll = contentH > area.h ? contentH - area.h : 0.0f;
@@ -67,7 +69,10 @@ void listView(Ui& ui, Rect area, int rowCount, float rowH, ListState& state,
   float thumbH = overflow ? area.h * (area.h / contentH) : 0.0f;
   uint64_t wid = widgetId(ui, "##scrollbar");
 
-  if (overflow) {
+  // A release while the scrollbar is hidden (content shrank mid-drag) would
+  // otherwise never be observed and wedge wheel scrolling off.
+  if (!showScrollbar || !overflow) state.dragging = false;
+  if (overflow && showScrollbar) {
     float thumbY0 = track.y + (track.h - thumbH) * (state.scroll / maxScroll);
     Rect thumb{track.x, thumbY0, trackW, thumbH};
 
@@ -106,7 +111,7 @@ void listView(Ui& ui, Rect area, int rowCount, float rowH, ListState& state,
   }
   ui.draw.popClip();
 
-  if (overflow) {
+  if (overflow && showScrollbar) {
     float thumbY = track.y + (track.h - thumbH) * (state.scroll / maxScroll);
     Color c = state.dragging ? t.textDim : t.splitter;
     Rect dr{track.x + 2, std::round(thumbY), trackW - 4, std::round(thumbH)};
@@ -159,9 +164,9 @@ bool textField(Ui& ui, Rect r, TextFieldState& st, const char* id,
     }
   }
 
-  // recessed field; soft accent glow when focused
-  if (st.focused) ui.draw.shadow(r, t.radius * 0.75f, 6.0f, 0.0f, withAlpha(t.accent, 0.35f));
-  ui.draw.rect(r, st.focused ? t.panel : t.panelAlt, t.radius * 0.75f);
+  // Recessed field with a tonal focus state. Avoid a neon focus halo—the
+  // caret already supplies the precise interaction cue.
+  ui.draw.rect(r, st.focused ? t.bgRaised : t.panelAlt, 2.0f);
 
   Rect inner = r.inset(4);
   ui.draw.pushClip(inner);
@@ -195,7 +200,7 @@ bool toggle(Ui& ui, Rect r, const char* label, bool& value) {
 
   float box = r.h - 8;
   Rect br{r.x + 4, r.y + 4, box, box};
-  ui.draw.rect(br, value ? t.accent : (b.hovered ? t.bgHover : t.panelAlt), 3.0f);
+  ui.draw.rect(br, value ? t.accent : (b.hovered ? t.bgHover : t.panelAlt), 2.0f);
   if (value) {
     // check mark, drawn in the window-bg tone inset against the accent box
     float cx = br.x, cy = br.y, s = box;
@@ -235,14 +240,19 @@ bool slider(Ui& ui, Rect r, const char* id, float& v, float lo, float hi) {
       shown = it->second;
     }
   }
+  // Evict stale entries when no slider is being dragged. If a slider is
+  // removed mid-drag (panel closed), its scratch value lingers forever —
+  // this clears all orphans on the first idle frame.
+  if (!ui.input.down && !s_drag.empty() && s_drag.size() > 1)
+    s_drag.clear();
 
   float frac = hi > lo ? std::clamp((shown - lo) / (hi - lo), 0.0f, 1.0f) : 0.0f;
   float cy = r.y + r.h * 0.5f;
-  float tx = r.x + 5.0f + frac * (r.w - 10.0f); // thumb stays inside the track
-  ui.draw.rect({r.x, cy - 1.5f, r.w, 3.0f}, t.splitter, 1.5f);
-  ui.draw.rect({r.x, cy - 1.5f, tx - r.x, 3.0f}, t.accent, 1.5f);
+  float tx = r.x + 4.0f + frac * (r.w - 8.0f); // thumb stays inside the track
+  ui.draw.rect({r.x, cy - 0.5f, r.w, 1.0f}, t.splitter);
+  ui.draw.rect({r.x, cy - 0.5f, tx - r.x, 1.0f}, t.accent);
   Color thumb = b.held ? t.accent : (b.hovered ? t.textDim : t.bgHover);
-  ui.draw.rect({tx - 5, cy - 5, 10, 10}, thumb, 5.0f);
+  ui.draw.rect({tx - 3.5f, cy - 4.0f, 7.0f, 8.0f}, thumb, 2.0f);
   return changed;
 }
 
@@ -250,8 +260,10 @@ bool chip(Ui& ui, Rect r, const char* label, bool on) {
   const Theme& t = theme();
   uint64_t wid = widgetId(ui, label);
   Behavior b = behavior(ui, r, wid);
-  Color bg = on ? t.accentSoft : (b.hovered ? t.bgHover : t.panelAlt);
-  ui.draw.rect(r, bg, 4.0f);
+  if (on)
+    ui.draw.rect(r, t.bgRaised, 1.0f);
+  else if (b.hovered || b.held)
+    ui.draw.rect(r, b.held ? t.accentSoft : t.bgHover, 1.0f);
   ui.draw.textAligned(r, label, on ? t.text : t.textDim, DrawList::Center);
   return b.clicked;
 }
@@ -265,7 +277,7 @@ void panelHeader(Ui& ui, Rect r, const char* title, const char* right) {
 
 void gutterTag(DrawList& d, Rect r, const char* text, Color c) {
   const Theme& t = theme();
-  d.shadow(r, 3.0f, 6.0f, 1.0f, hexColor(0x000000, 0.35f));
-  d.rect(r, t.bgRaised, 3.0f);
+  d.shadow(r, 1.0f, 3.0f, 1.0f, hexColor(0x000000, 0.24f));
+  d.rect(r, t.bgRaised, 1.0f);
   d.textAligned(r, text, c, DrawList::Center);
 }

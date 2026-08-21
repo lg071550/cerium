@@ -9,8 +9,14 @@ build/
 
 # local binaries
 harness.exe
+harness.next.exe
+*.obj
+*.exe
+*.ilk
+*.pdb
 
 # editor / OS noise
+.vs/
 .vscode/
 .idea/
 *.swp
