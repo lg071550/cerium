@@ -137,6 +137,8 @@ bool textField(Ui& ui, Rect r, TextFieldState& st, const char* id,
       shell_ime_blur();
     }
   }
+  if (st.focused && ui.focusedField != wid) ui.focusedField = wid;
+  if (!st.focused && ui.focusedField == wid) ui.focusedField = 0;
 
   if (st.focused) {
     for (int i = 0; i < ui.input.keyCount; ++i) {

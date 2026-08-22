@@ -13,6 +13,11 @@ struct Ui {
   DrawList draw;
   uint64_t hot = 0;    // widget under the mouse
   uint64_t active = 0; // widget currently pressed/dragged
+  // Id of the currently keyboard/IME-focused text field, 0 = none. Lets
+  // late-drawn consumers (e.g. the DOM pin) defer to Escape's owner: a
+  // focused field blurs on Esc and the same press must not also unhook
+  // unrelated state.
+  uint64_t focusedField = 0;
   float dt = 0, time = 0;
   uint32_t frame = 0;
 

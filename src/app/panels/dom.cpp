@@ -326,8 +326,11 @@ bool applyCustomStep(DomPanel& st) {
 void drawSettings(Ui& u, Rect area, DomPanel& st) {
   const Theme& t = theme();
   constexpr int count = 15;
+  // Rows can wrap chip lines; anything under ~430px must reserve height for a
+  // second line or wrapped controls (PRECISION emits 9 chips ≈ 414px) become
+  // unreachable instead of merely taller.
   float rowH = area.w < 110 ? 150.0f : area.w < 190 ? 94.0f
-                                          : area.w < 340 ? 68.0f : 44.0f;
+                                          : area.w < 430 ? 68.0f : 44.0f;
   listView(u, area, count, rowH, st.settingsList,
            [&](Ui& rowUi, DrawList& d, Rect row, int index) {
              char id[32]; snprintf(id, sizeof(id), "##dom-setting-%d", index);
@@ -558,12 +561,18 @@ void DomPanel::drawVenuePicker(Ui& u, Feeds& feeds) {
                d.textAligned(row, status, state.status == wire::Live ? t.green : t.textDim,
                              DrawList::Right, 8);
              }
-             if (hov && rowUi.input.released) {
-               venue = v; autoCenter = true; centerOffset = 0; hasPinned = false;
-               tickVersion = ~0ull; saveSettings(*this);
-               rowUi.closeOverlay(venuePickerId);
-               rowUi.input.released = false;
-             }
+              // Press-inside guard via the canonical primitive: a drag that
+              // started elsewhere must not commit when it releases over a row.
+              Behavior rowB = behavior(
+                  rowUi, row,
+                  rowUi.id("##dom-vrow") +
+                      (uint64_t)(index + 1) * 0x9E3779B97F4A7C15ull);
+              if (rowB.clicked) {
+                venue = v; autoCenter = true; centerOffset = 0; hasPinned = false;
+                tickVersion = ~0ull; saveSettings(*this);
+                rowUi.closeOverlay(venuePickerId);
+                rowUi.input.released = false;
+              }
            });
 }
 
@@ -806,7 +815,10 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
     st.centerOffset -= (int64_t)std::lround(u.input.wheelY / 40.0f);
     st.autoCenter = false;
   }
-  if (u.input.escapePressed && st.hasPinned) st.hasPinned = false;
+  // Escape priority: a focused text field owns the press (it blurs); the pin
+  // unhooks only when no field is focused.
+  if (u.input.escapePressed && u.focusedField == 0 && st.hasPinned)
+    st.hasPinned = false;
   int64_t midTick = (int64_t)std::llround(st.model.summary.mid / st.effectiveStep);
   int64_t centerTick = midTick + st.centerOffset;
   int64_t topTick = centerTick + rowCount / 2;

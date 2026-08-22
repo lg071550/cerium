@@ -51,6 +51,7 @@ private:
   bool m_showTabStrips = true;
   bool m_restored = false;
   float m_winW = 0, m_winH = 0;
+  float m_layoutDirtyAt = -10.0f; // ui.time of the latest dock change (debounced persistence)
 
   int addPanel(PanelKind kind, const std::string& title = {});
   int addWidget(PanelKind kind, DockNode* host);

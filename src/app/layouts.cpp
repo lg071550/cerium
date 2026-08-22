@@ -9,17 +9,28 @@
 #include "../ui/theme.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 static const char* kLayoutIndexKey = "cerium.layouts.index";
 static const char* kLayoutPrefix = "cerium.layouts.";
 
-// index JSON: [{"name":"alpha","fav":1},...] — we own the format, so a
-// minimal scanner is enough (names escape only \ and ")
+// index JSON: [1,{"name":"alpha","fav":1},...] — leading version element (v1)
+// marks the format; legacy indexes start with '{' and load unversioned. We own
+// the format, so a minimal scanner is enough (names escape only \ and ").
+// Control characters are stripped from names: raw bytes < 0x20 would make the
+// index invalid JSON by spec.
 
 static void jsonEscape(std::string& out, const std::string& s) {
+  char b[8];
   for (char c : s) {
     if (c == '\\' || c == '"') out += '\\';
+    else if ((unsigned char)c < 0x20) { // control junk from pasted names
+      snprintf(b, sizeof(b), "\\u%04x", (unsigned char)c);
+      out += b;
+      continue;
+    }
     out += c;
   }
 }
@@ -28,30 +39,51 @@ void Terminal::loadLayoutIndex() {
   m_layouts.clear();
   char* json = shell_storage_get(kLayoutIndexKey);
   if (!json) return;
-  const char* p = json;
-  while ((p = std::strstr(p, "\"name\":\""))) {
-    p += 8;
-    SavedLayout l;
-    while (*p && *p != '"') {
-      if (*p == '\\' && p[1]) ++p; // unescape
-      l.name += *p++;
+  const char* p = std::strchr(json, '[');
+  bool salvaged = false;
+  if (p) {
+    ++p; // past '['
+    while (*p == ' ') ++p;
+    if (*p == '1' && p[1] == ',') p += 2; // versioned index
+    while ((p = std::strstr(p, "\"name\":\""))) {
+      p += 8;
+      SavedLayout l;
+      while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) {
+          // \u00XX control escapes decode back to the raw byte
+          if (p[1] == 'u' && p[2] == '0' && p[3] == '0') {
+            l.name += (char)std::strtoul(std::string(p + 4, 2).c_str(), nullptr, 16);
+            p += 6;
+            continue;
+          }
+          ++p; // plain escape
+        }
+        l.name += *p++;
+      }
+      const char* next = *p ? std::strstr(p + 1, "\"name\":\"") : nullptr;
+      const char* f = *p ? std::strstr(p, "\"fav\":") : nullptr;
+      if (!f || (next && f > next)) {
+        // Malformed record: salvage the rest of the index instead of losing
+        // every snapshot after it. The bodies remain in storage either way.
+        salvaged = true;
+        if (!next) break;
+        p = next;
+        continue;
+      }
+      l.favorite = f[6] == '1';
+      m_layouts.push_back(std::move(l));
+      p = f + 6;
     }
-    if (!*p) break;
-    const char* f = std::strstr(p, "\"fav\":");
-    if (!f) break;
-    l.favorite = f[6] == '1';
-    m_layouts.push_back(std::move(l));
-    p = f + 6;
   }
   free(json);
+  if (salvaged) m_layoutError = "layout index partially unreadable";
   sortLayouts();
 }
 
 void Terminal::saveLayoutIndex() {
-  std::string json = "[";
+  std::string json = "[1";
   for (size_t i = 0; i < m_layouts.size(); ++i) {
-    if (i) json += ',';
-    json += "{\"name\":\"";
+    json += ",{\"name\":\"";
     jsonEscape(json, m_layouts[i].name);
     json += "\",\"fav\":";
     json += m_layouts[i].favorite ? '1' : '0';

@@ -3,6 +3,7 @@
 #include "../dock/dock_layout.h"
 #include "../platform/shell.h"
 #include "../ui/theme.h"
+#include "../ui/widgets.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -328,7 +329,10 @@ void Terminal::frame(const Input& input, float frameDt, float uiDt,
     drag.drawOverlay(ui, dock, pid >= 0 ? m_titles[(size_t)pid].c_str() : "?");
   }
 
-  if (dock.changed) {
+  // Debounced persistence: tab activation marks the dock dirty on every
+  // click; serialize+write only after ~1 s without changes so switching
+  // tabs doesn't write localStorage per frame-click.
+  if (dock.changed && ui.time - m_layoutDirtyAt >= 1.0) {
     saveLayout();
     dock.changed = false;
   }
@@ -510,6 +514,7 @@ void Terminal::handleSplitters() {
     if (!ui.input.down) {
       m_splitDrag = nullptr;
       dock.changed = true;
+      m_layoutDirtyAt = ui.time;
     }
     return;
   }
@@ -600,10 +605,12 @@ void Terminal::drawTabStrip(DockNode* leaf, Rect strip) {
     if (closeHov && ui.input.pressed) {
       dock.removeTab(leaf, pid); // collapses the leaf when emptied
       // tabs shifted left under this loop — one close per press
+      m_layoutDirtyAt = ui.time;
       break;
     } else if (hov && ui.input.pressed) {
       leaf->active = i;
       dock.changed = true;
+      m_layoutDirtyAt = ui.time;
       drag.arm(leaf, pid, ui.input.mouseX, ui.input.mouseY);
     }
     if (hov && ui.input.rightPressed) {
@@ -689,7 +696,9 @@ void Terminal::drawMenu() {
       ui.draw.rect(item, t.bgHover, 3.0f);
     }
     ui.draw.textAligned(item, m_menu[i].label.c_str(), t.text, DrawList::Left, 8);
-    if (hov && ui.input.released) {
+    // Press-inside guard: menu items commit only when the press started on
+    // the item itself (a drag released over the menu must not fire it).
+    if (behavior(ui, item, m_menuId + (uint64_t)i + 1).clicked) {
       auto action = std::move(m_menu[i].action);
       ui.closeOverlay(m_menuId);
       ui.input.released = false; // don't leak the click into panels
@@ -778,7 +787,7 @@ void Terminal::drawSymbolPicker() {
     ui.draw.textAligned(row, kSyms[sym], sym == feeds.symbol ? t.accent : t.text,
                         DrawList::Left, 8);
     ui.draw.textAligned(row, cnt, t.textDim, DrawList::Right, 8);
-    if (hov && ui.input.released) {
+    if (behavior(ui, row, m_pickerId ^ (0x9E3779B97F4A7C15ull * (uint64_t)(sym + 1))).clicked) {
       feeds.setSymbol(sym);
       ui.closeOverlay(m_pickerId);
       ui.input.released = false;
