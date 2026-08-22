@@ -11,6 +11,7 @@
 #include "../../ui/widgets.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -4430,78 +4431,138 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
                               std::max(1.0f, ctx.price.area.h / 11.0f));
     const double dayMs = 86400000.0;
     const double bracketMs = (m_tpoBracket == 0 ? 30.0 : 60.0) * 60000.0;
-    std::vector<TpoSession> sessions;
     // TPO is session-native rather than candle-native. Show the latest few UTC
     // sessions ending at the current horizontal viewport, allocating a stable
     // profile column to each instead of stretching letters over bar spacing.
     int maxSessions = ctx.price.area.w >= 760 ? 4 : ctx.price.area.w >= 460 ? 3 : 2;
     int tpoFirst = ctx.vis1;
-    int64_t lastDay = -1;
-    int dayCount = 0;
-    for (int i = ctx.vis1; i >= 0; --i) {
-      int64_t day = utcDay(cs.v[(size_t)i].ts);
-      if (day != lastDay) {
-        lastDay = day;
-        if (++dayCount > maxSessions) { tpoFirst = i + 1; break; }
+    {
+      int64_t lastDay = -1;
+      int dayCount = 0;
+      for (int i = ctx.vis1; i >= 0; --i) {
+        int64_t day = utcDay(cs.v[(size_t)i].ts);
+        if (day != lastDay) {
+          lastDay = day;
+          if (++dayCount > maxSessions) { tpoFirst = i + 1; break; }
+        }
+        tpoFirst = i;
       }
-      tpoFirst = i;
-    }
-    for (int i = tpoFirst; i <= ctx.vis1; ++i) {
-      const Candle& candle = cs.v[(size_t)i];
-      int64_t day = utcDay(candle.ts);
-      if (sessions.empty() || sessions.back().day != day) {
-        TpoSession fresh;
-        fresh.day = day;
-        fresh.last = i;
-        fresh.open = fresh.close = candle.o;
-        sessions.push_back(std::move(fresh));
-      }
-      TpoSession& session = sessions.back();
-      session.last = i;
-      session.close = candle.c;
-      int period = (int)std::floor((candle.ts - day * dayMs) / bracketMs);
-      period = std::clamp(period, 0, 63);
-      int ibPeriods = m_tpoBracket == 0 ? 2 : 1;
-      if (period < ibPeriods) {
-        session.ibHigh = std::max(session.ibHigh, candle.h);
-        session.ibLow = std::min(session.ibLow, candle.l);
-      }
-      int64_t loTick = (int64_t)std::floor(candle.l / tpoStep);
-      int64_t hiTick = (int64_t)std::ceil(candle.h / tpoStep);
-      for (int64_t tick = loTick; tick <= hiTick && tick - loTick < 4096; ++tick)
-        session.rows[tick] |= 1ull << period;
     }
 
-    for (size_t sessionIndex = 0; sessionIndex < sessions.size(); ++sessionIndex) {
-      TpoSession& session = sessions[sessionIndex];
-      float slotW = ctx.price.area.w / std::max<size_t>(1, sessions.size());
-      float sx = ctx.price.area.x + sessionIndex * slotW;
-      float available = std::max(2.0f, slotW - 8.0f);
+    // Cached profile build: session construction, per-row letter maps and the
+    // POC/value-area extraction previously ran every frame (thousands of hash
+    // operations plus a sort per session) even though historical sessions are
+    // immutable. tpoStep is lattice-quantized (niceStep) so it is stable
+    // frame-to-frame; rebuild immediately on any window/step/bracket change,
+    // otherwise refresh the forming bar's letters at most every 250 ms.
+    struct TpoDraw {
+      int sessionIndex = 0;
+      std::vector<TpoRow> rows;
       int64_t poc = 0;
       int maxCount = 0, totalCount = 0;
-      std::vector<TpoRow> rows;
-      rows.reserve(session.rows.size());
-      for (const auto& entry : session.rows) {
-        int count = __builtin_popcountll(entry.second);
-        totalCount += count;
-        if (count > maxCount) { maxCount = count; poc = entry.first; }
-        rows.push_back({entry.first, entry.second});
+      int pocIndex = 0, vaLo = 0, vaHi = 0;
+    };
+    static thread_local std::vector<TpoSession> tpoSessions;
+    static thread_local std::vector<TpoDraw> tpoDraws;
+    static thread_local uint64_t tpoSig = 0;
+    static thread_local std::chrono::steady_clock::time_point tpoBuiltAt{};
+    const auto nowTp = std::chrono::steady_clock::now();
+    uint64_t tpSig = 1469598103934665603ull;
+    auto mixTp = [&tpSig](uint64_t x) { tpSig ^= x; tpSig *= 1099511628211ull; };
+    mixTp(bits_double(tpoStep));
+    mixTp((uint64_t)m_tpoBracket);
+    mixTp((uint64_t)maxSessions);
+    mixTp((uint64_t)tpoFirst);
+    mixTp((uint64_t)(ctx.vis1 + 1));
+    mixTp((uint64_t)cs.v.size());
+    if (!cs.v.empty()) {
+      uint64_t u;
+      std::memcpy(&u, &cs.v.front().ts, 8);
+      mixTp(u);
+    }
+    const bool tpRebuild =
+        tpSig != tpoSig || tpoDraws.empty() ||
+        std::chrono::duration_cast<std::chrono::milliseconds>(nowTp - tpoBuiltAt)
+                .count() > 250;
+
+    if (tpRebuild) {
+      tpoSig = tpSig;
+      tpoBuiltAt = nowTp;
+      tpoSessions.clear();
+      for (int i = tpoFirst; i <= ctx.vis1; ++i) {
+        const Candle& candle = cs.v[(size_t)i];
+        int64_t day = utcDay(candle.ts);
+        if (tpoSessions.empty() || tpoSessions.back().day != day) {
+          TpoSession fresh;
+          fresh.day = day;
+          fresh.open = fresh.close = candle.o;
+          tpoSessions.push_back(std::move(fresh));
+        }
+        TpoSession& session = tpoSessions.back();
+        session.last = i;
+        session.close = candle.c;
+        int period = (int)std::floor((candle.ts - day * dayMs) / bracketMs);
+        period = std::clamp(period, 0, 63);
+        int ibPeriods = m_tpoBracket == 0 ? 2 : 1;
+        if (period < ibPeriods) {
+          session.ibHigh = std::max(session.ibHigh, candle.h);
+          session.ibLow = std::min(session.ibLow, candle.l);
+        }
+        int64_t loTick = (int64_t)std::floor(candle.l / tpoStep);
+        int64_t hiTick = (int64_t)std::ceil(candle.h / tpoStep);
+        for (int64_t tick = loTick; tick <= hiTick && tick - loTick < 4096; ++tick)
+          session.rows[tick] |= 1ull << period;
       }
-      std::sort(rows.begin(), rows.end(),
-                [](const TpoRow& a, const TpoRow& b) { return a.tick < b.tick; });
-      int pocIndex = 0;
-      for (int i = 0; i < (int)rows.size(); ++i)
-        if (rows[(size_t)i].tick == poc) { pocIndex = i; break; }
-      int vaLo = pocIndex, vaHi = pocIndex;
-      int covered = rows.empty() ? 0 : __builtin_popcountll(rows[(size_t)pocIndex].letters);
-      int targetCount = (int)std::ceil(totalCount * 0.70);
-      while (covered < targetCount && (vaLo > 0 || vaHi + 1 < (int)rows.size())) {
-        int below = vaLo > 0 ? __builtin_popcountll(rows[(size_t)vaLo - 1].letters) : -1;
-        int above = vaHi + 1 < (int)rows.size()
-                        ? __builtin_popcountll(rows[(size_t)vaHi + 1].letters) : -1;
-        if (above >= below) covered += __builtin_popcountll(rows[(size_t)++vaHi].letters);
-        else covered += __builtin_popcountll(rows[(size_t)--vaLo].letters);
+
+      tpoDraws.clear();
+      tpoDraws.resize(tpoSessions.size());
+      for (size_t sessionIndex = 0; sessionIndex < tpoSessions.size(); ++sessionIndex) {
+        TpoSession& session = tpoSessions[sessionIndex];
+        TpoDraw& draw = tpoDraws[sessionIndex];
+        draw.sessionIndex = (int)sessionIndex;
+        draw.rows.reserve(session.rows.size());
+        for (const auto& entry : session.rows) {
+          int count = __builtin_popcountll(entry.second);
+          draw.totalCount += count;
+          if (count > draw.maxCount) { draw.maxCount = count; draw.poc = entry.first; }
+          draw.rows.push_back({entry.first, entry.second});
+        }
+        std::sort(draw.rows.begin(), draw.rows.end(),
+                  [](const TpoRow& a, const TpoRow& b) { return a.tick < b.tick; });
+        for (int i = 0; i < (int)draw.rows.size(); ++i)
+          if (draw.rows[(size_t)i].tick == draw.poc) { draw.pocIndex = i; break; }
+        draw.vaLo = draw.vaHi = draw.pocIndex;
+        int covered =
+            draw.rows.empty()
+                ? 0
+                : __builtin_popcountll(draw.rows[(size_t)draw.pocIndex].letters);
+        int targetCount = (int)std::ceil(draw.totalCount * 0.70);
+        while (covered < targetCount &&
+               (draw.vaLo > 0 || draw.vaHi + 1 < (int)draw.rows.size())) {
+          int below = draw.vaLo > 0
+                          ? __builtin_popcountll(draw.rows[(size_t)draw.vaLo - 1].letters)
+                          : -1;
+          int above = draw.vaHi + 1 < (int)draw.rows.size()
+                          ? __builtin_popcountll(draw.rows[(size_t)draw.vaHi + 1].letters)
+                          : -1;
+          if (above >= below)
+            covered += __builtin_popcountll(draw.rows[(size_t)++draw.vaHi].letters);
+          else
+            covered += __builtin_popcountll(draw.rows[(size_t)--draw.vaLo].letters);
+        }
       }
+    }
+
+    for (size_t sessionIndex = 0; sessionIndex < tpoDraws.size(); ++sessionIndex) {
+      TpoSession& session = tpoSessions[(size_t)tpoDraws[sessionIndex].sessionIndex];
+      const std::vector<TpoRow>& rows = tpoDraws[sessionIndex].rows;
+      const int64_t poc = tpoDraws[sessionIndex].poc;
+      const int maxCount = tpoDraws[sessionIndex].maxCount;
+      const int vaLo = tpoDraws[sessionIndex].vaLo;
+      const int vaHi = tpoDraws[sessionIndex].vaHi;
+      float slotW = ctx.price.area.w / std::max<size_t>(1, tpoDraws.size());
+      float sx = ctx.price.area.x + sessionIndex * slotW;
+      float available = std::max(2.0f, slotW - 8.0f);
 
       u.draw.rect({sx, ctx.price.area.y, 1, ctx.price.area.h}, withAlpha(t.border, 0.72f));
       if (!rows.empty() && available > 90.0f) {
