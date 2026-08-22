@@ -94,7 +94,7 @@ static double scanNativeTick(const Feeds& feeds, uint32_t mask) {
   static thread_local std::vector<double> gaps;
   gaps.clear();
   bool healthy[64] = {};
-  feeds.collectHealthy(50.0, healthy);
+  feeds.collectHealthy(50.0, healthy, std::size(healthy));
   for (size_t i = 0; i < feeds.venues.size() && i < 32; ++i) {
     if (!(mask & (1u << (uint32_t)i))) continue;
     const VenueState& v = feeds.venues[i];
@@ -201,7 +201,7 @@ void captureHeatmapSides(const Feeds& feeds, uint32_t mask, double bin,
   const double fenceHi = mid > 0 ? mid * HeatmapSeries::kFence : 0;
 
   bool healthy[64] = {};
-  feeds.collectHealthy(50.0, healthy);
+  feeds.collectHealthy(50.0, healthy, std::size(healthy));
   // mask is a uint32_t, so bits at index >= 32 can never be set; bounding the
   // loop keeps `1u << i` well-defined regardless of how many venues exist.
   for (size_t i = 0; i < feeds.venues.size() && i < 32; ++i) {

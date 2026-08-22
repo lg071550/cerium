@@ -456,16 +456,23 @@ void drawOrderbookAnalytics(Ui& u, Rect area, OrderbookPanel& st,
     }
   }
 
-  char bid1[24], ask1[24], bid5[24], ask5[24];
-  formatAmount(st.analytics.bidUsd[1], true, 2, bid1, sizeof(bid1));
-  formatAmount(st.analytics.askUsd[1], true, 2, ask1, sizeof(ask1));
-  formatAmount(st.analytics.bidUsd[3], true, 2, bid5, sizeof(bid5));
-  formatAmount(st.analytics.askUsd[3], true, 2, ask5, sizeof(ask5));
-  snprintf(st.analyticsTip, sizeof(st.analyticsTip),
-           "Imbalance by depth 0.5/1/2.5/5/10%%: %+.1f / %+.1f / %+.1f / %+.1f / %+.1f · L2 depth: 1%% bid %s / ask %s · 5%% bid %s / ask %s",
-           st.analytics.imbalance[0] * 100.0, st.analytics.imbalance[1] * 100.0,
-           st.analytics.imbalance[2] * 100.0, st.analytics.imbalance[3] * 100.0,
-           st.analytics.imbalance[4] * 100.0, bid1, ask1, bid5, ask5);
+  // Tooltip text only matters while hovered; values change on merge rebuilds,
+  // so cache against mergeVersion instead of formatting 9 conversions per
+  // frame for a tooltip nobody is reading.
+  static thread_local uint64_t tipVersion = ~0ull;
+  if (u.hovered(area) || st.mergeVersion != tipVersion) {
+    tipVersion = st.mergeVersion;
+    char bid1[24], ask1[24], bid5[24], ask5[24];
+    formatAmount(st.analytics.bidUsd[1], true, 2, bid1, sizeof(bid1));
+    formatAmount(st.analytics.askUsd[1], true, 2, ask1, sizeof(ask1));
+    formatAmount(st.analytics.bidUsd[3], true, 2, bid5, sizeof(bid5));
+    formatAmount(st.analytics.askUsd[3], true, 2, ask5, sizeof(ask5));
+    snprintf(st.analyticsTip, sizeof(st.analyticsTip),
+             "Imbalance by depth 0.5/1/2.5/5/10%%: %+.1f / %+.1f / %+.1f / %+.1f / %+.1f · L2 depth: 1%% bid %s / ask %s · 5%% bid %s / ask %s",
+             st.analytics.imbalance[0] * 100.0, st.analytics.imbalance[1] * 100.0,
+             st.analytics.imbalance[2] * 100.0, st.analytics.imbalance[3] * 100.0,
+             st.analytics.imbalance[4] * 100.0, bid1, ask1, bid5, ask5);
+  }
   u.tip(u.id("##orderbook-analytics"), area, st.analyticsTip);
 }
 } // namespace
@@ -623,17 +630,20 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
     int capRows0 = std::max(1, (int)(area.h / rowH0));
     int configured0 = kLevelLimits[std::clamp(st.levelLimit, 0, 4)];
     if (configured0 > 0) capRows0 = std::min(capRows0, configured0);
-    const int mergeCap = std::max(1024, capRows0 + std::abs(st.scroll) + 64);
-  bool filterChanged = st.mask != st.mergeMask || st.bin != st.mergeBin ||
-                       st.mergeCap != mergeCap;
-  if (filterChanged || ver != st.mergeVersion) {
-    st.mergeVersion = ver;
-    st.mergeCap = mergeCap;
-    st.mergeMask = st.mask;
-    st.mergeBin = st.bin;
+    // Quantize the scroll-driven cap to 256-step blocks: unquantized, every
+    // wheel notch past 1024 produced a new cap and forced a full rebuild.
+    const int mergeCap =
+        std::max(1024, (capRows0 + std::abs(st.scroll) + 255) & ~255);
+    bool filterChanged = st.mask != st.mergeMask || st.bin != st.mergeBin;
+    bool verChanged = ver != st.mergeVersion;
+    if (filterChanged || st.mergeCap != mergeCap || verChanged) {
+      st.mergeVersion = ver;
+      st.mergeCap = mergeCap;
+      st.mergeMask = st.mask;
+      st.mergeBin = st.bin;
 
-    bool healthy[64];
-    feeds.collectHealthy(50.0, healthy);
+      bool healthy[64];
+      feeds.collectHealthy(50.0, healthy, std::size(healthy));
     std::vector<const BookSide*> askSides, bidSides;
     for (size_t i = 0; i < feeds.venues.size(); ++i) {
       if (!healthy[i] || !(st.mask & (1u << i))) continue;
@@ -644,6 +654,9 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
     // Analytics deliberately use the raw selected books rather than display
     // bins. Ask bins round down for the visual ladder, which can make a wide
     // grouping appear to cross the midpoint and would corrupt touch metrics.
+    // Keyed on version/mask only: a cap-only drift re-merges the ladder but
+    // must not rescan the ±10% bands.
+    if (verChanged || filterChanged) {
     st.analytics = {};
     double bestBidSize = 0, bestAskSize = 0;
     for (const BookSide* side : askSides) {
@@ -709,6 +722,7 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
                        : 0;
       st.analytics.valid = true;
     }
+    } // analytics keyed on version/mask
 
     static thread_local std::vector<MergedLevel> asks, bids;
     // merge each side over the venue books' FULL extent (aggbook-style): the

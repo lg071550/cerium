@@ -39,6 +39,7 @@ void MarketSeries::loadLiq(const double* data, int n, int symIdx, int64_t base) 
   if (!data || n <= 0) {
     liqTop = base + n;
     ++version;
+    ++liqVersion;
     return;
   }
   int first = std::max(0, n - (int)MAX_SAMPLES);
@@ -54,6 +55,7 @@ void MarketSeries::loadLiq(const double* data, int n, int symIdx, int64_t base) 
             [](const LiqPrint& a, const LiqPrint& b) { return a.ts < b.ts; });
   liqTop = base + n;
   ++version;
+  ++liqVersion;
 }
 
 void MarketSeries::appendLiq(const double* data, int n, int64_t start, int symIdx) {
@@ -78,7 +80,7 @@ void MarketSeries::appendLiq(const double* data, int n, int64_t start, int symId
                        liq.end(), byTs);
     if ((size_t)liq.size() > MAX_SAMPLES)
       liq.erase(liq.begin(), liq.end() - (std::ptrdiff_t)MAX_SAMPLES);
-    ++version;
+    ++version; ++liqVersion;
   }
 }
 
@@ -89,4 +91,5 @@ void MarketSeries::clear() {
   liq.clear();
   sym = -1;
   ++version;
+  ++liqVersion;
 }

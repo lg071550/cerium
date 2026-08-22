@@ -101,7 +101,7 @@ void closeFields(LiquidationsPanel& st) {
 }
 
 void rebuildFilter(LiquidationsPanel& st, const MarketSeries& market) {
-  if (st.filterVersion == market.version && st.filterMin == st.minUsd &&
+  if (st.filterVersion == market.liqVersion && st.filterMin == st.minUsd &&
       st.filterMax == st.maxUsd && st.filterSide == st.sideMode)
     return;
   st.filtered.clear();
@@ -116,7 +116,7 @@ void rebuildFilter(LiquidationsPanel& st, const MarketSeries& market) {
     if (st.maxUsd > 0 && usd > st.maxUsd) continue;
     st.filtered.push_back(n);
   }
-  st.filterVersion = market.version;
+  st.filterVersion = market.liqVersion;
   st.filterMin = st.minUsd;
   st.filterMax = st.maxUsd;
   st.filterSide = st.sideMode;

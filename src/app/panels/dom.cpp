@@ -715,7 +715,7 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
     if (st.venue >= 0) {
       const VenueState& venue = feeds.venues[(size_t)st.venue];
       bool healthy[64]{};
-      feeds.collectHealthy(50.0, healthy);
+      feeds.collectHealthy(50.0, healthy, std::size(healthy));
       bool stale = venue.bookUpdatedAtMs > 0 && now - venue.bookUpdatedAtMs > 3000.0;
       const char* status = !venue.enabled ? "DISABLED"
                            : venue.status == wire::Connecting ? "CONNECTING"
@@ -820,7 +820,11 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
   int64_t topTick = centerTick + rowCount / 2;
 
   double maxSize = 1e-12, maxFlow = 1e-12;
-  std::vector<DomResidual> bidQ, askQ;
+  // Frame scratch, persisted like drawOrderTiles' tiles — these were rebuilt
+  // from capacity 0 every frame (several alloc/free pairs per frame).
+  static thread_local std::vector<DomResidual> bidQ, askQ;
+  bidQ.clear();
+  askQ.clear();
   for (int row = 0; row < rowCount; ++row) {
     int64_t tick = topTick - row;
     const DomBucket* b = st.model.bucket(tick);
@@ -837,8 +841,10 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
   int tileSlots = queueTileCapacity(laneW);
   double lot = niceLot(std::max(maxSize / 18.0, 0.1));
   double minTile = 1.0;
-  std::vector<double> tileSizes;
-  std::vector<QueueTile> built;
+  static thread_local std::vector<double> tileSizes;
+  static thread_local std::vector<QueueTile> built;
+  tileSizes.clear();
+  built.clear();
   if (st.showWalls) {
     tileSizes.reserve((size_t)rowCount * 6);
     for (int row = 0; row < rowCount; ++row) {
@@ -1100,9 +1106,11 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
     double bid = b ? b->bid : 0, ask = b ? b->ask : 0;
     double total = bid + ask;
     double imbalance = total > 0 ? (bid - ask) / total * 100.0 : 0;
-    std::vector<DomContribution> contributions;
+    static thread_local std::vector<DomContribution> contributions;
+    static thread_local std::vector<DomResidual> iq;
+    contributions.clear();
+    iq.clear();
     st.model.contributions(feeds, st.venue, st.mask, tick, contributions);
-    std::vector<DomResidual> iq;
     st.model.residuals(tick, false, iq);
     size_t qBid = iq.size();
     st.model.residuals(tick, true, iq);

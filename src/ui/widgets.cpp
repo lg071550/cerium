@@ -157,7 +157,7 @@ bool textField(Ui& ui, Rect r, TextFieldState& st, const char* id,
 
   bool changed = false;
   if (st.focused) {
-    char buf[128];
+    char buf[512]; // room for pasted values; the old 128 could cut mid-UTF-8
     shell_ime_get(buf, sizeof(buf));
     buf[sizeof(buf) - 1] = '\0';
     if (st.text != buf) {

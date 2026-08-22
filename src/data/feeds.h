@@ -69,8 +69,10 @@ struct Feeds {
   // corrupt book (one garbage book must never poison the aggregate view).
   double aggMid() const;
 
-  // Venues whose own mid is within `tolBps` of the aggregate mid.
-  int collectHealthy(double tolBps, bool* out) const;
+  // Venues whose own mid is within `tolBps` of the aggregate mid. `cap` bounds
+  // the output array (callers pass std::size(healthy)); entries beyond cap are
+  // not written.
+  int collectHealthy(double tolBps, bool* out, size_t cap) const;
 
   double aggBestBid() const;
   double aggBestAsk() const;

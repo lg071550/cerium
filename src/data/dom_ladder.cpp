@@ -162,7 +162,7 @@ uint64_t DomModel::sourceSignature(const Feeds& feeds, int selected, double nowM
 double DomModel::inferTick(const Feeds& feeds, int selected, uint32_t mask,
                            double nowMs) {
   bool healthy[64]{};
-  feeds.collectHealthy(50.0, healthy);
+  feeds.collectHealthy(50.0, healthy, std::size(healthy));
   double referenceMid = selected >= 0 && selected < (int)feeds.venues.size()
                             ? feeds.venues[(size_t)selected].book.mid()
                             : feeds.aggMid();
@@ -216,7 +216,7 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
   buckets.clear();
   buckets.reserve(8192);
   bool healthy[64]{};
-  feeds.collectHealthy(50.0, healthy);
+  feeds.collectHealthy(50.0, healthy, std::size(healthy));
   summary = {};
   const double referenceMid = selected >= 0 && selected < (int)feeds.venues.size()
                                   ? feeds.venues[(size_t)selected].book.mid()
@@ -608,7 +608,7 @@ void DomModel::updateTrades(const Feeds& feeds, int selected, uint32_t mask,
     lastTradePrice = 0;
 
     bool healthy[64]{};
-    feeds.collectHealthy(50.0, healthy);
+    feeds.collectHealthy(50.0, healthy, std::size(healthy));
     // Hit matching must follow the tape's clock, not wall time: exchange
     // timestamps routinely sit a second or more off Date.now(), which is why
     // the previous print filter never caught live sweeps.
@@ -692,7 +692,7 @@ void DomModel::contributions(const Feeds& feeds, int selected, uint32_t mask,
                              std::vector<DomContribution>& out) const {
   out.clear();
   bool healthy[64]{};
-  feeds.collectHealthy(50.0, healthy);
+  feeds.collectHealthy(50.0, healthy, std::size(healthy));
   double referenceMid = selected >= 0 && selected < (int)feeds.venues.size()
                             ? feeds.venues[(size_t)selected].book.mid()
                             : feeds.aggMid();

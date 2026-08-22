@@ -6,6 +6,7 @@
 #include "../symbols.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -112,9 +113,20 @@ void closeTapeFields(TapePanel& st) {
 }
 
 void rebuildTapeFilter(TapePanel& st, const Tape& tape) {
+  // Filter edits rebuild immediately; a moved ring head does not — during
+  // active trading head advances nearly every frame and the full O(ring)
+  // rescan would run per print. ~10 Hz keeps new rows within 100 ms.
+  static thread_local std::chrono::steady_clock::time_point lastHeadRebuild{};
+  const bool filterChanged =
+      st.filterMin != st.minUsd || st.filterMax != st.maxUsd;
   if (st.filterHead == tape.head && st.filterCount == tape.count &&
       st.filterMin == st.minUsd && st.filterMax == st.maxUsd)
     return;
+  if (!filterChanged) {
+    auto now = std::chrono::steady_clock::now();
+    if (now - lastHeadRebuild < std::chrono::milliseconds(100)) return;
+    lastHeadRebuild = now;
+  }
 
   st.filtered.clear();
   if (st.filtered.capacity() < Tape::CAP) st.filtered.reserve(Tape::CAP);

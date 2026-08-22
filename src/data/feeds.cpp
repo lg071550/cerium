@@ -283,11 +283,12 @@ double Feeds::aggMid() const {
   return m_aggMid;
 }
 
-int Feeds::collectHealthy(double tolBps, bool* out) const {
+int Feeds::collectHealthy(double tolBps, bool* out, size_t cap) const {
+  if (cap > venues.size()) cap = venues.size();
   if (tolBps == kAggTolBps) { // cached path (same tolerance as agg best bid/ask)
     refreshAggCache();
     int n = 0;
-    for (size_t i = 0; i < venues.size(); ++i) {
+    for (size_t i = 0; i < cap; ++i) {
       bool ok = i < 64 && m_aggHealthy[i];
       out[i] = ok;
       if (ok) n++;
@@ -296,7 +297,7 @@ int Feeds::collectHealthy(double tolBps, bool* out) const {
   }
   double mid = aggMid();
   int n = 0;
-  for (size_t i = 0; i < venues.size(); ++i) {
+  for (size_t i = 0; i < cap; ++i) {
     const VenueState& v = venues[i];
     bool ok = false;
     if (v.enabled && mid > 0) {

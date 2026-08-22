@@ -130,7 +130,8 @@ int Terminal::addPanel(PanelKind kind, const std::string& requestedTitle) {
 
 int Terminal::addWidget(PanelKind kind, DockNode* host) {
   if (!host) return -1;
-  std::vector<int> present;
+  static thread_local std::vector<int> present;
+  present.clear();
   dock.collectTabs(present);
   for (const PanelDef& panel : m_panels) {
     bool inDock = std::find(present.begin(), present.end(), panel.id) != present.end();
@@ -810,7 +811,8 @@ void Terminal::drawWidgetsPicker() {
   ui.draw.rect(r, t.panel, t.radius);
   ui.draw.rectOutline(r, t.border, 1.0f, t.radius);
 
-  std::vector<int> present;
+  static thread_local std::vector<int> present;
+  present.clear();
   dock.collectTabs(present);
 
   float y = r.y + 4;

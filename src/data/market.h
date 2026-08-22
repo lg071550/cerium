@@ -32,6 +32,10 @@ struct MarketSeries {
   int64_t liqTop = 0; // worker-global index one past the newest known liq row
   int sym = -1;
   uint64_t version = 0;
+  // Bumps only when the liq series changes — OI/funding snapshots arrive
+  // ~1/s and bump `version`, which would otherwise force consumers (the
+  // liquidations panel's filter) to re-scan 16k prints for nothing.
+  uint64_t liqVersion = 0;
 
   // Packed rows: oi [ts, coin] x n, funding [ts, rate] x n, liq [ts, price,
   // qty, side] x n. Each load replaces its buffer wholesale (worker retains

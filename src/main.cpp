@@ -50,6 +50,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE double cerium_perf(int i) {
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE double cerium_set_tf(int kind, double value) {
+  if (kind < 0 || kind > 2) return 0; // probe-only entry; keep kinds in range
   g_terminal.feeds.setTimeframe({(Timeframe::Kind)(uint8_t)kind, value});
   return g_terminal.feeds.candles.tf.value;
 }

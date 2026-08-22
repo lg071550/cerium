@@ -36,8 +36,14 @@ fi
 
 # --- build -----------------------------------------------------------------
 MODE="${1:-release}"
+SAN=""
+if [[ "${CERIUM_SAN:-0}" == "1" ]]; then
+  # Opt-in sanitizer profile: CERIUM_SAN=1 bash build.sh dev — mechanically
+  # catches bounds/truncation-class bugs during development.
+  SAN="-fsanitize=address,undefined -fno-sanitize=undefined,pointer-overflow" # ASan+UBSan; keep JSPI-safe defaults
+fi
 if [[ "$MODE" == "dev" ]]; then
-  OPT="-O1 -g -sASSERTIONS=2"
+  OPT="-O1 -g -sASSERTIONS=2 $SAN"
 else
   OPT="-O3 -flto -sASSERTIONS=0"
 fi

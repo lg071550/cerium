@@ -47,7 +47,11 @@ inline bool drawFlowSources(Ui& u, Rect r, uint32_t& mask, Feeds& feeds,
     int venue; // -1 = header
     uint8_t cls;
   };
-  std::vector<Row> rows;
+  // Rebuilt every frame while the popover is open; static scratch avoids the
+  // per-frame alloc. Contents depend only on Feeds' venue set, which is fixed
+  // after init.
+  static thread_local std::vector<Row> rows;
+  rows.clear();
   rows.reserve((size_t)kVenueCount + 3);
   for (const auto& g : kGroups) {
     rows.push_back({-1, g.cls});
