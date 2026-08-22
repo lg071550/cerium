@@ -209,7 +209,11 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
     m_residAsk.assign(feeds.venues.size(), {});
   }
 
-  std::unordered_map<int64_t, DomBucket> buckets;
+  // Per-rebuild scratch, persisted across frames: rebuild runs effectively
+  // every frame on live markets, and fresh node-backed containers were an
+  // allocation storm under WASM (same pattern as merge.cpp / heatmap.cpp).
+  static thread_local std::unordered_map<int64_t, DomBucket> buckets;
+  buckets.clear();
   buckets.reserve(8192);
   bool healthy[64]{};
   feeds.collectHealthy(50.0, healthy);
@@ -234,7 +238,8 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
   const bool bandWasValid = m_bandValid && newStep == m_changeStep;
 
   auto addSide = [&](const BookSide& side, int venueIndex, bool ask, double scale) {
-    std::unordered_map<int64_t, double> local;
+    static thread_local std::unordered_map<int64_t, double> local;
+    local.clear();
     const double loRaw = newBandLoP / scale;
     const double hiRaw = newBandHiP / scale;
     size_t begin = side.lowerBound(loRaw);
@@ -278,8 +283,11 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
   // can touch one tick in a single snapshot); the merge below then REPLACES
   // the persisted per-tick change, matching the old diff-vs-previous-frame
   // semantics where a +3 add followed by a -4 pull shows -4, not -1.
-  std::unordered_map<int64_t, DomChange> curDelta;
-  std::unordered_set<int64_t> bidTouched, askTouched;
+  static thread_local std::unordered_map<int64_t, DomChange> curDelta;
+  static thread_local std::unordered_set<int64_t> bidTouched, askTouched;
+  curDelta.clear();
+  bidTouched.clear();
+  askTouched.clear();
   auto emit = [&](int64_t tick, double bidDelta, double askDelta, double at) {
     DomChange& c = curDelta[tick];
     if (bidDelta != 0) { c.bid += bidDelta; c.bidAt = at; bidTouched.insert(tick); }
@@ -314,7 +322,8 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
       std::unordered_map<int64_t, double>& prev =
           (ask ? m_prevAsk : m_prevBid)[(size_t)i];
       auto& resid = (ask ? m_residAsk : m_residBid)[(size_t)i];
-      std::unordered_map<int64_t, std::pair<double, double>> cur;
+      static thread_local std::unordered_map<int64_t, std::pair<double, double>> cur;
+      cur.clear();
       const double loRaw = newBandLoP / scale;
       const double hiRaw = newBandHiP / scale;
       size_t begin = side.lowerBound(loRaw);
@@ -453,7 +462,8 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
   // Retain only the nearest 4,096 price buckets on each side. The source L2
   // books remain canonical; this bounds the DOM projection without truncating
   // or duplicating feed storage.
-  std::unordered_set<int64_t> keep;
+  static thread_local std::unordered_set<int64_t> keep;
+  keep.clear();
   keep.reserve(kMaxSideBuckets * 2);
   size_t keptBids = 0, keptAsks = 0;
   for (const DomBucket& level : levels) {
@@ -465,9 +475,11 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
   levels.erase(std::remove_if(levels.begin(), levels.end(), [&](const DomBucket& level) {
                  return keep.find(level.tick) == keep.end();
                }), levels.end());
-  buckets.clear();
-  buckets.reserve(levels.size());
-  for (const DomBucket& level : levels) buckets.emplace(level.tick, level);
+  // Index once, here, instead of rebuilding a second tick→bucket hash map
+  // from levels: the best-tick lookups and change GC below query this.
+  m_index.clear();
+  m_index.reserve(levels.size());
+  for (size_t i = 0; i < levels.size(); ++i) m_index[levels[i].tick] = (int)i;
 
   double bidCum = 0, bidCumUsd = 0;
   int bidSeen = 0;
@@ -500,10 +512,14 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
     summary.imbalance = (summary.bidTop5 - summary.askTop5) / topTotal;
 
   double bestBidSize = 0, bestAskSize = 0;
-  auto bidIt = buckets.find(bidTick(summary.bestBid, newStep));
-  auto askIt = buckets.find(askTick(summary.bestAsk, newStep));
-  if (bidIt != buckets.end()) bestBidSize = bidIt->second.bid;
-  if (askIt != buckets.end()) bestAskSize = askIt->second.ask;
+  auto bucketAt = [&](int64_t tick) -> const DomBucket* {
+    auto it = m_index.find(tick);
+    return it != m_index.end() ? &levels[(size_t)it->second] : nullptr;
+  };
+  if (const DomBucket* b = bucketAt(bidTick(summary.bestBid, newStep)))
+    bestBidSize = b->bid;
+  if (const DomBucket* a = bucketAt(askTick(summary.bestAsk, newStep)))
+    bestAskSize = a->ask;
   if (!summary.crossed && bestBidSize + bestAskSize > 0)
     summary.microprice = (summary.bestAsk * bestBidSize +
                           summary.bestBid * bestAskSize) /
@@ -511,15 +527,12 @@ void DomModel::rebuild(const Feeds& feeds, int selected, uint32_t mask,
 
   for (auto it = m_changes.begin(); it != m_changes.end();) {
     double last = std::max(it->second.bidAt, it->second.askAt);
-    if (buckets.find(it->first) == buckets.end() && nowSeconds - last > 2.0)
+    if (!m_index.contains(it->first) && nowSeconds - last > 2.0)
       it = m_changes.erase(it);
     else
       ++it;
   }
 
-  m_index.clear();
-  m_index.reserve(levels.size());
-  for (size_t i = 0; i < levels.size(); ++i) m_index[levels[i].tick] = i;
   step = newStep;
   m_sourceNowMs = nowMs;
   suppressExecutedPulls(newStep);
