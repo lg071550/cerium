@@ -8,11 +8,9 @@
 #include <cstdio>
 
 // Canonical symbols matching feeds/registry.ts SYMBOLS + C++ feeds.cpp.
-static const char* kSymbols[] = {"ETH", "BTC", "SOL"};
-static constexpr int kSymCount = 3;
 
 // Per-symbol venue count (ETH-only venues reduce the total for BTC/SOL).
-static constexpr int kVenueCounts[kSymCount] = {27, 24, 24};
+#include "../symbols.h"
 
 void drawWatchlist(Ui& u, Rect r, Feeds& feeds) {
   const Theme& t = theme();
@@ -36,7 +34,7 @@ void drawWatchlist(Ui& u, Rect r, Feeds& feeds) {
   u.draw.rect({r.x, r.y + 20, r.w, 1}, t.border);
 
   float rowH = 24.0f;
-  for (int i = 0; i < kSymCount; ++i) {
+  for (int i = 0; i < symbols::kCount; ++i) {
     Rect row{r.x, r.y + 21 + i * rowH, r.w, rowH};
     bool isActive = i == feeds.symbol;
     if (i % 2) u.draw.rect(row, t.panelAlt);
@@ -47,10 +45,10 @@ void drawWatchlist(Ui& u, Rect r, Feeds& feeds) {
     // Symbol name
     Color nameColor = isActive ? t.accent : t.text;
     u.draw.textFit({symbolColumn.x, row.y, symbolColumn.w, row.h},
-                   kSymbols[i], nameColor, DrawList::Left);
+                   symbols::kNames[i], nameColor, DrawList::Left);
     // Pair suffix in dim text
     if (r.w >= 150.0f && i == feeds.symbol) {
-      float nameW = u.draw.measure(kSymbols[i]);
+      float nameW = u.draw.measure(symbols::kNames[i]);
       u.draw.textFit({symbolColumn.x + nameW + 4, row.y,
                       symbolColumn.w - nameW - 4, row.h},
                      "/USDT", t.textDim, DrawList::Left);
@@ -84,7 +82,7 @@ void drawWatchlist(Ui& u, Rect r, Feeds& feeds) {
         for (auto& v : feeds.venues)
           if (v.enabled && v.status == wire::Live) ++live;
         char vc[16];
-        snprintf(vc, sizeof(vc), "%d/%d", live, kVenueCounts[i]);
+        snprintf(vc, sizeof(vc), "%d/%d", live, symbols::kVenueCounts[i]);
         u.draw.textFit({venueColumn.x, row.y, venueColumn.w, row.h}, vc,
                        t.green, DrawList::Right);
       }

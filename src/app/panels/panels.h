@@ -13,7 +13,9 @@
 #include <string>
 #include <vector>
 
-// bounded cache: second-resolution timestamp → "HH:MM:SS" (direct-mapped)
+// bounded cache: second-resolution timestamp → "HH:MM:SS" (direct-mapped).
+// Tape rows re-render the same entries every frame; the cache keeps
+// localtime_r + snprintf off that path.
 struct TimeLabels {
   static constexpr int kSlots = 64;
   struct Slot {
@@ -21,6 +23,19 @@ struct TimeLabels {
     char text[12] = {};
   };
   Slot slots[kSlots];
+
+  const char* label(int64_t secs) {
+    Slot& s = slots[(size_t)(((uint64_t)secs * 0x9E3779B97F4A7C15ull) >> 58)];
+    if (s.key != secs + 1) {
+      time_t t = (time_t)secs;
+      struct tm tmv;
+      localtime_r(&t, &tmv);
+      s.key = secs + 1;
+      snprintf(s.text, sizeof(s.text), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min,
+               tmv.tm_sec);
+    }
+    return s.text;
+  }
 };
 
 // orderbook panel: view state + merged-book cache

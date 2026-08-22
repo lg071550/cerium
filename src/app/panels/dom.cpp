@@ -549,18 +549,14 @@ void DomPanel::drawVenuePicker(Ui& u, Feeds& feeds) {
              const char* name = v < 0 ? "X-VENUE ANALYTICS"
                                       : feeds.venues[(size_t)v].label.c_str();
              d.textFit(row, name, active ? t.accent : t.text, DrawList::Left, 8);
-             if (v < 0) {
-               d.textAligned(row, "NORMALIZED", t.textDim, DrawList::Right, 8);
-             } else {
-               const VenueState& state = feeds.venues[(size_t)v];
-               const char* status = state.status == wire::Live ? "LIVE"
-                                    : state.status == wire::Syncing ? "SYNCING"
-                                    : state.status == wire::Connecting ? "CONNECTING"
-                                    : state.status == wire::Reconnecting ? "RECONNECT"
-                                    : state.status == wire::Error ? "ERROR" : "OFFLINE";
-               d.textAligned(row, status, state.status == wire::Live ? t.green : t.textDim,
-                             DrawList::Right, 8);
-             }
+              if (v < 0) {
+                d.textAligned(row, "NORMALIZED", t.textDim, DrawList::Right, 8);
+              } else {
+                const VenueState& state = feeds.venues[(size_t)v];
+                d.textAligned(row, wireStatusShort(state.status),
+                              wireStatusColor(state.status, t),
+                              DrawList::Right, 8);
+              }
               // Press-inside guard via the canonical primitive: a drag that
               // started elsewhere must not commit when it releases over a row.
               Behavior rowB = behavior(

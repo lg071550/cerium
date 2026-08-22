@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../data/feeds.h"
 #include "../../ui/theme.h"
 
 #include <algorithm>
@@ -9,6 +10,45 @@
 #include <cstring>
 #include <cctype>
 #include <string>
+
+// ---------------------------------------------------------------------------
+// Venue status mapping
+// ---------------------------------------------------------------------------
+// One table for every panel that renders connection status, so a new wire::Status
+// lands in one place instead of three divergent switch statements.
+
+inline const char* wireStatusText(uint8_t s) {
+  switch (s) {
+    case wire::Connecting: return "connecting";
+    case wire::Syncing: return "syncing";
+    case wire::Live: return "live";
+    case wire::Reconnecting: return "reconnecting";
+    case wire::Error: return "error";
+    default: return "offline";
+  }
+}
+
+inline const char* wireStatusShort(uint8_t s) {
+  switch (s) {
+    case wire::Connecting: return "CONNECTING";
+    case wire::Syncing: return "SYNCING";
+    case wire::Live: return "LIVE";
+    case wire::Reconnecting: return "RECONN";
+    case wire::Error: return "ERROR";
+    default: return "OFFLINE";
+  }
+}
+
+inline Color wireStatusColor(uint8_t s, const Theme& t) {
+  switch (s) {
+    case wire::Live: return t.green;
+    case wire::Connecting:
+    case wire::Syncing: return t.accent;
+    case wire::Reconnecting:
+    case wire::Error: return t.red;
+    default: return t.textDim;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Color helpers

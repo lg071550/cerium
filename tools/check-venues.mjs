@@ -11,6 +11,8 @@
 //     expectation (registry.ts has no cls field; the mapping below is the
 //     contract). Bump DEX_IDS / PERP_EXTRA if a new venue class appears.
 //   - ETH-only venues actually guard their make() on sym === "ETH"
+//   - src/app/symbols.h kNames / kVenueCounts match SYMBOLS and the
+//     per-symbol venue support columns in registry.ts
 //
 // Exits 1 with a diff on any mismatch. Wired into build.sh before em++.
 
@@ -128,6 +130,50 @@ for (const t of ts) {
     errors.push(`registry.ts venue "${t.id}" is ETH-only by contract but its make() has no \`sym === "ETH"\` guard`);
   if (!ETH_ONLY_IDS.has(t.id) && guarded)
     errors.push(`registry.ts venue "${t.id}" guards on ETH but is not in ETH_ONLY_IDS in tools/check-venues.mjs — update the contract list`);
+}
+
+function parseSymbolsHeader() {
+  const src = readFileSync(join(ROOT, "src/app/symbols.h"), "utf8");
+  const names =
+    /kNames\[\]\s*=\s*\{([^}]*)\}/.exec(src)?.[1]?.match(/"([^"]+)"/g) ?? null;
+  if (!names) throw new Error("src/app/symbols.h: kNames table not found");
+  const countsRe = /kVenueCounts\[kCount\]\s*=\s*\{([^}]*)\}/.exec(src);
+  if (!countsRe) throw new Error("src/app/symbols.h: kVenueCounts table not found");
+  const counts = countsRe[1].split(",").map((v) => parseInt(v.trim(), 10));
+  return { names: names.map((s) => s.slice(1, -1)), counts };
+}
+
+// Per-symbol venue support from registry.ts make() guards: an ETH-only venue
+// supports symbol 0 only; every other venue trades all listed symbols.
+function parseSymbolSupport(venues, body, symbols) {
+  const counts = symbols.map(() => 0);
+  for (const v of venues) {
+    const next = venues.find((o) => o.offset > v.offset);
+    const text = body.slice(v.offset, next ? next.offset : body.length);
+    const ethOnly = /sym\s*===\s*"ETH"|sym\s*!==\s*"ETH"/.test(text);
+    for (let s = 0; s < symbols.length; s++)
+      if (!ethOnly || s === 0) counts[s]++;
+  }
+  return counts;
+}
+
+// symbols.h contract: the C++ side renders labels/counts from these literals.
+{
+  const { names: cppSymbols, counts: cppCounts } = parseSymbolsHeader();
+  const full = readFileSync(join(ROOT, "feeds/registry.ts"), "utf8");
+  const symStart = full.indexOf("export const SYMBOLS");
+  if (symStart < 0) throw new Error("feeds/registry.ts: `export const SYMBOLS` not found");
+  const symLine = full.slice(symStart, full.indexOf("\n", symStart));
+  const tsSymbols = [...symLine.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  const support = parseSymbolSupport(ts, tsBody, tsSymbols);
+  if (cppSymbols.length !== tsSymbols.length)
+    errors.push(`symbols.h kNames has ${cppSymbols.length} entries vs registry.ts SYMBOLS ${tsSymbols.length}`);
+  for (let i = 0; i < Math.min(cppSymbols.length, tsSymbols.length); i++)
+    if (cppSymbols[i] !== tsSymbols[i])
+      errors.push(`symbols.h kNames[${i}]="${cppSymbols[i]}" vs registry.ts SYMBOLS[${i}]="${tsSymbols[i]}"`);
+  for (let i = 0; i < Math.min(cppCounts.length, support.length); i++)
+    if (cppCounts[i] !== support[i])
+      errors.push(`symbols.h kVenueCounts[${i}] (${cppSymbols[i] ?? "?"})=${cppCounts[i]} but registry.ts implies ${support[i]} — update kVenueCounts in src/app/symbols.h`);
 }
 
 if (errors.length) {

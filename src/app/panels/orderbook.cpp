@@ -1,5 +1,6 @@
 #include "panels.h"
 #include "panels_common.h"
+#include "../symbols.h"
 
 #include "../flow_sources.h"
 #include "../../data/merge.h"
@@ -589,11 +590,10 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
   if (showColumnHeader)
     u.draw.textFit(priceColumn, r.w < 180.0f ? "PRICE" : "PRICE (USDT)",
                    t.textDim, DrawList::Left);
-  static constexpr const char* kSymbols[] = {"ETH", "BTC", "SOL"};
   char amountHeader[32];
   snprintf(amountHeader, sizeof(amountHeader), "%s (%s)",
            st.showCumulative ? "CUM" : "SIZE",
-           st.showUsd ? "USD" : kSymbols[std::clamp(feeds.symbol, 0, 2)]);
+           st.showUsd ? "USD" : symbols::kNames[std::clamp(feeds.symbol, 0, 2)]);
   if (showColumnHeader) {
     u.draw.textFit(amountColumn,
                    r.w < 180.0f ? (st.showCumulative ? "CUM" : "SIZE")

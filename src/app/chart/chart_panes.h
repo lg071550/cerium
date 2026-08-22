@@ -1,12 +1,54 @@
 #pragma once
 
 #include "render/draw_list.h"
+#include "../../data/candles.h"
 #include "../../ui/theme.h"
 
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <vector>
+
+// Wilder seed for RSI-style oscillators: simple mean of the first `p` close
+// deltas (gains positive, losses negative). False when history is shorter
+// than the seed window. One implementation — this math previously lived in
+// five divergent copies across rsiSeries / computeRsi / computeRsiLive /
+// cipher_b / d7Rsi.
+inline bool wilderSeed(const CandleSeries& cs, int p, double& gainOut,
+                       double& lossOut) {
+  const size_t n = cs.v.size();
+  if (p < 1 || n <= (size_t)p) return false;
+  double gain = 0, loss = 0;
+  for (int i = 1; i <= p; ++i) {
+    double d = cs.v[(size_t)i].c - cs.v[(size_t)i - 1].c;
+    if (d > 0) gain += d;
+    else loss -= d;
+  }
+  gainOut = gain / p;
+  lossOut = loss / p;
+  return true;
+}
+
+// Full-series Wilder RSI: seed, then smooth through the last bar. Live-update
+// paths instead seed via wilderSeed and smooth only to n-2 so their
+// updateLastBar owns the forming bar.
+inline void wilderRsiSeries(const CandleSeries& cs, int p,
+                            std::vector<float>& out) {
+  const size_t n = cs.v.size();
+  out.assign(n, NAN);
+  double gain = 0, loss = 0;
+  if (!wilderSeed(cs, p, gain, loss)) return;
+  auto rsiOf = [](double g, double l) {
+    return l == 0 ? 100.0f : (float)(100.0 - 100.0 / (1.0 + g / l));
+  };
+  out[(size_t)p] = rsiOf(gain, loss);
+  for (size_t i = (size_t)p + 1; i < n; ++i) {
+    double d = cs.v[i].c - cs.v[i - 1].c;
+    gain = (gain * (p - 1) + (d > 0 ? d : 0)) / p;
+    loss = (loss * (p - 1) + (d < 0 ? -d : 0)) / p;
+    out[i] = rsiOf(gain, loss);
+  }
+}
 
 struct ChartPane {
   Rect area;

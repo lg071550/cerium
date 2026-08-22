@@ -3,6 +3,7 @@
 
 #include "../../platform/shell.h"
 #include "../../ui/theme.h"
+#include "../symbols.h"
 
 #include <algorithm>
 #include <cctype>
@@ -294,21 +295,9 @@ void drawTapeSettings(Ui& u, Rect area, TapePanel& st) {
 
 } // namespace
 
-// cached "HH:MM:SS" for a second-resolution timestamp — tape rows re-render
-// the same entries every frame; the cache keeps localtime_r + snprintf off
-// that path. Direct-mapped and bounded (64 slots).
+// cached "HH:MM:SS" — shared direct-mapped implementation on TimeLabels
 const char* TapePanel::timeLabel(int64_t secs) {
-  TimeLabels::Slot& s =
-      timeLabels.slots[(size_t)(((uint64_t)secs * 0x9E3779B97F4A7C15ull) >> 58)];
-  if (s.key != secs + 1) {
-    time_t t = (time_t)secs;
-    struct tm tmv;
-    localtime_r(&t, &tmv);
-    s.key = secs + 1;
-    snprintf(s.text, sizeof(s.text), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min,
-             tmv.tm_sec);
-  }
-  return s.text;
+  return timeLabels.label(secs);
 }
 
 void drawTape(Ui& u, Rect r, TapePanel& st, Feeds& feeds) {
@@ -423,10 +412,9 @@ void drawTape(Ui& u, Rect r, TapePanel& st, Feeds& feeds) {
     if (drawVenue) u.draw.textFit(venueColumn, "VENUE", t.textDim, DrawList::Left);
     u.draw.textFit(priceColumn, "PRICE", t.textDim, DrawList::Left);
   }
-  static constexpr const char* kSymbols[] = {"ETH", "BTC", "SOL"};
   char amountHeader[32];
   snprintf(amountHeader, sizeof(amountHeader), "AMOUNT (%s)",
-           st.showUsd ? "USD" : kSymbols[std::clamp(feeds.symbol, 0, 2)]);
+           st.showUsd ? "USD" : symbols::kNames[std::clamp(feeds.symbol, 0, 2)]);
   if (showColumnHeader) {
     u.draw.textFit(amountColumn, r.w < 180.0f ? "AMT" : amountHeader, t.textDim,
                    DrawList::Right);

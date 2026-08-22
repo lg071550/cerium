@@ -4,6 +4,7 @@
 #include "../platform/shell.h"
 #include "../ui/theme.h"
 #include "../ui/widgets.h"
+#include "symbols.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -16,8 +17,6 @@ static const char* kLayoutKey = "cerium.layout.v1";
 static const char* kTabCloseKey = "cerium.tabs.close.visible.v1";
 static const char* kTabStripsKey = "cerium.tabs.visible.v1";
 
-// canonical symbols — index matches feeds/registry.ts SYMBOLS
-static const char* kSyms[] = {"ETH", "BTC", "SOL"};
 static constexpr PanelKind kPanelKinds[] = {
     PanelKind::Chart, PanelKind::Orderbook, PanelKind::Dom, PanelKind::Tape,
     PanelKind::Liquidations, PanelKind::Watchlist, PanelKind::Feeds};
@@ -364,7 +363,7 @@ void Terminal::drawTopBar(float w) {
   if (sym.held || sym.hovered)
     ui.draw.rect(symBtn, sym.held ? t.accentSoft : t.bgHover);
   ui.draw.setFont(FontMonoSemibold);
-  ui.draw.textAligned({symBtn.x + 12, symBtn.y, 34, symBtn.h}, kSyms[feeds.symbol],
+  ui.draw.textAligned({symBtn.x + 12, symBtn.y, 34, symBtn.h}, symbols::kNames[feeds.symbol],
                       t.accent, DrawList::Left);
   ui.draw.setFont(FontMono);
   Color quietText = withAlpha(t.text, 0.60f);
@@ -758,11 +757,10 @@ void Terminal::drawSymbolPicker() {
   textField(ui, searchR, m_symSearch, "##symsearch", "search symbol…");
 
   // venue support per symbol — mirrors feeds/registry.ts
-  static const int kVenueCount[3] = {27, 24, 24};
-  int matches[3];
+    int matches[3];
   int nm = 0;
   for (int i = 0; i < 3; ++i)
-    if (containsCI(kSyms[i], m_symSearch.text)) matches[nm++] = i;
+    if (containsCI(symbols::kNames[i], m_symSearch.text)) matches[nm++] = i;
 
   if (m_symSearch.submitted) {
     m_symSearch.submitted = false;
@@ -783,8 +781,8 @@ void Terminal::drawSymbolPicker() {
       ui.draw.rect(row, t.bgHover, 3.0f);
     }
     char cnt[16];
-    snprintf(cnt, sizeof(cnt), "%d venues", kVenueCount[sym]);
-    ui.draw.textAligned(row, kSyms[sym], sym == feeds.symbol ? t.accent : t.text,
+    snprintf(cnt, sizeof(cnt), "%d venues", symbols::kVenueCounts[sym]);
+    ui.draw.textAligned(row, symbols::kNames[sym], sym == feeds.symbol ? t.accent : t.text,
                         DrawList::Left, 8);
     ui.draw.textAligned(row, cnt, t.textDim, DrawList::Right, 8);
     if (behavior(ui, row, m_pickerId ^ (0x9E3779B97F4A7C15ull * (uint64_t)(sym + 1))).clicked) {

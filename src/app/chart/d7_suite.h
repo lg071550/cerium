@@ -69,32 +69,12 @@ inline void d7EmaClose(const CandleSeries& cs, int period,
 }
 
 inline void d7Rsi(const CandleSeries& cs, int p, std::vector<float>& out,
-                 double* gainOut = nullptr, double* lossOut = nullptr) {
-  size_t n = cs.v.size();
-  out.assign(n, NAN);
-  if (gainOut) *gainOut = 0;
-  if (lossOut) *lossOut = 0;
-  if (n <= (size_t)p || p < 1) return;
-  double gain = 0, loss = 0;
-  for (int i = 1; i <= p; ++i) {
-    double d = cs.v[(size_t)i].c - cs.v[(size_t)i - 1].c;
-    if (d > 0) gain += d;
-    else loss -= d;
-  }
-  gain /= p;
-  loss /= p;
-  auto rsi = [](double g, double l) {
-    return l == 0 ? 100.0f : (float)(100.0 - 100.0 / (1.0 + g / l));
-  };
-  out[(size_t)p] = rsi(gain, loss);
-  for (size_t i = (size_t)p + 1; i < n; ++i) {
-    double d = cs.v[i].c - cs.v[i - 1].c;
-    gain = (gain * (p - 1) + (d > 0 ? d : 0)) / p;
-    loss = (loss * (p - 1) + (d < 0 ? -d : 0)) / p;
-    out[i] = rsi(gain, loss);
-  }
-  if (gainOut) *gainOut = gain;
-  if (lossOut) *lossOut = loss;
+                  double* gainOut = nullptr, double* lossOut = nullptr) {
+  // Shared Wilder implementation (chart_panes.h); the out-params are kept for
+  // signature compatibility but no caller consumes them.
+  wilderRsiSeries(cs, p, out);
+  (void)gainOut;
+  (void)lossOut;
 }
 
 inline void d7EmaOn(const std::vector<float>& src, int period,

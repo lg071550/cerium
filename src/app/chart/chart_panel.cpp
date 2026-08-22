@@ -1,4 +1,5 @@
 #include "chart_panel.h"
+#include "../symbols.h"
 #include "cipher_b.h"
 #include "d7_suite.h"
 
@@ -21,7 +22,6 @@
 #include <limits>
 #include <unordered_map>
 
-static const char* kSyms[] = {"ETH", "BTC", "SOL"};
 static constexpr float kChartGutters[] = {56.0f, 72.0f, 88.0f};
 static constexpr float kChartLineWidths[] = {1.0f, 1.5f, 2.0f, 2.5f};
 static constexpr float kLastPriceLineWidths[] = {1.0f, 1.5f, 2.0f};
@@ -227,27 +227,7 @@ static void bollBandsSeries(const CandleSeries& cs, int period, float deviation,
 }
 
 static void rsiSeries(const CandleSeries& cs, int p, std::vector<float>& out) {
-  size_t n = cs.v.size();
-  out.assign(n, NAN);
-  if (n <= (size_t)p) return;
-  double gain = 0, loss = 0;
-  for (int i = 1; i <= p; ++i) {
-    double d = cs.v[(size_t)i].c - cs.v[(size_t)i - 1].c;
-    if (d > 0) gain += d;
-    else loss -= d;
-  }
-  gain /= p;
-  loss /= p;
-  auto rsi = [](double g, double l) {
-    return l == 0 ? 100.0f : (float)(100.0 - 100.0 / (1.0 + g / l));
-  };
-  out[(size_t)p] = rsi(gain, loss);
-  for (size_t i = (size_t)p + 1; i < n; ++i) { // Wilder smoothing
-    double d = cs.v[i].c - cs.v[i - 1].c;
-    gain = (gain * (p - 1) + (d > 0 ? d : 0)) / p;
-    loss = (loss * (p - 1) + (d < 0 ? -d : 0)) / p;
-    out[i] = rsi(gain, loss);
-  }
+  wilderRsiSeries(cs, p, out);
 }
 
 static void macdSeries(const CandleSeries& cs, int fast, int slow,
@@ -273,6 +253,31 @@ static double trueRange(const Candle& c, double prevC) {
 }
 
 static int64_t utcDay(double tsMs) { return (int64_t)std::floor(tsMs / 86400000.0); }
+
+// TPO shows the latest few UTC sessions; profile column count scales to the
+// pane. Shared by the price-range scan and the TPO session builder so both
+// agree on how many sessions exist.
+static inline int tpoMaxSessions(float paneW) {
+  return paneW >= 760 ? 4 : paneW >= 460 ? 3 : 2;
+}
+
+// First bar of the visible TPO window: walk back from `vis1` across whole
+// UTC days until one more session than the pane can show has been crossed.
+static inline int tpoWindowFirst(const CandleSeries& cs, int vis1,
+                                 int maxSessions) {
+  int first = vis1;
+  int64_t lastDay = -1;
+  int days = 0;
+  for (int i = vis1; i >= 0; --i) {
+    int64_t day = utcDay(cs.v[(size_t)i].ts);
+    if (day != lastDay) {
+      lastDay = day;
+      if (++days > maxSessions) return i + 1;
+    }
+    first = i;
+  }
+  return first;
+}
 
 static void atrSeries(const CandleSeries& cs, int period, std::vector<float>& out) {
   size_t n = cs.v.size();
@@ -933,20 +938,12 @@ static void computeRsi(const CandleSeries& cs, IndicatorInstance& inst,
   rsiSeries(cs, std::max(2, inst.p0), inst.series);
   const size_t n = cs.v.size();
   if (n >= (size_t)inst.p0 + 2 && inst.series.size() == n) {
-    double gain = 0, loss = 0;
-    for (size_t i = 1; i <= n - 2; ++i) {
+    double gain, loss;
+    if (!wilderSeed(cs, inst.p0, gain, loss)) return;
+    for (size_t i = (size_t)inst.p0 + 1; i <= n - 2; ++i) { // to the last closed bar
       double d = cs.v[i].c - cs.v[i - 1].c;
-      if (i <= (size_t)inst.p0) {
-        if (d > 0) gain += d;
-        else loss -= d;
-        if (i == (size_t)inst.p0) {
-          gain /= inst.p0;
-          loss /= inst.p0;
-        }
-      } else {
-        gain = (gain * (inst.p0 - 1) + (d > 0 ? d : 0)) / inst.p0;
-        loss = (loss * (inst.p0 - 1) + (d < 0 ? -d : 0)) / inst.p0;
-      }
+      gain = (gain * (inst.p0 - 1) + (d > 0 ? d : 0)) / inst.p0;
+      loss = (loss * (inst.p0 - 1) + (d < 0 ? -d : 0)) / inst.p0;
     }
     inst.live0 = gain;
     inst.live1 = loss;
@@ -1198,20 +1195,12 @@ static void computeRsiLive(const CandleSeries& cs, IndicatorInstance& inst,
                            int rsiLiveP) {
   const size_t n = cs.v.size();
   if (n >= (size_t)rsiLiveP + 2 && inst.series.size() == n) {
-    double gain = 0, loss = 0;
-    for (size_t i = 1; i <= n - 2; ++i) {
+    double gain, loss;
+    if (!wilderSeed(cs, rsiLiveP, gain, loss)) return;
+    for (size_t i = (size_t)rsiLiveP + 1; i <= n - 2; ++i) { // to the last closed bar
       double d = cs.v[i].c - cs.v[i - 1].c;
-      if (i <= (size_t)rsiLiveP) {
-        if (d > 0) gain += d;
-        else loss -= d;
-        if (i == (size_t)rsiLiveP) {
-          gain /= rsiLiveP;
-          loss /= rsiLiveP;
-        }
-      } else {
-        gain = (gain * (rsiLiveP - 1) + (d > 0 ? d : 0)) / rsiLiveP;
-        loss = (loss * (rsiLiveP - 1) + (d < 0 ? -d : 0)) / rsiLiveP;
-      }
+      gain = (gain * (rsiLiveP - 1) + (d > 0 ? d : 0)) / rsiLiveP;
+      loss = (loss * (rsiLiveP - 1) + (d < 0 ? -d : 0)) / rsiLiveP;
     }
     inst.live0 = gain;
     inst.live1 = loss;
@@ -3376,7 +3365,7 @@ float ChartPanel::drawHeader(Ui& u, Rect r, Feeds& feeds) {
   Rect identity{r.x + 8.0f, r.y,
                 std::max(0.0f, typeBtn.x - r.x - 12.0f), 26};
   char sym[16];
-  snprintf(sym, sizeof(sym), "%sUSDT", kSyms[feeds.symbol]);
+  snprintf(sym, sizeof(sym), "%sUSDT", symbols::kNames[feeds.symbol]);
   u.draw.setFont(FontMonoSemibold);
   u.draw.textFit(identity, sym, t.text, DrawList::Left);
   float symW = u.draw.measure(sym);
@@ -3716,19 +3705,9 @@ void ChartPanel::navAndRanges(Ui& u, Feeds& feeds, PlotCtx& ctx) {
 
     double lo = 1e300, hi = -1e300; // price range over visible candles
     int rangeStart = ctx.vis0;
-    if (m_chartType == 3) {
-      int64_t lastDay = -1;
-      int days = 0;
-      int maxDays = ctx.price.area.w >= 760 ? 4 : ctx.price.area.w >= 460 ? 3 : 2;
-      for (int i = ctx.vis1; i >= 0; --i) {
-        int64_t day = utcDay(cs.v[(size_t)i].ts);
-        if (day != lastDay) {
-          lastDay = day;
-          if (++days > maxDays) break;
-        }
-        rangeStart = i;
-      }
-    }
+    if (m_chartType == 3)
+      rangeStart = tpoWindowFirst(cs, ctx.vis1,
+                                  tpoMaxSessions(ctx.price.area.w));
     for (int i = rangeStart; i <= ctx.vis1; ++i) {
       lo = std::min(lo, cs.v[(size_t)i].l);
       hi = std::max(hi, cs.v[(size_t)i].h);
@@ -4434,20 +4413,8 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
     // TPO is session-native rather than candle-native. Show the latest few UTC
     // sessions ending at the current horizontal viewport, allocating a stable
     // profile column to each instead of stretching letters over bar spacing.
-    int maxSessions = ctx.price.area.w >= 760 ? 4 : ctx.price.area.w >= 460 ? 3 : 2;
-    int tpoFirst = ctx.vis1;
-    {
-      int64_t lastDay = -1;
-      int dayCount = 0;
-      for (int i = ctx.vis1; i >= 0; --i) {
-        int64_t day = utcDay(cs.v[(size_t)i].ts);
-        if (day != lastDay) {
-          lastDay = day;
-          if (++dayCount > maxSessions) { tpoFirst = i + 1; break; }
-        }
-        tpoFirst = i;
-      }
-    }
+    int maxSessions = tpoMaxSessions(ctx.price.area.w);
+    int tpoFirst = tpoWindowFirst(cs, ctx.vis1, maxSessions);
 
     // Cached profile build: session construction, per-row letter maps and the
     // POC/value-area extraction previously ran every frame (thousands of hash

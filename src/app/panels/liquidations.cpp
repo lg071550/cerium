@@ -287,17 +287,7 @@ void drawSettings(Ui& u, Rect area, LiquidationsPanel& st) {
 } // namespace
 
 const char* LiquidationsPanel::timeLabel(int64_t secs) {
-  TimeLabels::Slot& slot =
-      timeLabels.slots[(size_t)(((uint64_t)secs * 0x9E3779B97F4A7C15ull) >> 58)];
-  if (slot.key != secs + 1) {
-    time_t time = (time_t)secs;
-    struct tm tmv;
-    localtime_r(&time, &tmv);
-    slot.key = secs + 1;
-    snprintf(slot.text, sizeof(slot.text), "%02d:%02d:%02d", tmv.tm_hour,
-             tmv.tm_min, tmv.tm_sec);
-  }
-  return slot.text;
+  return timeLabels.label(secs); // shared direct-mapped cache
 }
 
 void drawLiquidations(Ui& u, Rect r, LiquidationsPanel& st, Feeds& feeds) {

@@ -28,6 +28,9 @@ enum {
   CipherMarkBlood = 32
 };
 
+// Market Cipher B's RSI leg is fixed at period 14 in the Pine original.
+constexpr int kCipherRsiPeriod = 14;
+
 inline int cipherLayers(int opt) { return opt ? opt : CipherLayerAll; }
 
 inline double cipherHlc3(const Candle& c) { return (c.h + c.l + c.c) / 3.0; }
@@ -190,21 +193,15 @@ inline void cipherCompute(const CandleSeries& cs, int n1, int n2, int n3,
   cipherMfi(cs, mfi);
 
   double gain = 0, loss = 0;
-  bool rsiOn = false;
-  const int rp = 14;
+  const int rp = kCipherRsiPeriod;
+  // Pre-seed the Wilder averages; smoothing starts after the seed window.
+  // (The old inline accumulate-then-smooth loop did both in one pass.)
+  bool rsiOn = wilderSeed(cs, rp, gain, loss);
   float rsi = NAN;
+  if (rsiOn) rsi = cipherRsiOf(gain, loss);
   for (size_t i = 1; i < n; ++i) {
     double d = cs.v[i].c - cs.v[i - 1].c;
-    if (!rsiOn) {
-      if (d > 0) gain += d;
-      else loss -= d;
-      if (i == (size_t)rp) {
-        gain /= rp;
-        loss /= rp;
-        rsiOn = true;
-        rsi = cipherRsiOf(gain, loss);
-      }
-    } else {
+    if (rsiOn && (int)i > rp) {
       gain = (gain * (rp - 1) + (d > 0 ? d : 0)) / rp;
       loss = (loss * (rp - 1) + (d < 0 ? -d : 0)) / rp;
       rsi = cipherRsiOf(gain, loss);
@@ -213,9 +210,8 @@ inline void cipherCompute(const CandleSeries& cs, int n1, int n2, int n3,
       liveGain = rsiOn ? gain : NAN;
       liveLoss = rsiOn ? loss : NAN;
     }
-    if (i > 0)
-      marks[i] = cipherMark(wt1[i], wt2[i], wt1[i - 1], wt2[i - 1], rsi,
-                            i < mfi.size() ? mfi[i] : NAN);
+    marks[i] = cipherMark(wt1[i], wt2[i], wt1[i - 1], wt2[i - 1], rsi,
+                          i < mfi.size() ? mfi[i] : NAN);
   }
 }
 
