@@ -1488,6 +1488,7 @@ IndicatorInstance ChartPanel::makeInstance(int ri) {
     case IndVwap:
       inst.flag = m_showVwapBands;
       inst.opt = 1; // ±1σ bands by default
+      inst.colorD = inst.colorE = inst.colorB; // bands share one hue initially
       break;
     case IndD7:
       inst.p0 = 56;
@@ -1524,9 +1525,10 @@ IndicatorInstance ChartPanel::makeInstance(int ri) {
       inst.p2 = 4;
       inst.height = 128.0f;
       inst.flag = true;
-      inst.opt = CipherLayerAll;
+      inst.opt = CipherLayerAll | CipherOptDiv;
       inst.colorA = 0;
       inst.colorB = 6;
+      inst.colorC = 3;
       break;
     default: break;
   }
@@ -2468,7 +2470,7 @@ static void drawPaneCipherB(DrawList& d, const ChartPane& pane, const CandleSeri
                             float startF, float bw, const MarketSeries*) {
   cipherDraw(d, pane, inst.series, inst.aux, inst.aux2, inst.dir, vis0, vis1,
              startF, bw, indPalette(inst.colorA), indPalette(inst.colorB),
-             indWidth(inst), inst.flag, inst.opt);
+             indPalette(inst.colorC), indWidth(inst), inst.flag, inst.opt);
 }
 
 struct IndPresent {
@@ -3956,11 +3958,11 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       // 1px edge like Bollinger's.
       int sigMask = (inst.opt & 7) ? (inst.opt & 7) : 1;
       int maxK = (sigMask & 4) ? 3 : (sigMask & 2) ? 2 : 1;
-      Color band = indPalette(inst.colorB);
       static thread_local std::vector<float> bx, bTop, bBot;
       for (int k = 1; k <= maxK; ++k) {
         if (!(sigMask & (1 << (k - 1)))) continue;
         float scale = (float)k;
+        Color band = indPalette(k == 1 ? inst.colorB : k == 2 ? inst.colorD : inst.colorE);
         bx.clear();
         bTop.clear();
         bBot.clear();
@@ -4852,7 +4854,7 @@ static constexpr IndSettingsLayout kIndLayouts[] = {
     {true, 1, 1},  // SMA
     {true, 2, 2},  // BB
     {false, 0, 0}, // BOOK HEAT (slider page, fixed height)
-    {true, 2, 1},  // VWAP
+    {true, 4, 1},  // VWAP (line + three individually colored sigma bands)
     {true, 2, 2},  // ST
     {true, 1, 1},  // EMA 200
     {true, 2, 2},  // STOCH
@@ -4865,7 +4867,7 @@ static constexpr IndSettingsLayout kIndLayouts[] = {
     {true, 3, 2},  // D7 LVLS
     {true, 2, 1},  // OI
     {true, 2, 2},  // FUND
-    {true, 2, 3},  // CIPHER B
+    {true, 3, 4},  // CIPHER B (WT colors + MFI; preset/signals/guides/layer rows)
 };
 
 // Palette rows per register, in kRegistry order; the first
@@ -4875,7 +4877,7 @@ struct IndColorRow {
   uint8_t IndicatorInstance::*slot;
 };
 
-static constexpr IndColorRow kIndColors[][3] = {
+static constexpr IndColorRow kIndColors[][4] = {
     {{"UP", &IndicatorInstance::colorA}, {"DOWN", &IndicatorInstance::colorB}},                                       // VOL
     {{"UP", &IndicatorInstance::colorA}, {"DOWN", &IndicatorInstance::colorB}},                                       // CVD
     {{"LINE", &IndicatorInstance::colorA}},                                                                           // RSI
@@ -4884,7 +4886,10 @@ static constexpr IndColorRow kIndColors[][3] = {
     {{"LINE", &IndicatorInstance::colorA}},                                                                           // SMA
     {{"LINE", &IndicatorInstance::colorA}, {"BAND", &IndicatorInstance::colorB}},                                     // BB
     {},                                                                                                               // BOOK HEAT
-    {{"LINE", &IndicatorInstance::colorA}, {"BAND", &IndicatorInstance::colorB}},                                     // VWAP
+    {{"LINE", &IndicatorInstance::colorA},
+     {"1\xcf\x83", &IndicatorInstance::colorB},
+     {"2\xcf\x83", &IndicatorInstance::colorD},
+     {"3\xcf\x83", &IndicatorInstance::colorE}},                                                                      // VWAP
     {{"UP", &IndicatorInstance::colorA}, {"DOWN", &IndicatorInstance::colorB}},                                       // ST
     {{"LINE", &IndicatorInstance::colorA}},                                                                           // EMA 200
     {{"%K", &IndicatorInstance::colorA}, {"%D", &IndicatorInstance::colorB}},                                         // STOCH
@@ -4897,7 +4902,7 @@ static constexpr IndColorRow kIndColors[][3] = {
     {{"DAY", &IndicatorInstance::colorA}, {"WEEK", &IndicatorInstance::colorB}, {"MONTH", &IndicatorInstance::colorC}}, // D7 LVLS
     {{"UP", &IndicatorInstance::colorA}, {"DOWN", &IndicatorInstance::colorB}},                                       // OI
     {{"UP", &IndicatorInstance::colorA}, {"DOWN", &IndicatorInstance::colorB}},                                       // FUND
-    {{"WT1", &IndicatorInstance::colorA}, {"WT2", &IndicatorInstance::colorB}},                                       // CIPHER B
+    {{"WT1", &IndicatorInstance::colorA}, {"WT2", &IndicatorInstance::colorB}, {"MFI", &IndicatorInstance::colorC}},   // CIPHER B
 };
 
 static_assert(sizeof(kIndLayouts) / sizeof(kIndLayouts[0]) == 22, "layout/reg drift");
@@ -5134,17 +5139,19 @@ static constexpr IndOptRow kIndOpts[][4] = {
      {"GUIDE", nullptr,
       {chipToggle("ZERO LINE", 82, &IndicatorInstance::flag)}}},
     {// CIPHER B
-     {"PRESET", nullptr,
-      {{"10/21/4", 66, ChipKind::Set, 10, 21, 4, &IndicatorInstance::p0,
-        &IndicatorInstance::p1, &IndicatorInstance::p2},
-       {"9/12/3", 62, ChipKind::Set, 9, 12, 3, &IndicatorInstance::p0,
-        &IndicatorInstance::p1, &IndicatorInstance::p2}}},
-     {"GUIDES", nullptr,
-      {chipToggle("\xc2\xb1" "60", 52, &IndicatorInstance::flag)}},
-     {"LAYER", nullptr,
-      {{"MFI", 42, ChipKind::Bits, CipherLayerMfi, 0, 0, &IndicatorInstance::opt},
-       {"HIST", 50, ChipKind::Bits, CipherLayerHist, 0, 0, &IndicatorInstance::opt},
-       {"DOTS", 50, ChipKind::Bits, CipherLayerDots, 0, 0, &IndicatorInstance::opt}}}},
+      {"PRESET", nullptr,
+       {{"10/21/4", 66, ChipKind::Set, 10, 21, 4, &IndicatorInstance::p0,
+         &IndicatorInstance::p1, &IndicatorInstance::p2},
+        {"9/12/3", 62, ChipKind::Set, 9, 12, 3, &IndicatorInstance::p0,
+         &IndicatorInstance::p1, &IndicatorInstance::p2}}},
+      {"SIGNALS", nullptr,
+       {{"DIV", 42, ChipKind::Bits, CipherOptDiv, 0, 0, &IndicatorInstance::opt}}},
+      {"GUIDES", nullptr,
+       {chipToggle("\xc2\xb1" "60", 52, &IndicatorInstance::flag)}},
+      {"LAYER", nullptr,
+       {{"MFI", 42, ChipKind::Bits, CipherLayerMfi, 0, 0, &IndicatorInstance::opt},
+        {"HIST", 50, ChipKind::Bits, CipherLayerHist, 0, 0, &IndicatorInstance::opt},
+        {"DOTS", 50, ChipKind::Bits, CipherLayerDots, 0, 0, &IndicatorInstance::opt}}}},
 };
 
 static_assert(sizeof(kIndOpts) / sizeof(kIndOpts[0]) == 22, "opts/reg drift");

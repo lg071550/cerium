@@ -16,7 +16,9 @@ enum {
   CipherLayerMfi = 1,
   CipherLayerHist = 2,
   CipherLayerDots = 4,
-  CipherLayerAll = CipherLayerMfi | CipherLayerHist | CipherLayerDots
+  CipherLayerAll = CipherLayerMfi | CipherLayerHist | CipherLayerDots,
+  // opt bit above the layer mask: regular-divergence diamonds on/off.
+  CipherOptDiv = 256
 };
 
 enum {
@@ -366,12 +368,13 @@ inline void cipherCross(DrawList& d, float x, float y, float s, Color c,
 }
 
 inline void cipherDraw(DrawList& d, const ChartPane& pane,
-                      const std::vector<float>& wt1, const std::vector<float>& wt2,
-                      const std::vector<float>& mfi, const std::vector<int8_t>& marks,
-                      int vis0, int vis1, float startF, float bw, Color wt1C,
-                      Color wt2C, float thick, bool guides, int opt) {
+                       const std::vector<float>& wt1, const std::vector<float>& wt2,
+                       const std::vector<float>& mfi, const std::vector<int8_t>& marks,
+                       int vis0, int vis1, float startF, float bw, Color wt1C,
+                       Color wt2C, Color mfiC, float thick, bool guides, int opt) {
   const Theme& th = theme();
   int layers = cipherLayers(opt);
+  bool divOn = (opt & CipherOptDiv) != 0;
   Color up = th.green;
   Color down = th.red;
   Color gold = hexColor(0xe6b84d);
@@ -405,8 +408,10 @@ inline void cipherDraw(DrawList& d, const ChartPane& pane,
   Color wave = withAlpha(wt1C, 0.16f);
   d7DrawBand(d, pane, wt1, zero, vis0, vis1, startF, bw, wave, wave);
   if (layers & CipherLayerMfi)
-    d7DrawBand(d, pane, mfi, zero, vis0, vis1, startF, bw, withAlpha(up, 0.42f),
-               withAlpha(down, 0.42f));
+    // Money flow: bull side takes the instance's palette color; bear side
+    // stays red so the area reads directionally at any hue.
+    d7DrawBand(d, pane, mfi, zero, vis0, vis1, startF, bw,
+               withAlpha(mfiC, 0.40f), withAlpha(down, 0.42f));
   d7DrawBand(d, pane, wt1, wt2, vis0, vis1, startF, bw, withAlpha(wt1C, 0.32f),
              withAlpha(wt2C, 0.28f));
 
@@ -474,7 +479,8 @@ inline void cipherDraw(DrawList& d, const ChartPane& pane,
       }
     }
 
-    // Regular divergences ride the wave point itself.
+    // Regular divergences ride the wave point itself (opt-gated).
+    if (!divOn) continue;
     bool divBull = (m & CipherMarkDivBull) != 0;
     bool divBear = (m & CipherMarkDivBear) != 0;
     if ((divBull || divBear) && !std::isnan(b)) {

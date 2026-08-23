@@ -38,7 +38,9 @@ struct IndicatorInstance {
   uint8_t width = 1;     // 1 / 1.5 / 2 / 2.5px
   uint8_t colorA = 0;    // primary series / up / %K / ADX
   uint8_t colorB = 3;    // secondary / down / %D / +DI / signal
-  uint8_t colorC = 4;    // tertiary / −DI / hist
+  uint8_t colorC = 4;    // tertiary / −DI / hist / cipher money flow
+  uint8_t colorD = 3;    // vwap ±2σ band
+  uint8_t colorE = 3;    // vwap ±3σ band
   int p0 = 0, p1 = 0, p2 = 0; // type-specific periods / volume mode
   int opt = 0;           // deviation / multiplier / volume intensity
   bool flag = true;      // guides / histogram / bands / DI / zero line
