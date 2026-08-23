@@ -77,7 +77,7 @@ inline int8_t cipherMark(float wt1, float wt2, float prev1, float prev2,
 // bullish mirrored under −25. Pivot separation capped so stale pairs die.
 inline void cipherDivergences(const CandleSeries& cs,
                               const std::vector<float>& wt2,
-                              std::vector<int8_t>& marks, int pad = 5,
+                              std::vector<int8_t>& marks, int pad = 2,
                               int maxSpan = 60) {
   const size_t n = cs.v.size();
   if ((int)n < pad * 2 + 2 || wt2.size() != n || marks.size() != n) return;
@@ -133,43 +133,27 @@ inline void cipherSma(const std::vector<float>& src, int period,
   }
 }
 
-// Market Cipher B money flow: Wilder RSI applied to dollar volume
-// (hlc3 × volume), rescaled around zero by −50 and stretched ×1.5 — plotted
-// range ≈ ±75. This is the original formula; the previous implementation
-// averaged candle-body ratios, which looked nothing like it.
-inline double cipherMfiSrc(const Candle& c) {
-  return cipherHlc3(c) * std::max(0.0, c.vol);
-}
-
-inline void cipherMfi(const CandleSeries& cs, std::vector<float>& out,
-                      double* upOut = nullptr, double* downOut = nullptr) {
+// Market Cipher B money flow (RSI-MFI): body position within the range
+// (close−open)/(high−low), smoothed with SMA 60 and scaled ×190 — exactly
+// the Pine default (mfi_input_mafn="SMA", period 60, scale 190). Previous
+// builds averaged hlc3×volume via Wilder RSI, which produced a completely
+// different shape and amplitude.
+inline void cipherMfi(const CandleSeries& cs, std::vector<float>& out) {
   const int period = 60;
+  const float scale = 190.0f;
   const size_t n = cs.v.size();
   out.assign(n, NAN);
-  if (upOut) *upOut = 0;
-  if (downOut) *downOut = 0;
-  if ((int)n <= period) return;
-  double up = 0, down = 0;
-  for (int i = 1; i <= period; ++i) {
-    double d = cipherMfiSrc(cs.v[(size_t)i]) - cipherMfiSrc(cs.v[(size_t)i - 1]);
-    if (d > 0) up += d;
-    else down -= d;
+  if ((int)n < period) return;
+  for (size_t i = (size_t)period - 1; i < n; ++i) {
+    double sum = 0;
+    for (int k = 0; k < period; ++k) {
+      const Candle& c = cs.v[i - (size_t)k];
+      double denom = c.h - c.l;
+      double v = (denom != 0.0) ? (c.c - c.o) / denom : 0.0;
+      sum += v;
+    }
+    out[i] = (float)(sum / period * scale);
   }
-  up /= period;
-  down /= period;
-  auto mfiOf = [](double u, double dn) {
-    double rsi = dn == 0 ? 100.0 : 100.0 - 100.0 / (1.0 + u / dn);
-    return (float)((rsi - 50.0) * 1.5);
-  };
-  out[(size_t)period] = mfiOf(up, down);
-  for (size_t i = (size_t)period + 1; i < n; ++i) {
-    double d = cipherMfiSrc(cs.v[i]) - cipherMfiSrc(cs.v[i - 1]);
-    up = (up * (period - 1) + (d > 0 ? d : 0)) / period;
-    down = (down * (period - 1) + (d < 0 ? -d : 0)) / period;
-    out[i] = mfiOf(up, down);
-  }
-  if (upOut) *upOut = up;
-  if (downOut) *downOut = down;
 }
 
 // WaveTrend + MFI + marks. live* are n-2 seeds for the last-bar increment:
@@ -251,11 +235,9 @@ inline void cipherCompute(const CandleSeries& cs, int n1, int n2, int n3,
   }
 
   cipherSma(wt1, n3, wt2);
-  double mfiUp = 0, mfiDown = 0;
-  cipherMfi(cs, mfi, &mfiUp, &mfiDown);
-  liveMfiUp = mfiUp;
-  liveMfiDown = mfiDown;
-  cipherDivergences(cs, wt2, marks);
+  cipherMfi(cs, mfi);
+  liveMfiUp = liveMfiDown = 0;
+  cipherDivergences(cs, wt2, marks, 2, 60);
 
   double gain = 0, loss = 0;
   const int rp = kCipherRsiPeriod;
@@ -292,14 +274,19 @@ inline bool cipherUpdateLast(const CandleSeries& cs, int n1, int n2, int n3,
   if (n < 2 || wt1.size() != n || wt2.size() != n || mfi.size() != n ||
       marks.size() != n)
     return false;
-  // MFI RMA step on dollar-volume deltas (seeded from the full compute).
-  if (!std::isnan(mfi[(size_t)n - 2]) && cs.v.size() >= 61) {
-    double d = cipherMfiSrc(cs.v[n - 1]) - cipherMfiSrc(cs.v[n - 2]);
-    mfiUp = (mfiUp * 59.0 + (d > 0 ? d : 0)) / 60.0;
-    mfiDown = (mfiDown * 59.0 + (d < 0 ? -d : 0)) / 60.0;
-    double rsi = mfiDown == 0 ? 100.0
-                              : 100.0 - 100.0 / (1.0 + mfiUp / mfiDown);
-    mfi[n - 1] = (float)((rsi - 50.0) * 1.5);
+  // Body-position MFI is SMA-based; recompute the last bar from its 60-bar
+  // window (trivial cost, no persistent RMA state to drift).
+  (void)mfiUp;
+  (void)mfiDown;
+  if (n >= 60) {
+    double sum = 0;
+    for (size_t k = n - 60; k < n; ++k) {
+      const Candle& c = cs.v[k];
+      double denom = c.h - c.l;
+      double v = (denom != 0.0) ? (c.c - c.o) / denom : 0.0;
+      sum += v;
+    }
+    mfi[n - 1] = (float)(sum / 60.0 * 190.0);
   } else {
     mfi[n - 1] = NAN;
   }
