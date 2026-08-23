@@ -1260,14 +1260,15 @@ static void computeCipherB(const CandleSeries& cs, IndicatorInstance& inst,
                            const OrderFlowSeries* of, const MarketSeries* mkt) {
   cipherCompute(cs, inst.p0, inst.p1, inst.p2, inst.series, inst.aux, inst.aux2,
                 inst.dir, inst.live0, inst.live1, inst.live2, inst.live3,
-                inst.live4);
+                inst.live4, inst.live5, inst.live6);
 }
 
 static bool updateCipherB(const CandleSeries& cs, IndicatorInstance& inst,
                           const OrderFlowSeries* of, const MarketSeries* mkt) {
   return cipherUpdateLast(cs, inst.p0, inst.p1, inst.p2, inst.series, inst.aux,
                           inst.aux2, inst.dir, inst.live0, inst.live1,
-                          inst.live2, inst.live3, inst.live4);
+                          inst.live2, inst.live3, inst.live4, inst.live5,
+                          inst.live6);
 }
 
 static const Indicator kRegistry[] = {
@@ -1484,7 +1485,10 @@ IndicatorInstance ChartPanel::makeInstance(int ri) {
       inst.colorA = 3;
       inst.colorB = 4;
       break;
-    case IndVwap: inst.flag = m_showVwapBands; break;
+    case IndVwap:
+      inst.flag = m_showVwapBands;
+      inst.opt = 1; // ±1σ bands by default
+      break;
     case IndD7:
       inst.p0 = 56;
       inst.flag = false;
@@ -2535,55 +2539,6 @@ static void drawVwapLine(DrawList& d, const ChartPane& pane, const CandleSeries&
     }
     xy.push_back(pane.area.x + (i - startF) * bw + bw * 0.5f);
     xy.push_back(pane.yOf(v));
-  }
-  flush();
-}
-
-static void drawVwapBands(DrawList& d, const ChartPane& pane, const CandleSeries& cs,
-                          const std::vector<float>& upper, const std::vector<float>& lower,
-                          int vis0, int vis1, float startF, float bw, Color fill) {
-  static thread_local std::vector<float> bx, bTop, bBot;
-  auto flush = [&]() {
-    if (bx.size() >= 2)
-      d.seriesBand(bx.data(), bTop.data(), bBot.data(), (int)bx.size(), fill);
-    bx.clear();
-    bTop.clear();
-    bBot.clear();
-  };
-  int64_t day = std::numeric_limits<int64_t>::min();
-  int last = -1;
-  for (int i = vis0; i <= vis1 && i < (int)upper.size() && i < (int)lower.size() &&
-                     i < (int)cs.v.size();
-       ++i) {
-    if (std::isnan(upper[(size_t)i]) || std::isnan(lower[(size_t)i])) {
-      if (last >= 0) {
-        bx.push_back(pane.area.x + (last - startF) * bw + bw);
-        bTop.push_back(bTop.back());
-        bBot.push_back(bBot.back());
-      }
-      flush();
-      last = -1;
-      continue;
-    }
-    int64_t d = utcDay(cs.v[(size_t)i].ts);
-    if (d != day) {
-      if (last >= 0) {
-        bx.push_back(pane.area.x + (last - startF) * bw + bw);
-        bTop.push_back(bTop.back());
-        bBot.push_back(bBot.back());
-      }
-      flush();
-      day = d;
-    }
-    bx.push_back(pane.area.x + (i - startF) * bw);
-    bTop.push_back(pane.yOf(upper[(size_t)i]));
-    bBot.push_back(pane.yOf(lower[(size_t)i]));
-    last = i;
-  }
-  if (last >= 0) {
-    bx.push_back(pane.area.x + (last - startF) * bw + bw);
-    bTop.push_back(bTop.back());
-    bBot.push_back(bBot.back());
   }
   flush();
 }
@@ -3996,9 +3951,70 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       if (inst.reg != IndVwap || !inst.seriesVisible || !inst.flag ||
           inst.aux.size() != inst.series.size())
         continue;
-      drawVwapBands(u.draw, ctx.price, cs, inst.aux, inst.aux2, ctx.vis0,
-                    ctx.vis1, ctx.startF, ctx.bw,
-                    withAlpha(indPalette(inst.colorB), 0.06f));
+      // σ bands are linear in k: aux/aux2 hold ±1σ, selected multiples scale
+      // the distance from the line. Fills fade with k; each drawn band gets a
+      // 1px edge like Bollinger's.
+      int sigMask = (inst.opt & 7) ? (inst.opt & 7) : 1;
+      int maxK = (sigMask & 4) ? 3 : (sigMask & 2) ? 2 : 1;
+      Color band = indPalette(inst.colorB);
+      static thread_local std::vector<float> bx, bTop, bBot;
+      for (int k = 1; k <= maxK; ++k) {
+        if (!(sigMask & (1 << (k - 1)))) continue;
+        float scale = (float)k;
+        bx.clear();
+        bTop.clear();
+        bBot.clear();
+        for (int i = ctx.vis0; i <= ctx.vis1 && i < (int)inst.series.size() &&
+                               i < (int)cs.v.size();
+             ++i) {
+          float mid = inst.series[(size_t)i];
+          float up = inst.aux[(size_t)i], dn = inst.aux2[(size_t)i];
+          if (std::isnan(mid) || std::isnan(up) || std::isnan(dn)) continue;
+          float dist = up - mid;
+          bx.push_back(ctx.xOf(i));
+          bTop.push_back(ctx.price.yOf(mid + dist * scale));
+          bBot.push_back(ctx.price.yOf(mid - dist * scale));
+        }
+        if (bx.size() < 2) continue;
+        u.draw.seriesBand(bx.data(), bTop.data(), bBot.data(), (int)bx.size(),
+                          withAlpha(band, k == 1 ? 0.10f : k == 2 ? 0.06f
+                                                                 : 0.045f));
+        static thread_local std::vector<float> exy;
+        for (int side = 0; side < 2; ++side) {
+          exy.clear();
+          for (size_t j = 0; j < bx.size(); ++j) {
+            exy.push_back(bx[j]);
+            exy.push_back(side ? bBot[j] : bTop[j]);
+          }
+          u.draw.polyline(exy.data(), (int)(exy.size() / 2),
+                          withAlpha(band, 0.5f), 1.0f);
+        }
+      }
+
+      // Session-end ticks: a 1px hairline where each UTC segment ends,
+      // spanning the widest drawn band on both sides of the line.
+      static thread_local std::vector<float> tickYs;
+      tickYs.clear();
+      int64_t prevDay = std::numeric_limits<int64_t>::min();
+      for (int i = std::max(ctx.vis0, 1);
+           i <= ctx.vis1 && i < (int)inst.series.size() && i < (int)cs.v.size();
+           ++i) {
+        float mid = inst.series[(size_t)i];
+        float up = inst.aux[(size_t)i], dn = inst.aux2[(size_t)i];
+        if (std::isnan(mid) || std::isnan(up) || std::isnan(dn)) continue;
+        int64_t dday = utcDay(cs.v[(size_t)i].ts);
+        if (prevDay != std::numeric_limits<int64_t>::min() && dday != prevDay &&
+            tickYs.size() >= 2) {
+          float x = ctx.xOf(i) - ctx.bw * 0.5f;
+          u.draw.rect({x, tickYs[0], 1.0f, tickYs[1] - tickYs[0]},
+                      withAlpha(t.border, 0.55f));
+        }
+        prevDay = dday;
+        float dist = up - mid;
+        tickYs.clear();
+        tickYs.push_back(ctx.price.yOf(mid + dist * (float)maxK));
+        tickYs.push_back(ctx.price.yOf(mid - dist * (float)maxK));
+      }
     }
   }
 
@@ -5032,8 +5048,10 @@ static constexpr IndOptRow kIndOpts[][4] = {
        chipSet("3", 42, 3, &IndicatorInstance::opt)}}},
     {}, // BOOK HEAT (slider page)
     {// VWAP
-     {"BANDS", nullptr,
-      {chipToggle("1\xcf\x83", 48, &IndicatorInstance::flag)}}},
+      {"SIGMA", nullptr,
+       {{"1\xcf\x83", 44, ChipKind::Bits, 1, 0, 0, &IndicatorInstance::opt},
+        {"2\xcf\x83", 44, ChipKind::Bits, 2, 0, 0, &IndicatorInstance::opt},
+        {"3\xcf\x83", 44, ChipKind::Bits, 4, 0, 0, &IndicatorInstance::opt}}}},
     {// ST
      {"PERIOD", nullptr,
       {chipSet("7", 42, 7, &IndicatorInstance::p0),

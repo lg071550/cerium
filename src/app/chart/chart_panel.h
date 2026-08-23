@@ -47,6 +47,7 @@ struct IndicatorInstance {
   std::vector<float> aux2;
   std::vector<int8_t> dir;
   double live0 = 0, live1 = 0, live2 = 0, live3 = 0, live4 = 0;
+  double live5 = 0, live6 = 0; // cipher B: MFI RMA up/down seeds
   int liveI = 0;
   int64_t liveDay = 0;
   int64_t liveShift = 0; // OrderFlowSeries::indexShift as of the last fold

@@ -25,7 +25,9 @@ enum {
   CipherMarkBuy = 4,
   CipherMarkSell = 8,
   CipherMarkGold = 16,
-  CipherMarkBlood = 32
+  CipherMarkBlood = 32,
+  CipherMarkDivBull = 64,
+  CipherMarkDivBear = 128
 };
 
 // Market Cipher B's RSI leg is fixed at period 14 in the Pine original.
@@ -34,12 +36,6 @@ constexpr int kCipherRsiPeriod = 14;
 inline int cipherLayers(int opt) { return opt ? opt : CipherLayerAll; }
 
 inline double cipherHlc3(const Candle& c) { return (c.h + c.l + c.c) / 3.0; }
-
-inline double cipherBody(const Candle& c) {
-  double span = c.h - c.l;
-  if (!(span > 0.0)) return 0.0;
-  return (c.c - c.o) / span;
-}
 
 inline float cipherRsiOf(double g, double l) {
   return l == 0.0 ? 100.0f : (float)(100.0 - 100.0 / (1.0 + g / l));
@@ -52,21 +48,67 @@ inline int8_t cipherMark(float wt1, float wt2, float prev1, float prev2,
     return 0;
   float d0 = prev1 - prev2;
   float d1 = wt1 - wt2;
-  bool cross = (d0 > 0.0f && d1 <= 0.0f) || (d0 < 0.0f && d1 >= 0.0f) ||
-               (d0 == 0.0f && d1 != 0.0f);
-  if (!cross) return 0;
-  int8_t m = (int8_t)CipherMarkCross;
-  bool up = d1 >= 0.0f;
-  if (up) m = (int8_t)(m | CipherMarkUp);
-  if (up && wt2 <= -60.0f) {
-    m = (int8_t)(m | CipherMarkBuy);
-    if (wt2 <= -80.0f && !std::isnan(rsi) && rsi < 30.0f)
+  bool crossUp = d0 <= 0.0f && d1 > 0.0f;
+  bool crossDown = d0 >= 0.0f && d1 < 0.0f;
+  // Original Market Cipher B paints a signal only when the wave cross lands
+  // beyond the ±53 WaveTrend extremes; mid-range crossovers stay unmarked.
+  if (crossUp && wt2 <= -53.0f) {
+    int8_t m = (int8_t)(CipherMarkCross | CipherMarkUp | CipherMarkBuy);
+    // Golden buy: buy confluence with RSI < 20 and negative money flow.
+    if (!std::isnan(rsi) && !std::isnan(mfi) && rsi < 20.0f && mfi < 0.0f)
       m = (int8_t)(m | CipherMarkGold);
-  } else if (!up && wt2 >= 60.0f) {
-    m = (int8_t)(m | CipherMarkSell);
-    if (!(mfi > 0.0f)) m = (int8_t)(m | CipherMarkBlood);
+    return m;
   }
-  return m;
+  if (crossDown && wt2 >= 53.0f) {
+    int8_t m = (int8_t)(CipherMarkCross | CipherMarkSell);
+    // Blood sell: sell confluence with RSI > 80 and positive money flow.
+    if (!std::isnan(rsi) && !std::isnan(mfi) && rsi > 80.0f && mfi > 0.0f)
+      m = (int8_t)(m | CipherMarkBlood);
+    return m;
+  }
+  return 0;
+}
+
+// Regular divergences, price vs WaveTrend %B. Fractal pivots confirmed after
+// `pad` bars on each side; the second pivot carries the mark. Bearish: price
+// higher high + oscillator lower high inside momentum territory (>25);
+// bullish mirrored under −25. Pivot separation capped so stale pairs die.
+inline void cipherDivergences(const CandleSeries& cs,
+                              const std::vector<float>& wt2,
+                              std::vector<int8_t>& marks, int pad = 5,
+                              int maxSpan = 60) {
+  const size_t n = cs.v.size();
+  if ((int)n < pad * 2 + 2 || wt2.size() != n || marks.size() != n) return;
+  int lastHighPivot = -1, lastLowPivot = -1;
+  for (size_t i = (size_t)pad; i + (size_t)pad < n; ++i) {
+    const Candle& c = cs.v[i];
+    bool ph = true, pl = true;
+    for (size_t k = 1; k <= (size_t)pad; ++k) {
+      if (!(c.h >= cs.v[i - k].h && c.h > cs.v[i + k].h)) ph = false;
+      if (!(c.l <= cs.v[i - k].l && c.l < cs.v[i + k].l)) pl = false;
+      if (!ph && !pl) break;
+    }
+    if (ph) {
+      float wPrev = lastHighPivot >= 0 ? wt2[(size_t)lastHighPivot] : NAN;
+      float wNow = wt2[i];
+      if (lastHighPivot >= 0 && i - (size_t)lastHighPivot <= (size_t)maxSpan &&
+          !std::isnan(wPrev) && !std::isnan(wNow) &&
+          c.h > cs.v[(size_t)lastHighPivot].h && wNow < wPrev &&
+          std::min(wNow, wPrev) > 25.0f)
+        marks[i] |= CipherMarkDivBear;
+      lastHighPivot = (int)i;
+    }
+    if (pl) {
+      float wPrev = lastLowPivot >= 0 ? wt2[(size_t)lastLowPivot] : NAN;
+      float wNow = wt2[i];
+      if (lastLowPivot >= 0 && i - (size_t)lastLowPivot <= (size_t)maxSpan &&
+          !std::isnan(wPrev) && !std::isnan(wNow) &&
+          c.l < cs.v[(size_t)lastLowPivot].l && wNow > wPrev &&
+          std::max(wNow, wPrev) < -25.0f)
+        marks[i] |= CipherMarkDivBull;
+      lastLowPivot = (int)i;
+    }
+  }
 }
 
 inline void cipherSma(const std::vector<float>& src, int period,
@@ -89,37 +131,53 @@ inline void cipherSma(const std::vector<float>& src, int period,
   }
 }
 
-inline void cipherMfi(const CandleSeries& cs, std::vector<float>& out) {
-  const int period = 60;
-  size_t n = cs.v.size();
-  out.assign(n, NAN);
-  if (n < (size_t)period) return;
-  double sum = 0;
-  for (int i = 0; i < period; ++i) sum += cipherBody(cs.v[(size_t)i]) * 150.0;
-  out[(size_t)period - 1] = (float)(sum / period);
-  for (size_t i = (size_t)period; i < n; ++i) {
-    sum += cipherBody(cs.v[i]) * 150.0 -
-           cipherBody(cs.v[i - (size_t)period]) * 150.0;
-    out[i] = (float)(sum / period);
-  }
+// Market Cipher B money flow: Wilder RSI applied to dollar volume
+// (hlc3 × volume), rescaled around zero by −50 and stretched ×1.5 — plotted
+// range ≈ ±75. This is the original formula; the previous implementation
+// averaged candle-body ratios, which looked nothing like it.
+inline double cipherMfiSrc(const Candle& c) {
+  return cipherHlc3(c) * std::max(0.0, c.vol);
 }
 
-inline float cipherMfiLast(const CandleSeries& cs, int period = 60) {
-  size_t n = cs.v.size();
-  if (n < (size_t)period || period < 1) return NAN;
-  double sum = 0;
-  for (size_t i = n - (size_t)period; i < n; ++i)
-    sum += cipherBody(cs.v[i]) * 150.0;
-  return (float)(sum / period);
+inline void cipherMfi(const CandleSeries& cs, std::vector<float>& out,
+                      double* upOut = nullptr, double* downOut = nullptr) {
+  const int period = 60;
+  const size_t n = cs.v.size();
+  out.assign(n, NAN);
+  if (upOut) *upOut = 0;
+  if (downOut) *downOut = 0;
+  if ((int)n <= period) return;
+  double up = 0, down = 0;
+  for (int i = 1; i <= period; ++i) {
+    double d = cipherMfiSrc(cs.v[(size_t)i]) - cipherMfiSrc(cs.v[(size_t)i - 1]);
+    if (d > 0) up += d;
+    else down -= d;
+  }
+  up /= period;
+  down /= period;
+  auto mfiOf = [](double u, double dn) {
+    double rsi = dn == 0 ? 100.0 : 100.0 - 100.0 / (1.0 + u / dn);
+    return (float)((rsi - 50.0) * 1.5);
+  };
+  out[(size_t)period] = mfiOf(up, down);
+  for (size_t i = (size_t)period + 1; i < n; ++i) {
+    double d = cipherMfiSrc(cs.v[i]) - cipherMfiSrc(cs.v[i - 1]);
+    up = (up * (period - 1) + (d > 0 ? d : 0)) / period;
+    down = (down * (period - 1) + (d < 0 ? -d : 0)) / period;
+    out[i] = mfiOf(up, down);
+  }
+  if (upOut) *upOut = up;
+  if (downOut) *downOut = down;
 }
 
 // WaveTrend + MFI + marks. live* are n-2 seeds for the last-bar increment:
-// esa, d, tci, RSI Wilder gain/loss.
+// esa, d, tci, RSI Wilder gain/loss, and MFI RMA up/down.
 inline void cipherCompute(const CandleSeries& cs, int n1, int n2, int n3,
                           std::vector<float>& wt1, std::vector<float>& wt2,
                           std::vector<float>& mfi, std::vector<int8_t>& marks,
                           double& liveEsa, double& liveDe, double& liveTci,
-                          double& liveGain, double& liveLoss) {
+                          double& liveGain, double& liveLoss,
+                          double& liveMfiUp, double& liveMfiDown) {
   n1 = std::max(2, n1);
   n2 = std::max(2, n2);
   n3 = std::max(2, n3);
@@ -127,6 +185,7 @@ inline void cipherCompute(const CandleSeries& cs, int n1, int n2, int n3,
   wt1.assign(n, NAN);
   marks.assign(n, 0);
   liveEsa = liveDe = liveTci = liveGain = liveLoss = NAN;
+  liveMfiUp = liveMfiDown = 0;
   if (n == 0) {
     wt2.assign(0, NAN);
     mfi.assign(0, NAN);
@@ -190,7 +249,11 @@ inline void cipherCompute(const CandleSeries& cs, int n1, int n2, int n3,
   }
 
   cipherSma(wt1, n3, wt2);
-  cipherMfi(cs, mfi);
+  double mfiUp = 0, mfiDown = 0;
+  cipherMfi(cs, mfi, &mfiUp, &mfiDown);
+  liveMfiUp = mfiUp;
+  liveMfiDown = mfiDown;
+  cipherDivergences(cs, wt2, marks);
 
   double gain = 0, loss = 0;
   const int rp = kCipherRsiPeriod;
@@ -219,7 +282,7 @@ inline bool cipherUpdateLast(const CandleSeries& cs, int n1, int n2, int n3,
                              std::vector<float>& wt1, std::vector<float>& wt2,
                              std::vector<float>& mfi, std::vector<int8_t>& marks,
                              double esa, double de, double tci, double gain,
-                             double loss) {
+                             double loss, double& mfiUp, double& mfiDown) {
   n1 = std::max(2, n1);
   n2 = std::max(2, n2);
   n3 = std::max(2, n3);
@@ -227,7 +290,17 @@ inline bool cipherUpdateLast(const CandleSeries& cs, int n1, int n2, int n3,
   if (n < 2 || wt1.size() != n || wt2.size() != n || mfi.size() != n ||
       marks.size() != n)
     return false;
-  mfi[n - 1] = cipherMfiLast(cs);
+  // MFI RMA step on dollar-volume deltas (seeded from the full compute).
+  if (!std::isnan(mfi[(size_t)n - 2]) && cs.v.size() >= 61) {
+    double d = cipherMfiSrc(cs.v[n - 1]) - cipherMfiSrc(cs.v[n - 2]);
+    mfiUp = (mfiUp * 59.0 + (d > 0 ? d : 0)) / 60.0;
+    mfiDown = (mfiDown * 59.0 + (d < 0 ? -d : 0)) / 60.0;
+    double rsi = mfiDown == 0 ? 100.0
+                              : 100.0 - 100.0 / (1.0 + mfiUp / mfiDown);
+    mfi[n - 1] = (float)((rsi - 50.0) * 1.5);
+  } else {
+    mfi[n - 1] = NAN;
+  }
   if (!std::isfinite(esa) || !std::isfinite(de) || !std::isfinite(tci)) {
     wt1[n - 1] = NAN;
     wt2[n - 1] = NAN;
@@ -365,31 +438,53 @@ inline void cipherDraw(DrawList& d, const ChartPane& pane,
     int8_t m = marks[(size_t)i];
     if (!m) continue;
     float a = wt1[(size_t)i], b = wt2[(size_t)i];
-    if (std::isnan(a) || std::isnan(b)) continue;
     float x = d7BarX(pane, (float)i, startF, bw);
-    float y = pane.yOf(0.5f * (a + b));
     bool buy = (m & CipherMarkBuy) != 0;
     bool sell = (m & CipherMarkSell) != 0;
     bool gdot = (m & CipherMarkGold) != 0;
     bool blood = (m & CipherMarkBlood) != 0;
-    bool upCross = (m & CipherMarkUp) != 0;
-    d.circle(x, y, wr, withAlpha(upCross ? up : down, 0.95f));
-    d.circleOutline(x, y, wr, withAlpha(th.text, 0.35f), 1.0f);
+
+    // Signal markers only — mid-range wave crossovers stay unmarked (the old
+    // draw loop stamped a gold X on every single crossover).
+    if (buy || sell) {
+      float a2 = wt2[(size_t)i];
+      if (!std::isnan(a) && !std::isnan(a2)) {
+        float y = pane.yOf(0.5f * (a + a2));
+        d.circle(x, y, wr, withAlpha(sell ? down : up, 0.90f));
+        d.circleOutline(x, y, wr, withAlpha(th.text, 0.35f), 1.0f);
+      }
+    }
     if (gdot) {
-      d.circle(x, yBuy, r, withAlpha(up, 0.95f));
-      d.circleOutline(x, yBuy, r + 3.0f, withAlpha(gold, 0.95f), 1.6f);
+      // Golden buy: gold-filled marker with a bright ring.
+      d.circle(x, yBuy, r, withAlpha(gold, 0.92f));
+      d.circleOutline(x, yBuy, r + 3.0f, withAlpha(th.text, 0.45f), 1.2f);
     } else if (buy) {
       d.circle(x, yBuy, r, withAlpha(up, 0.95f));
       d.circleOutline(x, yBuy, r, withAlpha(th.text, 0.40f), 1.1f);
     }
     if (sell) {
-      if (blood)
+      if (blood) {
+        // Blood sell: red diamond bearing a compact X.
         cipherDiamond(d, x, ySell, r + 0.8f, withAlpha(down, 0.95f));
-      else {
+        cipherCross(d, x, ySell, xs * 0.62f,
+                    withAlpha(hexColor(0xffffff), 0.85f), 1.4f);
+      } else {
         d.circle(x, ySell, r, withAlpha(down, 0.95f));
         d.circleOutline(x, ySell, r, withAlpha(th.text, 0.40f), 1.1f);
       }
     }
-    cipherCross(d, x, y, xs, withAlpha(gold, 0.92f), 1.8f);
+
+    // Regular divergences ride the wave point itself.
+    bool divBull = (m & CipherMarkDivBull) != 0;
+    bool divBear = (m & CipherMarkDivBear) != 0;
+    if ((divBull || divBear) && !std::isnan(b)) {
+      float yDiv = pane.yOf(b) + (divBear ? -(r + 6.0f) : (r + 6.0f));
+      cipherDiamond(d, x, yDiv, wr * 0.9f,
+                    withAlpha(divBear ? down : up, 0.95f));
+      cipherDiamond(d, x, yDiv, wr * 0.9f - 2.2f,
+                    withAlpha(th.panel, 0.85f));
+      cipherDiamond(d, x, yDiv, wr * 0.9f - 4.0f,
+                    withAlpha(divBear ? down : up, 0.95f));
+    }
   }
 }
