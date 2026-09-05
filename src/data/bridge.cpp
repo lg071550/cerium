@@ -27,7 +27,7 @@ EM_JS(void, bridge_init_js, (int capacity), {
     // stale buffer and cerium_on_orderflow would see zeros — CLUSTER then
     // keeps the kline gutter with no tick cells. Rebuild the view from the
     // live wasm buffer after every malloc.
-        var copyF64 = function (src) {
+    var copyF64 = function (src) {
       var n = src.length;
       var ptr = _malloc(Math.max(n, 1) * 8);
       if (!ptr) {
@@ -35,7 +35,10 @@ EM_JS(void, bridge_init_js, (int capacity), {
         return 0;
       }
       if (!n) return ptr;
-      var mem = (Module.wasmMemory || wasmMemory);
+      // `Module.wasmMemory` is an aborting stub unless explicitly exported.
+      // EM_JS runs inside Emscripten's generated module and can use the live
+      // internal object directly, including after ALLOW_MEMORY_GROWTH.
+      var mem = wasmMemory;
       HEAPF64 = new Float64Array(mem.buffer);
       Module.HEAPF64 = HEAPF64;
       var idx = ptr >> 3;
@@ -91,7 +94,11 @@ EM_JS(void, bridge_init_js, (int capacity), {
       }
       if (d.kind === "market") {
         try {
-          var oi = d.oi, funding = d.funding, liq = d.liq;
+          var oi = d.oi, funding = d.funding;
+          // liq is omitted by the worker when no print arrived since the last
+          // full sync (the heartbeat carries oi/funding only) — loadLiq's
+          // n==0 path keeps the retained series instead of re-sorting it.
+          var liq = d.liq || new Float64Array(0);
           var oiPtr = copyF64(oi);
           var fPtr = copyF64(funding);
           var lPtr = copyF64(liq);
@@ -106,6 +113,26 @@ EM_JS(void, bridge_init_js, (int capacity), {
           _free(oiPtr); _free(fPtr); _free(lPtr);
         } catch (err) {
           console.error("feeds: market apply failed", err);
+        }
+        return;
+      }
+      if (d.kind === "htMap") {
+        try {
+          var liq = d.liq || new Float64Array(0);
+          var sl = d.sl || new Float64Array(0);
+          var liqPtr = copyF64(liq);
+          var slPtr = copyF64(sl);
+          if (!liqPtr || !slPtr) {
+            if (liqPtr) _free(liqPtr);
+            if (slPtr) _free(slPtr);
+            return;
+          }
+          _cerium_on_ht(liqPtr, liq.length / 4, slPtr, sl.length / 4,
+                        d.sym | 0, d.status | 0, d.used | 0, d.quota | 0,
+                        d.liqAt || 0, d.slAt || 0, d.liqRef || 0, d.slRef || 0);
+          _free(liqPtr); _free(slPtr);
+        } catch (err) {
+          console.error("feeds: ht map apply failed", err);
         }
         return;
       }
@@ -124,6 +151,10 @@ EM_JS(void, bridge_init_js, (int capacity), {
       }
     };
     Module._ceriumWorker = worker;
+    if (Module._ceriumHtPending) {
+      worker.postMessage(Module._ceriumHtPending);
+      Module._ceriumHtPending = null;
+    }
   } catch (e) {
     console.error("feeds: bridge init failed", e);
   }
@@ -134,7 +165,7 @@ EM_JS(int, bridge_drain_js, (void* dest, int maxEvents), {
   if (!R) return 0;
   // The heap views can go stale after a growth malloc (see copyF64 above);
   // the ring SAB never grows, so only the wasm-side view needs revalidating.
-  var mem = (Module.wasmMemory || wasmMemory);
+  var mem = wasmMemory;
   if (HEAPU8.buffer !== mem.buffer) {
     HEAPU8 = new Uint8Array(mem.buffer);
     Module.HEAPU8 = HEAPU8;
@@ -143,14 +174,17 @@ EM_JS(int, bridge_drain_js, (void* dest, int maxEvents), {
   var w = Atomics.load(u32, 1);
   var r = Atomics.load(u32, 2);
   var avail = (w - r) >>> 0;
-  var n = Math.min(avail, maxEvents);
+  var n = Math.max(0, Math.min(avail, maxEvents));
   if (n === 0) return 0;
   var cap = u32[3];
-  var out = dest;
-  for (var i = 0; i < n; i++) {
-    var slot = 64 + ((r + i) % cap) * 32;
-    HEAPU8.set(u8.subarray(slot, slot + 32), out + i * 32);
-  }
+  // The readable region is at most two contiguous spans. Publish readIdx
+  // only after both copies so the producer cannot overwrite either span.
+  var slot = r % cap;
+  var first = Math.min(n, cap - slot);
+  var start = 64 + slot * 32;
+  HEAPU8.set(u8.subarray(start, start + first * 32), dest);
+  if (first < n)
+    HEAPU8.set(u8.subarray(64, 64 + (n - first) * 32), dest + first * 32);
   Atomics.store(u32, 2, (r + n) >>> 0);
   return n;
 });
@@ -176,6 +210,22 @@ EM_JS(void, bridge_cmd_js, (unsigned type, unsigned venue, double arg), {
   worker.postMessage({ kind: "command", type: type, venue: venue, arg: arg });
 });
 
+EM_JS(void, bridge_ht_js, (const char* token, int symbol, int liq, int sl), {
+  var msg = {
+    kind: "ht",
+    token: UTF8ToString(token),
+    sym: symbol | 0,
+    liq: liq ? 1 : 0,
+    sl: sl ? 1 : 0
+  };
+  var worker = Module._ceriumWorker;
+  if (!worker) {
+    Module._ceriumHtPending = msg;
+    return;
+  }
+  worker.postMessage(msg);
+});
+
 namespace bridge {
 
 // The consumer drains until empty every rAF and overflow already triggers a
@@ -196,6 +246,10 @@ uint32_t takeLostVenues() { return bridge_take_lost_venues_js(); }
 
 void sendCommand(uint32_t type, uint32_t venue, double arg) {
   bridge_cmd_js(type, venue, arg);
+}
+
+void sendHt(const char* token, int symbol, bool liq, bool sl) {
+  bridge_ht_js(token ? token : "", symbol, liq ? 1 : 0, sl ? 1 : 0);
 }
 
 } // namespace bridge

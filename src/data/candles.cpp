@@ -2,7 +2,18 @@
 
 #include <cmath>
 
+namespace {
+bool holdForHistory(CandleSeries& s, double tsMs) {
+  if (!s.awaitingHistory) return false;
+  if (!(s.historyWaitT0 > 0)) s.historyWaitT0 = tsMs;
+  if (tsMs - s.historyWaitT0 < 30000.0) return true;
+  s.awaitingHistory = false; // REST never arrived; let live bars form
+  return false;
+}
+} // namespace
+
 void CandleSeries::load(const double* data, int n, Timeframe tf_, int symIdx) {
+  ++historyVersion;
   tf = tf_;
   sym = symIdx;
   // Treat the loaded tail tick bar as already closed so the first live trade
@@ -10,9 +21,17 @@ void CandleSeries::load(const double* data, int n, Timeframe tf_, int symIdx) {
   // (partial) bar open and continue it with aggregated live volume in onAgg.
   barCount = tf.kind == Timeframe::Tick ? (int)tf.value : 0;
   v.clear();
-  v.reserve((size_t)n);
-  for (int i = 0; i < n; ++i) {
+  n = data && n > 0 ? n : 0;
+  const int first = n > (int)MAX_CANDLES ? n - (int)MAX_CANDLES : 0;
+  v.reserve((size_t)(n - first));
+  for (int i = first; i < n; ++i) {
     const double* k = data + (size_t)i * 7;
+    bool finite = true;
+    for (int j = 0; j < 7; ++j) finite = finite && std::isfinite(k[j]);
+    if (!finite || !(k[0] > 0) || !(k[3] > 0) || k[2] < k[3] ||
+        k[1] < k[3] || k[1] > k[2] || k[4] < k[3] || k[4] > k[2] ||
+        k[5] < 0 || k[6] < 0 || k[6] > k[5]) continue;
+    if (!v.empty() && k[0] < v.back().ts) continue;
     double vol = k[5];
     double takerBuy = k[6];
     // Historical seed is Binance-only: aggregated volume/delta start from the
@@ -20,10 +39,15 @@ void CandleSeries::load(const double* data, int n, Timeframe tf_, int symIdx) {
     v.push_back({k[0], k[1], k[2], k[3], k[4], vol, 2.0 * takerBuy - vol, vol});
   }
   if (v.size() > MAX_CANDLES) v.erase(v.begin(), v.end() - (ptrdiff_t)MAX_CANDLES);
+  awaitingHistory = false;
+  historyLoaded = true;
+  historyWaitT0 = 0;
 }
 
 void CandleSeries::onTrade(double price, double qty, int side, double tsMs) {
-  if (!(price > 0) || !(qty > 0) || !(tsMs > 0)) return;
+  if (!(price > 0) || !(qty > 0) || !(tsMs > 0) ||
+      !std::isfinite(price) || !std::isfinite(qty) || !std::isfinite(tsMs)) return;
+  if (holdForHistory(*this, tsMs)) return;
   if (tf.kind == Timeframe::Volume) return; // volume bars are aggregated in onAgg
   double bucket = tsMs; // tick bars timestamp by their first trade
   if (tf.kind == Timeframe::Time)
@@ -57,7 +81,9 @@ void CandleSeries::onTrade(double price, double qty, int side, double tsMs) {
 // this owns the boundary too — the bar closes when aggregated volume reaches
 // the target, and its OHLC reflects every mask venue's prints.
 void CandleSeries::onAgg(double price, double qty, int side, double tsMs) {
-  if (!(price > 0) || !(qty > 0) || !(tsMs > 0)) return;
+  if (!(price > 0) || !(qty > 0) || !(tsMs > 0) ||
+      !std::isfinite(price) || !std::isfinite(qty) || !std::isfinite(tsMs)) return;
+  if (holdForHistory(*this, tsMs)) return;
 
   if (tf.kind == Timeframe::Volume) {
     if (v.empty() || v.back().aggVol >= tf.value)

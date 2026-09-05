@@ -3,6 +3,8 @@
 #include "../symbols.h"
 
 #include "../flow_sources.h"
+#include "../price_format.h"
+#include "../../data/dom_ladder.h"
 #include "../../data/merge.h"
 #include "../../platform/shell.h"
 
@@ -13,7 +15,7 @@
 
 namespace {
 constexpr double kBins[] = {0, 0.5, 1, 2.5, 5, 10};
-constexpr const char* kBinLabels[] = {"raw", "0.5", "1", "2.5", "5", "10"};
+constexpr const char* kBinLabels[] = {"AUTO", "0.5", "1", "2.5", "5", "10"};
 constexpr float kLevelLimits[] = {0, 20, 40, 60, 100};
 constexpr float kDepthWidths[] = {0.42f, 0.58f, 0.74f};
 constexpr float kBarWidths[] = {0.24f, 0.34f, 0.46f};
@@ -45,6 +47,7 @@ void resetOrderbookSettings(OrderbookPanel& st) {
   st.scaleMode = 0;
   st.intensity = 1;
   st.priceDecimals = 2;
+  st.priceAuto = true;
   st.amountPrecision = 2;
   st.depthWidth = 1;
   st.barWidth = 1;
@@ -73,13 +76,13 @@ void saveOrderbookSettings(OrderbookPanel& st) {
 
   char saved[320];
   snprintf(saved, sizeof(saved),
-           "3,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d",
+           "4,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d",
            st.showUsd, st.showCumulative, st.showDepth, st.showBars,
            st.showGradient, st.showTexture, st.showEdges, st.showFeedCount,
            st.showAnalytics, st.showDepthBands, st.showWeightedMid, st.density,
            st.levelLimit, st.scaleMode, st.intensity,
            st.priceDecimals, st.amountPrecision, st.depthWidth, st.barWidth,
-           st.sideMode, (unsigned)st.mask, st.binSel);
+           st.sideMode, (unsigned)st.mask, st.binSel, st.priceAuto ? 1 : 0);
   shell_storage_set(st.settingsKey.c_str(), saved);
   invalidateOrderbookLabels(st);
 }
@@ -95,16 +98,16 @@ void loadOrderbookSettings(OrderbookPanel& st) {
   int showAnalytics = 1, showDepthBands = 1, showWeightedMid = 1;
   int density = 0, levelLimit = 0, scaleMode = 0, intensity = 0;
   int priceDecimals = 0, amountPrecision = 0, depthWidth = 0, barWidth = 0;
-  int sideMode = 0, binSel = 0;
+  int sideMode = 0, binSel = 0, priceAuto = 1;
   unsigned mask = 0;
   int count = sscanf(
       saved,
-      "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d",
+      "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d,%d",
       &version, &showUsd, &showCum, &showDepth, &showBars, &showGradient,
       &showTexture, &showEdges, &showFeedCount, &showAnalytics, &showDepthBands,
       &showWeightedMid, &density, &levelLimit, &scaleMode, &intensity,
       &priceDecimals, &amountPrecision, &depthWidth, &barWidth, &sideMode, &mask,
-      &binSel);
+      &binSel, &priceAuto);
   if (version == 1) {
     showAnalytics = showDepthBands = showWeightedMid = 1;
     count = sscanf(saved,
@@ -114,10 +117,20 @@ void loadOrderbookSettings(OrderbookPanel& st) {
                    &density, &levelLimit, &scaleMode, &intensity,
                    &priceDecimals, &amountPrecision, &depthWidth, &barWidth,
                    &sideMode, &mask, &binSel);
+  } else if (version < 4) {
+    count = sscanf(
+        saved,
+        "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d",
+        &version, &showUsd, &showCum, &showDepth, &showBars, &showGradient,
+        &showTexture, &showEdges, &showFeedCount, &showAnalytics, &showDepthBands,
+        &showWeightedMid, &density, &levelLimit, &scaleMode, &intensity,
+        &priceDecimals, &amountPrecision, &depthWidth, &barWidth, &sideMode,
+        &mask, &binSel);
+    priceAuto = priceDecimals == 2 ? 1 : 0;
   }
   std::free(saved);
-  if (!((count == 23 && version == 3) || (count == 23 && version == 2) ||
-        (count == 20 && version == 1)))
+  if (!((count == 24 && version == 4) || (count == 23 && version == 3) ||
+        (count == 23 && version == 2) || (count == 20 && version == 1)))
     return;
   const bool legacyMask = version <= 2;
 
@@ -137,6 +150,7 @@ void loadOrderbookSettings(OrderbookPanel& st) {
   st.scaleMode = scaleMode;
   st.intensity = intensity;
   st.priceDecimals = priceDecimals;
+  st.priceAuto = priceAuto != 0;
   st.amountPrecision = amountPrecision;
   st.depthWidth = depthWidth;
   st.barWidth = barWidth;
@@ -232,10 +246,14 @@ void drawOrderbookSettings(Ui& u, Rect area, OrderbookPanel& st) {
                  break;
                }
                case 5: {
+                 option("AUTO", 54, st.priceAuto, [&] { st.priceAuto = true; });
                  static constexpr const char* labels[] = {"0", "1", "2", "3", "4"};
                  for (int i = 0; i < 5; ++i)
-                   option(labels[i], 42, st.priceDecimals == i,
-                          [&, i] { st.priceDecimals = i; });
+                   option(labels[i], 42, !st.priceAuto && st.priceDecimals == i,
+                          [&, i] {
+                            st.priceAuto = false;
+                            st.priceDecimals = i;
+                          });
                  break;
                }
                case 6: {
@@ -448,7 +466,7 @@ void drawOrderbookAnalytics(Ui& u, Rect area, OrderbookPanel& st,
                     summary.h * 0.5f},
                    line, t.textDim, DrawList::Left, 2);
     if (st.showWeightedMid) {
-      snprintf(line, sizeof(line), "WM %.*f", st.priceDecimals,
+      snprintf(line, sizeof(line), "WM %.*f", st.displayDecimals,
                st.analytics.weightedMid);
       u.draw.textFit({summary.x + half, summary.y + summary.h * 0.5f,
                       summary.w - half, summary.h * 0.5f},
@@ -525,7 +543,7 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
            kBinLabels[st.binSel]);
   const float binW = wideToolbar ? 64.0f : 54.0f;
   const bool showBin = cx + binW <= leftLimit;
-  if (showBin && chip(u, {cx, cy, binW, 18}, binLabel, st.bin > 0)) {
+  if (showBin && chip(u, {cx, cy, binW, 18}, binLabel, st.binSel != 0)) {
     st.binSel = (st.binSel + 1) % 6;
     st.bin = kBins[st.binSel];
     saveOrderbookSettings(st);
@@ -618,6 +636,24 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
       drawOrderbookAnalytics(u, analyticsArea, st, showFullDepthBands);
     u.draw.textAligned(area, "syncing…", t.textDim, DrawList::Center);
     return;
+  }
+
+  {
+    const uint64_t tickVer = feeds.booksVersion();
+    if (tickVer != st.tickBooks || st.mask != st.tickMask) {
+      st.tickBooks = tickVer;
+      st.tickMask = st.mask;
+      st.tickValue = DomModel::inferTick(feeds, -1, st.mask, 0);
+    }
+    double native = st.tickValue;
+    double step = st.binSel == 0 ? autoGroupStep(mid, native)
+                                 : kBins[std::clamp(st.binSel, 0, 5)];
+    if (!(step > 0)) step = autoGroupStep(mid, native);
+    int dec = 2;
+    resolvePriceDisplay(step, st.priceAuto, st.priceDecimals, dec);
+    if (dec != st.displayDecimals) invalidateOrderbookLabels(st);
+    st.displayDecimals = dec;
+    st.bin = step;
   }
 
     // The ladder rebuilds every frame the books move — no data throttling —
@@ -815,6 +851,11 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
   }
 
   float y = area.y + (capacityRows - rows) * rowH * 0.5f;
+  // Snap the row grid: a fractional panel origin leaves the quad SDF's 1px AA
+  // band as a dim fringe row at every ladder boundary — the horizontal-ray
+  // striping reported on the ladder. Integer rows make bars, cells and edges
+  // tile the pixel grid exactly.
+  y = std::floor(y);
   const float depthWidth = kDepthWidths[std::clamp(st.depthWidth, 0, 2)];
   const float barWidth = kBarWidths[std::clamp(st.barWidth, 0, 2)];
   const float visual = kPanelIntensity[std::clamp(st.intensity, 0, 2)];
@@ -823,7 +864,7 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
     // below bestBid and the "spread" is routinely negative — meaningless)
     OrderbookPanel::Level& L = st.ladder[(size_t)i];
     if (L.fmtP != L.price) { // label caches survive price-stable frames
-      snprintf(L.priceLbl, sizeof(L.priceLbl), "%.*f", st.priceDecimals, L.price);
+      snprintf(L.priceLbl, sizeof(L.priceLbl), "%.*f", st.displayDecimals, L.price);
       L.fmtP = L.price;
     }
     double amount = amountValue(L);
@@ -847,6 +888,10 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
         relC2 = shapeDepth((float)(cumulativeValue(next) / maxCum), st.scaleMode);
     }
     if (st.showDepth) {
+      // Interpolated cumulative depth, sliced into integer pixel bands. Each
+      // band's vertical extent snaps to the pixel grid so adjacent slices
+      // tile without the AA fringe that previously striped the silhouette
+      // every ~2px (visible through the translucent amount bars too).
       int depthSlices = std::max(1, (int)std::lround(rowH / 2.0f));
       for (int slice = 0; slice < depthSlices; ++slice) {
         float f0 = (float)slice / (float)depthSlices;
@@ -854,8 +899,11 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
         float depth = std::clamp(relC + (relC2 - relC) * ((f0 + f1) * 0.5f),
                                  0.0f, 1.0f);
         float cw = depth * (area.w * depthWidth);
-        Rect depthSlice{area.x + area.w - cw, y + rowH * f0, cw,
-                        rowH * (f1 - f0)};
+        float sy0 = std::floor(y + rowH * f0);
+        float sy1 = std::floor(y + rowH * f1);
+        float sh = sy1 - sy0;
+        if (sh < 1.0f) continue;
+        Rect depthSlice{area.x + area.w - cw, sy0, cw, sh};
         if (st.showGradient)
           u.draw.rectGradientHDithered(
               depthSlice, withAlpha(c, 0.004f * visual),

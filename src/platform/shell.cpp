@@ -59,6 +59,11 @@ EM_JS(void, boot_error_js, (const char* msg), {
   }
 });
 
+EM_JS(void, boot_ready_js, (), {
+  var el = document.getElementById('loading');
+  if (el) el.style.display = 'none';
+});
+
 char* shell_storage_get(const char* key) { return storage_get_js(key); }
 
 void shell_storage_set(const char* key, const char* value) { storage_set_js(key, value); }
@@ -73,6 +78,7 @@ void shell_set_cursor(const char* cursor) {
   set_cursor_js(cursor);
 }
 
+void shell_boot_ready() { boot_ready_js(); }
 void shell_boot_error(const char* msg) { boot_error_js(msg); }
 
 // ---------------------------------------------------------------------------

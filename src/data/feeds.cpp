@@ -40,6 +40,14 @@ extern "C" void cerium_on_liq(double* liq, int n, double start, int sym) {
   g_feedsInstance->market.appendLiq(liq, n, (int64_t)start, sym);
 }
 
+extern "C" void cerium_on_ht(double* liq, int liqN, double* sl, int slN, int sym,
+                             int status, int used, int quota, double liqAt, double slAt,
+                             double liqRef, double slRef) {
+  if (!g_feedsInstance || sym != g_feedsInstance->symbol) return;
+  g_feedsInstance->ht.load(liq, liqN, sl, slN, sym, status, used, quota, liqAt, slAt,
+                           (float)liqRef, (float)slRef);
+}
+
 // Probe diagnostics: per-venue book shape at the moment of the call.
 // [enabled, status, bidLevels, askLevels, minBid, maxBid, minAsk, maxAsk, mid]
 // Probe diagnostics: live liquidation series state.
@@ -174,8 +182,14 @@ void Feeds::setSymbol(int sym) {
   }
   tape.clear();
   candles.v.clear();
+  candles.barCount = 0;
+  candles.awaitingHistory = true;
+  candles.historyLoaded = false;
+  candles.historyWaitT0 = 0;
   orderFlow.clear();
   market.clear();
+  ht.clear();
+  m_htSym = -1;
   bridge::sendCommand(wire::CmdSetSymbol, 0, (double)sym);
 }
 
@@ -195,10 +209,16 @@ void Feeds::setVenueEnabled(int i, bool on) {
 void Feeds::setTimeframe(Timeframe tf) {
   if (tf.kind == Timeframe::Time) tf.value = std::round(tf.value);
   if (!(tf.value > 0) || tf.value > 1e6) return;
-  if (tf == candles.tf) return;
+  const bool same = tf == candles.tf;
+  // Same TF with a completed bootstrap is a no-op. Same TF while history is
+  // missing (failed/in-flight klines, live-only tape) re-issues the fetch.
+  if (same && candles.historyLoaded) return;
   candles.tf = tf;
   candles.v.clear();
   candles.barCount = 0;
+  candles.awaitingHistory = true;
+  candles.historyLoaded = false;
+  candles.historyWaitT0 = 0;
   // orderFlow stays: raw aggressor prints are timeframe-independent, so
   // wiping them here blanked footprints/CVD on every TF switch until a full
   // REST re-walk finished. The worker's bootstrap replace stitches the
@@ -223,6 +243,16 @@ void Feeds::setFlowMask(uint32_t mask) {
   // Live prints follow the new mask from this point. Do not drop the Binance
   // bootstrap window — the next symbol/timeframe load replaces it, and a clear
   // here left footprint charts with only a few minutes of live tape.
+}
+
+void Feeds::setHt(const char* token, bool liq, bool sl) {
+  const char* t = token ? token : "";
+  if (m_htToken == t && m_htLiq == liq && m_htSl == sl && m_htSym == symbol) return;
+  m_htToken = t;
+  m_htLiq = liq;
+  m_htSl = sl;
+  m_htSym = symbol;
+  bridge::sendHt(m_htToken.c_str(), symbol, liq, sl);
 }
 
 int Feeds::liveCount() const {

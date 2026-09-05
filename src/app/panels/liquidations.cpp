@@ -3,6 +3,7 @@
 
 #include "../../platform/shell.h"
 #include "../../ui/theme.h"
+#include "../price_format.h"
 
 #include <algorithm>
 #include <cctype>
@@ -389,7 +390,8 @@ void drawLiquidations(Ui& u, Rect r, LiquidationsPanel& st, Feeds& feeds) {
                       withAlpha(side, (0.16f + 0.76f * shaped) * visual));
 
              char price[32], amount[32];
-             snprintf(price, sizeof(price), "%.2f", e.price);
+             snprintf(price, sizeof(price), "%.*f", priceDecimalsForPrice(e.price),
+                      e.price);
              if (st.showUsd) formatUsd(usd, amount, sizeof(amount));
              else formatCoin(e.qty, st.amountPrecision, amount, sizeof(amount));
              const char* type = e.side == 0 ? "SHORT LIQ" : "LONG LIQ";

@@ -285,6 +285,16 @@ void Terminal::frame(const Input& input, float frameDt, float uiDt,
   } else if (std::any_of(m_charts.begin(), m_charts.end(),
                          [](const auto& chart) { return chart->panning(); })) {
     cursor = "grabbing";
+  } else if (std::any_of(m_charts.begin(), m_charts.end(),
+                         [](const auto& chart) { return chart->drawing(); })) {
+    cursor = "crosshair";
+    for (const auto& chart : m_charts) {
+      if (!chart->drawing()) continue;
+      if (const char* dc = chart->drawingCursor()) {
+        cursor = dc;
+        break;
+      }
+    }
   } else if (m_splitDrag) {
     cursor = m_splitDrag->dir == DockDir::Horizontal ? "col-resize" : "row-resize";
   } else {
@@ -316,6 +326,7 @@ void Terminal::frame(const Input& input, float frameDt, float uiDt,
     chart->drawIndicatorSettings(ui);
     chart->drawTfPicker(ui, feeds);
     chart->drawFlowPicker(ui, feeds);
+    chart->drawToolPicker(ui);
   }
   for (auto& dom : m_doms) dom->drawVenuePicker(ui, feeds);
   for (auto& ob : m_orderbooks) ob->drawFlowPicker(ui, feeds);

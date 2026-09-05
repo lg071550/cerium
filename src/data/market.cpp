@@ -33,15 +33,22 @@ void MarketSeries::loadFunding(const double* data, int n, int symIdx) {
 }
 
 void MarketSeries::loadLiq(const double* data, int n, int symIdx, int64_t base) {
-  sym = symIdx;
-  n = std::max(0, n);
-  liq.clear();
-  if (!data || n <= 0) {
-    liqTop = base + n;
-    ++version;
-    ++liqVersion;
+  if (n <= 0) {
+    // The periodic market heartbeat re-posts oi/funding live points but omits
+    // the liq payload when no print arrived since the last full sync. Keep the
+    // retained series and leave liqVersion alone: a spurious bump at publish
+    // rate re-sorted nothing but still invalidated every liq-gated consumer
+    // (liquidations filter cache, chart compute signature) several times per
+    // second. A base change (symbol switch resets it) still resets liqTop —
+    // setSymbol already cleared the series.
+    if (liqTop != base) {
+      liq.clear();
+      liqTop = base;
+      ++liqVersion;
+    }
     return;
   }
+  sym = symIdx;
   int first = std::max(0, n - (int)MAX_SAMPLES);
   liq.reserve((size_t)(n - first));
   for (int i = first; i < n; ++i) {

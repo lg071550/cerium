@@ -11,14 +11,22 @@
 // Pine-accurate EMA: SMA seed of the first `length` valid samples, then
 // k = 2/(length+1). Default channel/average/MA is 10/21/4; 9/12/3 is the
 // later VuManChu retune, exposed as a settings preset.
+//
+// Marker language mirrors the original: a small dot rides every WaveTrend
+// crossover, green "+" / red "x" crosses mark the ±53 extreme signals at the
+// wave cross itself, diamonds flag money-flow divergence (accumulation into
+// an oversold cross / distribution into an overbought cross), ringed diamonds
+// mark regular price/WT divergences, and the gold/blood RSI confluences
+// recolor the cross. Money flow hue is semantic (mint/red) and not paintable.
 
 enum {
   CipherLayerMfi = 1,
   CipherLayerHist = 2,
   CipherLayerDots = 4,
   CipherLayerAll = CipherLayerMfi | CipherLayerHist | CipherLayerDots,
-  // opt bit above the layer mask: regular-divergence diamonds on/off.
-  CipherOptDiv = 256
+  // opt bits above the layer mask.
+  CipherOptDiv = 256,   // regular-divergence diamonds
+  CipherOptXover = 512  // small dots on mid-range wave crossovers
 };
 
 enum {
@@ -354,11 +362,61 @@ inline void cipherCross(DrawList& d, float x, float y, float s, Color c,
   d.line(x - s, y + s, x + s, y - s, c, t);
 }
 
+inline void cipherPlus(DrawList& d, float x, float y, float s, Color c,
+                       float t) {
+  if (s <= 0.5f) return;
+  d.line(x - s, y, x + s, y, c, t);
+  d.line(x, y - s, x, y + s, c, t);
+}
+
+// Stroke along a series, split at the zero crossing so each side carries its
+// own hue — used as the crisp boundary of the money-flow area fill.
+inline void cipherEdgeLine(DrawList& d, const ChartPane& pane,
+                           const std::vector<float>& s, int vis0, int vis1,
+                           float startF, float bw, Color up, Color down,
+                           float w) {
+  static thread_local std::vector<float> xy;
+  xy.clear();
+  int cur = 0;
+  auto flush = [&]() {
+    if (xy.size() >= 4)
+      d.polyline(xy.data(), (int)(xy.size() / 2), cur >= 0 ? up : down, w);
+    xy.clear();
+  };
+  for (int i = vis0; i <= vis1 && i < (int)s.size(); ++i) {
+    float v = s[(size_t)i];
+    if (std::isnan(v)) {
+      flush();
+      cur = 0;
+      continue;
+    }
+    int sign = v >= 0.0f ? 1 : -1;
+    if (cur && sign != cur) {
+      float p = s[(size_t)i - 1];
+      float cx = NAN;
+      if (!std::isnan(p)) {
+        float t = std::fabs(v - p) < 1e-12f ? 0.5f : (0.0f - p) / (v - p);
+        t = std::clamp(t, 0.0f, 1.0f);
+        cx = d7BarX(pane, (float)(i - 1) + t, startF, bw);
+      }
+      flush();
+      if (!std::isnan(cx)) {
+        xy.push_back(cx);
+        xy.push_back(pane.yOf(0.0f));
+      }
+    }
+    cur = sign;
+    xy.push_back(d7BarX(pane, (float)i, startF, bw));
+    xy.push_back(pane.yOf(v));
+  }
+  flush();
+}
+
 inline void cipherDraw(DrawList& d, const ChartPane& pane,
                        const std::vector<float>& wt1, const std::vector<float>& wt2,
                        const std::vector<float>& mfi, const std::vector<int8_t>& marks,
                        int vis0, int vis1, float startF, float bw, Color wt1C,
-                       Color wt2C, Color mfiC, float thick, bool guides, int opt) {
+                       Color wt2C, float thick, bool guides, int opt) {
   const Theme& th = theme();
   int layers = cipherLayers(opt);
   bool divOn = (opt & CipherOptDiv) != 0;
@@ -395,23 +453,32 @@ inline void cipherDraw(DrawList& d, const ChartPane& pane,
   Color wave = withAlpha(wt1C, 0.16f);
   d7DrawBand(d, pane, wt1, zero, vis0, vis1, startF, bw, wave, wave);
   if (layers & CipherLayerMfi)
-    // Money flow: bull side takes the instance's palette color; bear side
-    // stays red so the area reads directionally at any hue.
+    // Money flow hue is semantic and deliberately not user-paintable: mint
+    // while positive, red while negative, so the area reads directionally.
     d7DrawBand(d, pane, mfi, zero, vis0, vis1, startF, bw,
-               withAlpha(mfiC, 0.40f), withAlpha(down, 0.42f));
+               withAlpha(up, 0.40f), withAlpha(down, 0.42f));
   d7DrawBand(d, pane, wt1, wt2, vis0, vis1, startF, bw, withAlpha(wt1C, 0.32f),
              withAlpha(wt2C, 0.28f));
 
   if (layers & CipherLayerHist) {
-    size_t n = std::min(wt1.size(), wt2.size());
-    vwap.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-      float a = wt1[i], b = wt2[i];
-      vwap[i] = (std::isnan(a) || std::isnan(b)) ? NAN : a - b;
+    // d7DrawBand only reads [vis0..vis1] (its crossover probe at i>vis0 reads
+    // i-1, still inside the window), so fill just the visible slice instead
+    // of re-differencing the full series every frame. Stale entries beyond
+    // the window are never read.
+    const size_t n = std::min(wt1.size(), wt2.size());
+    if (vwap.size() < n) vwap.resize(n);
+    for (int i = std::max(0, vis0); i <= vis1 && i < (int)n; ++i) {
+      float a = wt1[(size_t)i], b = wt2[(size_t)i];
+      vwap[(size_t)i] = (std::isnan(a) || std::isnan(b)) ? NAN : a - b;
     }
     Color hc = withAlpha(wt2C, 0.30f);
     d7DrawBand(d, pane, vwap, zero, vis0, vis1, startF, bw, hc, hc);
   }
+
+  if (layers & CipherLayerMfi)
+    // Crisp boundary on top of the fills, under the wave leads.
+    cipherEdgeLine(d, pane, mfi, vis0, vis1, startF, bw, withAlpha(up, 0.90f),
+                   withAlpha(down, 0.90f), 1.25f);
 
   d7DrawLead(d, pane, wt2, vis0, vis1, startF, bw, wt2C,
              std::max(1.0f, thick - 0.5f));
@@ -419,64 +486,90 @@ inline void cipherDraw(DrawList& d, const ChartPane& pane,
 
   if (!(layers & CipherLayerDots)) return;
   d.breakCmd();
-  float r = std::clamp(bw * 0.72f, 6.2f, 10.5f);
-  float wr = std::clamp(bw * 0.38f, 3.6f, 6.2f);
-  float xs = std::clamp(bw * 0.50f, 4.6f, 8.5f);
-  float yBuy = std::clamp(pane.yOf(-60), top + r + 4.0f, bot - r - 4.0f);
-  float ySell = std::clamp(pane.yOf(60), top + r + 4.0f, bot - r - 4.0f);
-  for (int i = vis0; i <= vis1 && i < (int)marks.size() && i < (int)wt1.size() &&
-                     i < (int)wt2.size();
+  // Marker geometry rides the waves, not fixed rails: crosses and diamonds
+  // sit at the WaveTrend cross point, sized from the bar width.
+  const float xs = std::clamp(bw * 0.95f, 4.6f, 7.6f);  // signal cross arm
+  const float dr = std::clamp(bw * 0.60f, 4.2f, 6.4f);  // diamond radius
+  const float xr = std::clamp(bw * 0.32f, 2.2f, 3.2f);  // crossover dot radius
+  const float ct = 1.6f;                                // cross stroke
+  const Color casing = withAlpha(th.chartPaneBg, 0.88f);
+  const float margin = std::max(xs, dr) + 2.0f;
+  const float yLo = std::min(top + margin, 0.5f * (top + bot));
+  const float yHi = std::max(bot - margin, 0.5f * (top + bot));
+  float prevD = NAN;
+  for (int i = vis0; i <= vis1 && i < (int)wt1.size() && i < (int)wt2.size();
        ++i) {
-    int8_t m = marks[(size_t)i];
-    if (!m) continue;
-    float a = wt1[(size_t)i], b = wt2[(size_t)i];
-    float x = d7BarX(pane, (float)i, startF, bw);
-    bool buy = (m & CipherMarkBuy) != 0;
-    bool sell = (m & CipherMarkSell) != 0;
-    bool gdot = (m & CipherMarkGold) != 0;
-    bool blood = (m & CipherMarkBlood) != 0;
+    const float a = wt1[(size_t)i], b = wt2[(size_t)i];
+    const float d1 = (std::isnan(a) || std::isnan(b)) ? NAN : a - b;
+    bool xup = false, xdn = false;
+    if (!std::isnan(d1) && !std::isnan(prevD)) {
+      xup = prevD <= 0.0f && d1 > 0.0f;
+      xdn = prevD >= 0.0f && d1 < 0.0f;
+    }
+    if (!std::isnan(d1)) prevD = d1;
 
-    // Signal markers only — mid-range wave crossovers stay unmarked (the old
-    // draw loop stamped a gold X on every single crossover).
-    if (buy || sell) {
-      float a2 = wt2[(size_t)i];
-      if (!std::isnan(a) && !std::isnan(a2)) {
-        float y = pane.yOf(0.5f * (a + a2));
-        d.circle(x, y, wr, withAlpha(sell ? down : up, 0.90f));
-        d.circleOutline(x, y, wr, withAlpha(th.text, 0.35f), 1.0f);
-      }
+    const int8_t m =
+        i < (int)marks.size() ? marks[(size_t)i] : (int8_t)0;
+    const bool buy = (m & CipherMarkBuy) != 0;
+    const bool sell = (m & CipherMarkSell) != 0;
+
+    // Mid-range wave crossovers: small direction dot at the intersection.
+    if ((xup || xdn) && !buy && !sell && (opt & CipherOptXover) &&
+        !std::isnan(d1)) {
+      float x = d7BarX(pane, (float)i, startF, bw);
+      float y = std::clamp(pane.yOf(0.5f * (a + b)), yLo, yHi);
+      d.circle(x, y, xr + 1.1f, casing);
+      d.circle(x, y, xr, withAlpha(xdn ? down : up, 0.95f));
     }
-    if (gdot) {
-      // Golden buy: gold-filled marker with a bright ring.
-      d.circle(x, yBuy, r, withAlpha(gold, 0.92f));
-      d.circleOutline(x, yBuy, r + 3.0f, withAlpha(th.text, 0.45f), 1.2f);
-    } else if (buy) {
-      d.circle(x, yBuy, r, withAlpha(up, 0.95f));
-      d.circleOutline(x, yBuy, r, withAlpha(th.text, 0.40f), 1.1f);
+    if (!buy && !sell) continue;
+
+    const float x = d7BarX(pane, (float)i, startF, bw);
+    if (std::isnan(a) || std::isnan(b)) continue;
+    const float yc = std::clamp(pane.yOf(0.5f * (a + b)), yLo, yHi);
+    const bool golden = (m & CipherMarkGold) != 0;
+    const bool blood = (m & CipherMarkBlood) != 0;
+
+    // Extreme WaveTrend signals: green "+" buys, red "x" sells, drawn at the
+    // cross itself with a dark casing so they read over the waves. The RSI
+    // confluences recolor them (gold buy / blood diamond sell).
+    if (buy) {
+      cipherPlus(d, x, yc, xs, casing, ct + 1.4f);
+      cipherPlus(d, x, yc, xs, withAlpha(golden ? gold : up, 1.0f), ct);
+    } else if (blood) {
+      cipherDiamond(d, x, yc, xs * 1.15f + 1.2f, casing);
+      cipherDiamond(d, x, yc, xs * 1.15f, withAlpha(down, 0.95f));
+      cipherCross(d, x, yc, xs * 0.55f, withAlpha(hexColor(0xffffff), 0.90f),
+                  1.4f);
+    } else {
+      cipherCross(d, x, yc, xs, casing, ct + 1.4f);
+      cipherCross(d, x, yc, xs, withAlpha(down, 1.0f), ct);
     }
-    if (sell) {
-      if (blood) {
-        // Blood sell: red diamond bearing a compact X.
-        cipherDiamond(d, x, ySell, r + 0.8f, withAlpha(down, 0.95f));
-        cipherCross(d, x, ySell, xs * 0.62f,
-                    withAlpha(hexColor(0xffffff), 0.85f), 1.4f);
-      } else {
-        d.circle(x, ySell, r, withAlpha(down, 0.95f));
-        d.circleOutline(x, ySell, r, withAlpha(th.text, 0.40f), 1.1f);
-      }
+
+    // Money-flow diamonds: the wave extreme disagrees with flow — mint
+    // diamond under a buy when money flow is already positive (accumulation),
+    // red diamond over a sell when it is already negative (distribution).
+    const float mf = i < (int)mfi.size() ? mfi[(size_t)i] : NAN;
+    if (!std::isnan(mf) && (buy ? mf > 0.0f : mf < 0.0f)) {
+      const float yd =
+          buy ? std::clamp(yc + dr + 5.5f, yLo, yHi)
+              : std::clamp(yc - dr - 5.5f, yLo, yHi);
+      cipherDiamond(d, x, yd, dr + 1.3f, casing);
+      cipherDiamond(d, x, yd, dr, withAlpha(buy ? up : down, 0.95f));
     }
 
     // Regular divergences ride the wave point itself (opt-gated).
     if (!divOn) continue;
-    bool divBull = (m & CipherMarkDivBull) != 0;
-    bool divBear = (m & CipherMarkDivBear) != 0;
+    const bool divBull = (m & CipherMarkDivBull) != 0;
+    const bool divBear = (m & CipherMarkDivBear) != 0;
     if ((divBull || divBear) && !std::isnan(b)) {
-      float yDiv = pane.yOf(b) + (divBear ? -(r + 6.0f) : (r + 6.0f));
-      cipherDiamond(d, x, yDiv, wr * 0.9f,
-                    withAlpha(divBear ? down : up, 0.95f));
-      cipherDiamond(d, x, yDiv, wr * 0.9f - 2.2f,
+      const float rr = std::max(3.0f, dr * 0.80f);
+      float yDiv =
+          std::clamp(pane.yOf(b) + (divBear ? -(dr + 4.0f) : (dr + 4.0f)),
+                     yLo, yHi);
+      cipherDiamond(d, x, yDiv, rr, withAlpha(divBear ? down : up, 0.95f));
+      cipherDiamond(d, x, yDiv, std::max(1.6f, rr - 2.0f),
                     withAlpha(th.panel, 0.85f));
-      cipherDiamond(d, x, yDiv, wr * 0.9f - 4.0f,
+      cipherDiamond(d, x, yDiv, std::max(0.8f, rr - 3.6f),
                     withAlpha(divBear ? down : up, 0.95f));
     }
   }

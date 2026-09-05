@@ -46,6 +46,11 @@ struct OrderbookPanel {
   int mergeCap = 0; // viewable-depth merge cap; changes rebuild now
   uint32_t mergeMask = 0;
   double mergeBin = -1;
+  // AUTO grouping's tick inference builds a gap histogram over every masked
+  // venue's book — cached per books version / mask like the merge itself.
+  uint64_t tickBooks = ~0ull;
+  uint32_t tickMask = 0;
+  double tickValue = 0;
   struct Level {
     double price, size, cum, cumUsd;
     bool ask;
@@ -98,7 +103,9 @@ struct OrderbookPanel {
   int levelLimit = 0;    // auto / 20 / 40 / 60 / 100
   int scaleMode = 0;     // linear / square-root / logarithmic
   int intensity = 1;     // quiet / normal / strong
-  int priceDecimals = 2;
+  int priceDecimals = 2;   // 0–4 when priceAuto is false
+  bool priceAuto = true;   // decimals follow the grouping step
+  int displayDecimals = 2; // resolved for the current ladder
   int amountPrecision = 2; // option index: 0 / 2 / 3 / 5 decimals
   int depthWidth = 1;      // 42 / 58 / 74 percent
   int barWidth = 1;        // 24 / 34 / 46 percent
@@ -128,6 +135,7 @@ struct TapePanel {
   int density = 1;       // tight / normal / relaxed
   int intensity = 1;     // quiet / normal / strong
   int priceDecimals = 2;
+  bool priceAuto = true;
   int amountPrecision = 2; // option index: 0 / 2 / 3 / 5 decimals
   double minUsd = 0.0;
   double maxUsd = 0.0; // zero = no upper bound
@@ -203,7 +211,8 @@ struct DomPanel {
   int scaleMode = 0;     // linear / sqrt / log
   int intensity = 1;     // quiet / normal / strong
   int amountPrecision = 2; // 0 / 2 / 3 / 5 decimals
-  int pricePrecision = 2;  // auto / 1 / 2 / 3 / 4
+  int pricePrecision = 0;  // 0 = auto / 1 / 2 / 3 / 4
+  int displayDecimals = 2;
   double customStep = 1.0;
   TextFieldState customStepInput;
   std::string customStepError;

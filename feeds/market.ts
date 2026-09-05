@@ -422,6 +422,7 @@ const liqHistory: number[] = [];
 const liqSeen = new Set<string>();
 let liqCounter = 0; // total records ever received (monotonic, never reset by trim)
 let liqBase = 0;    // global index of the first retained liqHistory row
+let liqPostedCount = -1; // liqCounter at the last full-history post (-1 = force)
 const snaps: VenueMarket[] = Array.from({ length: SNAP_N }, () => ({
   oi: null, funding: null,
 }));
@@ -884,10 +885,17 @@ async function backfillOi(): Promise<void> {
 function post(): void {
   const oi = packSeries(oiHist, oiLive, true);
   const funding = packSeries(fundHist, fundLive);
-  const liq = new Float64Array(liqHistory);
+  // Full liq history only when prints arrived since the last post: the oi/
+  // funding heartbeat fires every ~200ms and re-transfering (then re-sorting,
+  // on the C++ side) 8k unchanged prints — plus the liqVersion bump it costs,
+  // which invalidates every liq-gated consumer — is pure overhead. Live
+  // prints arrive incrementally via marketLiq posts either way.
+  const liq = liqPostedCount === liqCounter ? null : new Float64Array(liqHistory);
+  liqPostedCount = liqCounter;
   (self as unknown as Worker).postMessage(
     { kind: "market", sym: symIndex, oi, funding, liq, liqBase },
-    [oi.buffer, funding.buffer, liq.buffer],
+    liq ? [oi.buffer, funding.buffer, liq.buffer]
+        : [oi.buffer, funding.buffer],
   );
 }
 
@@ -976,6 +984,12 @@ function recordLiq(price: number, qty: number, ts: number, side: number): void {
 function forceSide(raw: unknown): number {
   const s = String(raw ?? "").toLowerCase();
   return s === "buy" ? 0 : 1;
+}
+
+// Position-side feeds (Bybit allLiquidation, Bitget UTA): Buy/buy = long liquidated.
+function posSide(raw: unknown): number {
+  const s = String(raw ?? "").toLowerCase();
+  return s === "buy" ? 1 : 0;
 }
 
 async function decodeWsData(data: unknown): Promise<string | null> {
@@ -1160,11 +1174,9 @@ function openBybitLiq(): void {
       for (const row of rows) {
         if (!row || typeof row !== "object") continue;
         const o = row as Record<string, unknown>;
-        // allLiquidation.S is the liquidated position side: Buy = long.
-        const pos = String(o.S ?? o.side ?? "");
-        const side = pos.toLowerCase() === "buy" ? 1 : 0;
+        // allLiquidation.S is the liquidated position side: Buy = long liquidated.
         recordLiq(num(o.p ?? o.price), num(o.v ?? o.size),
-                  num(o.T ?? o.updatedTime), side);
+                  num(o.T ?? o.updatedTime), posSide(o.S ?? o.side));
       }
     },
   });
@@ -1201,7 +1213,7 @@ function openOkxLiq(): void {
         ],
       }));
     },
-    onMessage(raw) {
+    onMessage(raw, ws) {
       // OKX/Bitget close the socket ~30s in unless the server PING gets a
       // PONG — observed live as close 4004 churn without this reply.
       if (raw === "ping" || raw === "PING") {
@@ -1284,15 +1296,10 @@ function openBitgetLiq(): void {
     onOpen(ws) {
       ws.send(JSON.stringify({
         op: "subscribe",
-        args: [
-          { instType: "USDT-FUTURES", channel: "liquidation", instId: s },
-          { instType: "USDT-FUTURES", channel: "ticker", instId: s },
-        ],
+        args: [{ instType: "USDT-FUTURES", channel: "ticker", instId: s }],
       }));
     },
-    onMessage(raw) {
-      // OKX/Bitget close the socket ~30s in unless the server PING gets a
-      // PONG — observed live as close 4004 churn without this reply.
+    onMessage(raw, ws) {
       if (raw === "ping" || raw === "PING") {
         ws.send("pong");
         return;
@@ -1302,29 +1309,49 @@ function openBitgetLiq(): void {
       if (!msg) return;
       const arg = msg.arg && typeof msg.arg === "object"
         ? (msg.arg as Record<string, unknown>) : null;
-      if (arg && arg.channel === "ticker") {
-        const rows = Array.isArray(msg.data) ? msg.data : [];
-        for (const row of rows) {
-          if (!row || typeof row !== "object") continue;
-          const o = row as Record<string, unknown>;
-          if (typeof o.symbol === "string" && o.symbol !== s) continue;
-          const oi = num(o.holdingAmount ?? o.openInterest);
-          const funding = num(o.fundingRate ?? o.capitalRate);
-          setSnap(Snap.Bitget,
-            Number.isFinite(oi) && oi >= 0 ? oi : null,
-            Number.isFinite(funding) ? funding : null);
-        }
-        return;
-      }
-      if (arg && arg.channel !== "liquidation") return;
+      if (!arg || arg.channel !== "ticker") return;
       const rows = Array.isArray(msg.data) ? msg.data : [];
       for (const row of rows) {
         if (!row || typeof row !== "object") continue;
         const o = row as Record<string, unknown>;
         if (typeof o.symbol === "string" && o.symbol !== s) continue;
-        // Bitget side is the forced order side: buy = covering a short = short liq.
-        recordLiq(num(o.price), num(o.amount), num(o.ts),
-                  String(o.side ?? "").toLowerCase() === "buy" ? 0 : 1);
+        const oi = num(o.holdingAmount ?? o.openInterest);
+        const funding = num(o.fundingRate ?? o.capitalRate);
+        setSnap(Snap.Bitget,
+          Number.isFinite(oi) && oi >= 0 ? oi : null,
+          Number.isFinite(funding) ? funding : null);
+      }
+    },
+  });
+  // Classic v2 has no liquidation channel (UTA upgrade). v3 `side` is
+  // position side: buy = long liquidated, sell = short liquidated.
+  openPersistent("wss://ws.bitget.com/v3/ws/public", {
+    pingMs: BYBIT_PING_MS,
+    ping: (ws) => { ws.send("ping"); },
+    onOpen(ws) {
+      ws.send(JSON.stringify({
+        op: "subscribe",
+        args: [{ instType: "usdt-futures", topic: "liquidation" }],
+      }));
+    },
+    onMessage(raw, ws) {
+      if (raw === "ping" || raw === "PING") {
+        ws.send("pong");
+        return;
+      }
+      if (raw === "pong" || raw === "PONG") return;
+      const msg = parseObj(raw);
+      if (!msg) return;
+      const arg = msg.arg && typeof msg.arg === "object"
+        ? (msg.arg as Record<string, unknown>) : null;
+      const topic = arg ? String(arg.topic ?? arg.channel ?? "") : "";
+      if (topic !== "liquidation") return;
+      const rows = Array.isArray(msg.data) ? msg.data : [];
+      for (const row of rows) {
+        if (!row || typeof row !== "object") continue;
+        const o = row as Record<string, unknown>;
+        if (typeof o.symbol === "string" && o.symbol !== s) continue;
+        recordLiq(num(o.price), num(o.amount), num(o.ts), posSide(o.side));
       }
     },
   });
@@ -1379,7 +1406,12 @@ function openDeribitLiq(): void {
         const amt = num(o.amount);
         // Inverse perp amount is USD; convert to base like the Deribit tape.
         if (!(px > 0) || !(amt > 0)) continue;
-        recordLiq(px, amt / px, num(o.timestamp), forceSide(o.direction));
+        // `direction` is the taker's side. "T" = taker was liquidated;
+        // "M" = maker was, so the liquidated side is the opposite.
+        const flag = String(o.liquidation);
+        let side = forceSide(o.direction);
+        if (flag === "M") side = side === 0 ? 1 : 0;
+        recordLiq(px, amt / px, num(o.timestamp), side);
       }
     },
   });
@@ -1398,7 +1430,7 @@ function ingestHtxRow(row: unknown, code: string, ctVal: number, live: boolean):
     : token > 0 && !(Math.abs(token - contracts) < 1e-9) ? token
     : contracts * ctVal;
   const ts = num(o.liquidation_time ?? o.created_at ?? o.ts ?? o.t);
-  const pos = String(o.position_side ?? o.offset ?? "").toLowerCase();
+  const pos = String(o.position_side ?? "").toLowerCase();
   const side = pos === "long" ? 1 : pos === "short" ? 0 : forceSide(o.side ?? o.direction);
   if (live) {
     const before = liqCounter;
@@ -1502,8 +1534,7 @@ function ingestBitgetRows(list: unknown, symbol: string): number {
     if (!row || typeof row !== "object") continue;
     const o = row as Record<string, unknown>;
     if (typeof o.symbol === "string" && o.symbol !== symbol) continue;
-    if (ingestLiq(num(o.price), num(o.amount), num(o.ts),
-                  String(o.side ?? "").toLowerCase() === "buy" ? 0 : 1))
+    if (ingestLiq(num(o.price), num(o.amount), num(o.ts), posSide(o.side)))
       ++n;
   }
   return n;
@@ -1519,8 +1550,8 @@ function ingestGateRows(list: unknown): number {
     const sz = num(o.size);
     let ts = num(o.time_ms ?? o.time);
     if (ts > 0 && ts < 1e12) ts *= 1000;
-    // Signed size: negative fill = forced sell = long liquidated.
-    if (ingestLiq(px, Math.abs(sz) * GATE_CTVAL, ts, sz < 0 ? 1 : 0)) ++n;
+    // `size` is user position size: positive = long, negative = short.
+    if (ingestLiq(px, Math.abs(sz) * GATE_CTVAL, ts, sz < 0 ? 0 : 1)) ++n;
   }
   return n;
 }
@@ -1529,9 +1560,9 @@ async function backfillBitget(): Promise<number> {
   const s = USDT_PERP[SYMBOLS[symIndex]];
   if (!s) return 0;
   const raw = await fetchJson(
-    `https://api.bitget.com/api/v2/mix/market/liquidation-history?productType=USDT-FUTURES&symbol=${s}&pageSize=100`,
+    `https://api.bitget.com/api/v3/market/liquidations?category=USDT-FUTURES&symbol=${s}&limit=100`,
   );
-  // v2 API wraps results in data.list; older v3 paths may return data directly.
+  // v3 wraps results in data.list; keep the array fallback if the envelope shifts.
   const list = (raw as { data?: { list?: unknown[] } | unknown[] } | null)?.data;
   const rows = Array.isArray(list) ? list
     : list && typeof list === "object" ? (list as { list?: unknown[] }).list ?? [] : [];
@@ -1562,8 +1593,8 @@ function ingestBitfinexRow(row: unknown): boolean {
   const px = num(row[11] ?? row[6]);
   const ts = num(row[2]);
   if (!(px > 0) || !(Math.abs(amt) > 0)) return false;
-  // Negative amount is a forced sell (long liquidated).
-  return ingestLiq(px, Math.abs(amt), ts, amt < 0 ? 1 : 0);
+  // Amount is position size: positive = long, negative = short.
+  return ingestLiq(px, Math.abs(amt), ts, amt < 0 ? 0 : 1);
 }
 
 function recordBitfinexRow(row: unknown): void {
@@ -1572,7 +1603,7 @@ function recordBitfinexRow(row: unknown): void {
   if (!bitfinexWanted(String(row[4] ?? ""))) return;
   const amt = num(row[5]);
   const px = num(row[11] ?? row[6]);
-  recordLiq(px, Math.abs(amt), num(row[2]), amt < 0 ? 1 : 0);
+  recordLiq(px, Math.abs(amt), num(row[2]), amt < 0 ? 0 : 1);
 }
 
 function openBitfinexLiq(): void {
@@ -1698,6 +1729,8 @@ function hlCoin(): string {
 }
 
 function hlLiqSide(dir: unknown, side: unknown): number {
+  // `dir` is victim language even on backstop vault fills
+  // ("Liquidated Isolated Short" + side A = vault sold to take the short).
   const d = String(dir ?? "");
   if (/short/i.test(d)) return 0;
   if (/long/i.test(d)) return 1;
@@ -1935,6 +1968,7 @@ export function startMarketFeed(sym: number): void {
   liqSeen.clear();
   liqCounter = 0;
   liqBase = 0;
+  liqPostedCount = -1;
   clearSnaps();
   openLiq();
   const gen = liqGen;

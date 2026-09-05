@@ -7,6 +7,7 @@ import type { AdapterDeps, VenueAdapter } from "./venues/types";
 import { SYMBOLS, VENUES, type VenueDef } from "./registry";
 import { fetchCandles, fetchOrderFlow, TF_TIME } from "./candles";
 import { startMarketFeed } from "./market";
+import { configureHt } from "./hypertracker";
 
 let writer: WireWriter | null = null;
 let symbolIndex = 0;
@@ -15,6 +16,7 @@ let orderFlowRequested = false;
 let candleRequest = 0;
 let flowRequest = 0;
 let orderFlowRetries = 0;
+let candleRetries = 0;
 const adapters: (VenueAdapter | null)[] = new Array(VENUES.length).fill(null);
 const enabled = new Set<number>(VENUES.map((v) => v.index)); // all on by default
 
@@ -86,8 +88,17 @@ function refreshCandles(): void {
     request !== candleRequest || forSymbol !== symbolIndex ||
     tf.kind !== candleTf.kind || tf.value !== candleTf.value;
   fetchCandles(sym, tf.kind, tf.value, orderFlowRequested && tf.kind !== TF_TIME, postPartial, stale).then((history) => {
-    if (!history || request !== candleRequest || forSymbol !== symbolIndex ||
+    if (request !== candleRequest || forSymbol !== symbolIndex ||
         tf.kind !== candleTf.kind || tf.value !== candleTf.value) return;
+    if (!history) {
+      if (candleRetries >= 4) return;
+      const delay = 700 * (1 << candleRetries++);
+      setTimeout(() => {
+        if (request === candleRequest && forSymbol === symbolIndex) refreshCandles();
+      }, delay);
+      return;
+    }
+    candleRetries = 0;
     const { bars, flow } = history;
     if (tf.kind !== TF_TIME && orderFlowRequested && flow.length === 0 &&
         orderFlowRetries < 3) {
@@ -105,6 +116,9 @@ function refreshCandles(): void {
       },
       [bars.buffer, flow.buffer],
     );
+    // Klines first: kicking the aggTrade walk in parallel 429s the shared
+    // www.binance.com WAF and is the usual reason a TF switch paints live-only.
+    if (orderFlowRequested && tf.kind === TF_TIME) refreshOrderFlow();
   });
 }
 
@@ -180,11 +194,11 @@ function handleCommand(type: number, venue: number, arg: number): void {
     if (next === symbolIndex || next < 0 || next >= SYMBOLS.length) return;
     symbolIndex = next;
     orderFlowRetries = 0;
+    candleRetries = 0;
     ++flowRequest;
     for (const v of VENUES) stopVenue(v.index);
     for (const v of VENUES) if (enabled.has(v.index)) startVenue(v);
     refreshCandles();
-    if (orderFlowRequested && candleTf.kind === TF_TIME) refreshOrderFlow();
     startMarketFeed(symbolIndex);
     return;
   }
@@ -194,12 +208,11 @@ function handleCommand(type: number, venue: number, arg: number): void {
     const kind = venue;
     const value = kind === TF_TIME ? Math.round(arg) : arg;
     if (kind < 0 || kind > 2 || !(value > 0) || value > 1e6) return;
-    if (kind === candleTf.kind && value === candleTf.value) return;
     candleTf = { kind, value };
     orderFlowRetries = 0;
+    candleRetries = 0;
     ++flowRequest;
     refreshCandles();
-    if (orderFlowRequested && candleTf.kind === TF_TIME) refreshOrderFlow();
     return;
   }
 
@@ -227,5 +240,16 @@ self.onmessage = (e: MessageEvent) => {
     if (Number.isSafeInteger(type) && Number.isSafeInteger(venue) && Number.isFinite(arg)) {
       handleCommand(type, venue, arg);
     }
+    return;
+  }
+  if (data?.kind === "ht") {
+    const token = typeof data.token === "string" ? data.token : "";
+    const sym = Number(data.sym);
+    configureHt({
+      token,
+      sym: Number.isSafeInteger(sym) ? sym : symbolIndex,
+      liq: !!data.liq,
+      sl: !!data.sl,
+    });
   }
 };

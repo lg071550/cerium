@@ -2,6 +2,7 @@
 #include "panels_common.h"
 
 #include "../flow_sources.h"
+#include "../price_format.h"
 #include "../../platform/shell.h"
 #include "../../ui/theme.h"
 
@@ -50,9 +51,10 @@ float residualAge01(double bornAt, float now) {
 }
 
 Color tileColor(bool ask, double bornAt, float now) {
-  Color oldC = ask ? hexColor(0x7a2424) : hexColor(0x155652);
-  Color newC = ask ? hexColor(0xf4d6d4) : hexColor(0xd4eeea);
-  return mixRgb(newC, oldC, residualAge01(bornAt, now));
+  static const Color kBidOld = hexColor(0x155652), kBidNew = hexColor(0xd4eeea);
+  static const Color kAskOld = hexColor(0x7a2424), kAskNew = hexColor(0xf4d6d4);
+  return mixRgb(ask ? kAskNew : kBidNew, ask ? kAskOld : kBidOld,
+                residualAge01(bornAt, now));
 }
 
 struct QueueTile {
@@ -164,15 +166,6 @@ void drawOrderTiles(DrawList& d, Rect lane, bool ask,
 }
 
 // formatValue, formatLot — from panels_common.h via aliases above
-
-int automaticPriceDecimals(double step) {
-  if (!(step > 0)) return 2;
-  int d = 0;
-  while (d < 8 && std::fabs(step * std::pow(10.0, d) -
-                            std::round(step * std::pow(10.0, d))) > 1e-7)
-    ++d;
-  return d;
-}
 
 void normalizeSettings(DomPanel& st) {
   st.venue = std::max(-1, st.venue);
@@ -296,7 +289,7 @@ void resetSettings(DomPanel& st) {
   st.groupMode = 0;
   st.scaleMode = 0;
   st.intensity = 1;
-  st.amountPrecision = st.pricePrecision = 2;
+  st.amountPrecision = st.pricePrecision = 0;
   st.customStep = 1.0;
   st.customStepInput.text = "1";
   st.customStepError.clear();
@@ -482,7 +475,9 @@ void drawSettings(Ui& u, Rect area, DomPanel& st) {
                  for (int i = 0; i < 4; ++i)
                    option(amount[i], 42, st.amountPrecision == i,
                           [&, i] { st.amountPrecision = i; });
-                 for (int i = 0; i < 5; ++i) {
+                 option("AUTO", 54, st.pricePrecision == 0,
+                        [&] { st.pricePrecision = 0; });
+                 for (int i = 1; i < 5; ++i) {
                    char label[8]; snprintf(label, sizeof(label), "P%d", i);
                    option(label, 42, st.pricePrecision == i,
                           [&, i] { st.pricePrecision = i; });
@@ -615,11 +610,22 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
   }
   static constexpr double factors[] = {
       1, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000};
-  st.effectiveStep = st.groupMode == 11
-                         ? st.customStep
-                         : st.inferredStep * factors[std::clamp(st.groupMode, 0, 10)];
+  if (st.groupMode == 11) {
+    st.effectiveStep = st.customStep;
+  } else if (st.groupMode == 0) {
+    double mid = st.venue >= 0 && st.venue < (int)feeds.venues.size()
+                     ? feeds.venues[(size_t)st.venue].book.mid()
+                     : feeds.aggMid();
+    if (!(mid > 0)) mid = st.model.summary.mid;
+    st.effectiveStep = autoGroupStep(mid, st.inferredStep);
+  } else {
+    st.effectiveStep = st.inferredStep * factors[std::clamp(st.groupMode, 0, 10)];
+  }
   st.effectiveStep = DomModel::cleanStep(st.effectiveStep);
   if (!(st.effectiveStep > 0)) st.effectiveStep = 0.01;
+  resolvePriceDisplay(st.effectiveStep, st.pricePrecision == 0, st.pricePrecision,
+                      st.displayDecimals);
+  st.effectiveStep = DomModel::cleanStep(st.effectiveStep);
 
   char group[32];
   if (st.groupMode == 0) snprintf(group, sizeof(group), "AUTO %.6g", st.effectiveStep);
@@ -678,28 +684,34 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
     u.draw.rect(summary, t.panelAlt);
     char metrics[256];
     const DomSummary& s = st.model.summary;
+    const int pd = st.displayDecimals;
     if (s.bestBid <= 0 || s.bestAsk <= 0) {
       snprintf(metrics, sizeof(metrics), "%s  /  waiting for depth",
                st.venue < 0 ? "CONSOLIDATED" : venueLabel);
     } else if (s.crossed) {
       double bps = (s.bestBid - s.bestAsk) / std::max(s.mid, 1e-9) * 1e4;
-      snprintf(metrics, sizeof(metrics), "B %.2f  A %.2f  CROSS %.2f bps  IMB %+.0f%%  %d SRC",
-               s.bestBid, s.bestAsk, bps, s.imbalance * 100.0, s.sourceCount);
+      snprintf(metrics, sizeof(metrics),
+               "B %.*f  A %.*f  CROSS %.2f bps  IMB %+.0f%%  %d SRC",
+               pd, s.bestBid, pd, s.bestAsk, bps, s.imbalance * 100.0,
+               s.sourceCount);
     } else if (r.w >= 900) {
       double spreadBps = (s.bestAsk - s.bestBid) / std::max(s.mid, 1e-9) * 1e4;
       snprintf(metrics, sizeof(metrics),
-               "B %.2f  A %.2f  SPR %.2f bps  MID %.2f  MICRO %.2f  LAST %.2f  IMB %+.0f%%  %d SRC",
-               s.bestBid, s.bestAsk, spreadBps, s.mid, s.microprice,
-               st.model.lastTradePrice, s.imbalance * 100.0, s.sourceCount);
+               "B %.*f  A %.*f  SPR %.2f bps  MID %.*f  MICRO %.*f  LAST %.*f  IMB %+.0f%%  %d SRC",
+               pd, s.bestBid, pd, s.bestAsk, spreadBps, pd, s.mid, pd,
+               s.microprice, pd, st.model.lastTradePrice, s.imbalance * 100.0,
+               s.sourceCount);
     } else if (r.w >= 620) {
       double spreadBps = (s.bestAsk - s.bestBid) / std::max(s.mid, 1e-9) * 1e4;
       snprintf(metrics, sizeof(metrics),
-               "B %.2f  A %.2f  SPR %.2f bps  MID %.2f  IMB %+.0f%%  %d SRC",
-               s.bestBid, s.bestAsk, spreadBps, s.mid,
+               "B %.*f  A %.*f  SPR %.2f bps  MID %.*f  IMB %+.0f%%  %d SRC",
+               pd, s.bestBid, pd, s.bestAsk, spreadBps, pd, s.mid,
                s.imbalance * 100.0, s.sourceCount);
     } else {
-      snprintf(metrics, sizeof(metrics), "MID %.2f  SPR %.2f  IMB %+.0f%%  %d SRC",
-               s.mid, s.bestAsk - s.bestBid, s.imbalance * 100.0, s.sourceCount);
+      snprintf(metrics, sizeof(metrics),
+               "MID %.*f  SPR %.*f  IMB %+.0f%%  %d SRC",
+               pd, s.mid, pd, s.bestAsk - s.bestBid, s.imbalance * 100.0,
+               s.sourceCount);
     }
     if (r.w >= 900 && (st.model.recentFlow.buy > 0 || st.model.recentFlow.sell > 0)) {
       char buy[24], sell[24], flow[64];
@@ -864,12 +876,13 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
     for (double size : tileSizes)
       if (size + 1e-12 >= wallMin) wallMax = std::max(wallMax, size);
   }
-  int priceDecimals = st.pricePrecision == 0
-                          ? automaticPriceDecimals(st.effectiveStep)
-                          : st.pricePrecision;
+  int priceDecimals = st.displayDecimals;
+  // Snap the row grid to the pixel grid (fractional dock origins otherwise
+  // leave an AA fringe row at every row boundary across the whole board).
+  const float rowBase = std::floor(rowsArea.y);
   for (int row = 0; row < rowCount; ++row) {
     int64_t tick = topTick - row;
-    float ry = rowsArea.y + row * rowH;
+    float ry = rowBase + row * rowH;
     Rect whole{r.x, ry, r.w, rowH};
     const DomBucket* b = st.model.bucket(tick);
     DomFlow flow = st.model.flow(tick);

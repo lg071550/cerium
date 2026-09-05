@@ -90,10 +90,13 @@ async function fetchKlinesPage(
       const res = await fetch(`${host}/fapi/v1/klines?${qs}`, {
         signal: AbortSignal.timeout(8000),
       });
-      if (res.status === 418 || res.status === 429) {
-        klineFapiOk = false;
+      if (res.status === 418) {
+        // 418 is a ban. Only drop fapi when fapi itself banned us; a www
+        // 418/429 must not pin the rest of the session onto the limited host.
+        if (host.includes("fapi.binance.com")) klineFapiOk = false;
         continue;
       }
+      if (res.status === 429) continue;
       if (!res.ok) continue;
       const raw: unknown = await res.json();
       if (Array.isArray(raw)) return raw;
@@ -131,6 +134,7 @@ function packFlow(rows: readonly AggTrade[]): Float64Array {
 async function fetchTimeBars(
   canon: string,
   minutes: number,
+  isStale?: () => boolean,
 ): Promise<Float64Array | null> {
   const sym = `${canon}USDT`;
   const direct = standardString(minutes);
@@ -138,9 +142,11 @@ async function fetchTimeBars(
     const chunks: unknown[][] = [];
     let endTime: number | undefined;
     for (let page = 0; page < Math.ceil(MAX_BARS / KLINE_PAGE); ++page) {
+      if (isStale?.()) return null;
       let raw = await fetchKlinesPage(sym, direct, endTime);
       if (!raw && page === 0) {
         await new Promise((r) => setTimeout(r, 800));
+        if (isStale?.()) return null;
         raw = await fetchKlinesPage(sym, direct, endTime);
       }
       if (!raw || raw.length === 0) break;
@@ -167,7 +173,13 @@ async function fetchTimeBars(
   const chunks: unknown[][] = [];
   let endTime: number | undefined;
   for (let p = 0; p < pages; p++) {
-    const raw = await fetchKlinesPage(sym, baseStr, endTime);
+    if (isStale?.()) return null;
+    let raw = await fetchKlinesPage(sym, baseStr, endTime);
+    if (!raw && p === 0) {
+      await new Promise((r) => setTimeout(r, 800));
+      if (isStale?.()) return null;
+      raw = await fetchKlinesPage(sym, baseStr, endTime);
+    }
     if (!raw || raw.length === 0) break;
     chunks.unshift(raw); // oldest first
     endTime = Number((raw[0] as unknown[])[0]) - 1;
@@ -714,7 +726,7 @@ export async function fetchCandles(
     // Time OHLC comes from klines. Footprints are a separate aggTrade pull
     // (fetchOrderFlow) so a TF switch can paint candles immediately instead of
     // blocking on hundreds of weight-20 pages.
-    const bars = await fetchTimeBars(canon, value);
+    const bars = await fetchTimeBars(canon, value, isStale);
     if (!bars) return null;
     return { bars, flow: new Float64Array() };
   }

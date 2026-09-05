@@ -25,4 +25,7 @@ uint32_t takeLostVenues();
 // Sends a command to the worker (wire::Cmd).
 void sendCommand(uint32_t type, uint32_t venue, double arg);
 
+// HyperTracker overlay config (token is a JWT; not on the numeric CMD wire).
+void sendHt(const char* token, int symbol, bool liq, bool sl);
+
 } // namespace bridge

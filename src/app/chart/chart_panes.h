@@ -3,6 +3,7 @@
 #include "render/draw_list.h"
 #include "../../data/candles.h"
 #include "../../ui/theme.h"
+#include "../price_format.h"
 
 #include <cmath>
 #include <cstddef>
@@ -93,7 +94,9 @@ struct ChartPane {
 
 using ChartFmt = void (*)(char* out, size_t n, double v);
 
-inline void chartFmtPrice(char* out, size_t n, double v) { snprintf(out, n, "%.2f", v); }
+inline void chartFmtPrice(char* out, size_t n, double v) {
+  snprintf(out, n, "%.*f", priceDecimalsForPrice(v), v);
+}
 inline void chartFmtInt(char* out, size_t n, double v) { snprintf(out, n, "%.0f", v); }
 inline void chartFmtPlain(char* out, size_t n, double v) { snprintf(out, n, "%.1f", v); }
 inline void chartFmtVol(char* out, size_t n, double v) { // 12.4k / 3.1M
@@ -103,10 +106,11 @@ inline void chartFmtVol(char* out, size_t n, double v) { // 12.4k / 3.1M
   else snprintf(out, n, "%.0f", v);
 }
 
-inline void chartFmtUsd(char* out, size_t n, double v) { // $12.4K / $3.1B
+inline void chartFmtUsd(char* out, size_t n, double v) { // $12.4K / $200M / $3.1B
   double a = std::fabs(v);
   if (a >= 1e12) snprintf(out, n, "$%.2fT", v / 1e12);
   else if (a >= 1e9) snprintf(out, n, "$%.2fB", v / 1e9);
+  else if (a >= 1e8) snprintf(out, n, "$%.0fM", v / 1e6);
   else if (a >= 1e6) snprintf(out, n, "$%.1fM", v / 1e6);
   else if (a >= 1e3) snprintf(out, n, "$%.1fK", v / 1e3);
   else snprintf(out, n, "$%.0f", v);

@@ -7,7 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
-#include <ctime>
+#include <deque>
 #include <limits>
 #include <vector>
 
@@ -19,19 +19,6 @@ inline int d7BaseLength(int p0) {
 // EMA on the fast Donchian mid so D-Lead flows; K is a short raw 50% stair.
 inline int d7DEmaLen(int nLen) { return std::max(4, nLen / 6); }
 inline int d7KLen(int nLen) { return nLen; }
-
-inline int64_t d7UtcDay(double tsMs) {
-  return (int64_t)std::floor(tsMs / 86400000.0);
-}
-
-inline int64_t d7UtcWeek(int64_t day) { return (day + 3) / 7; }
-
-inline int d7UtcMonth(double tsMs) {
-  time_t t = (time_t)(tsMs / 1000.0);
-  tm g{};
-  if (!gmtime_r(&t, &g)) return 0;
-  return g.tm_year * 12 + g.tm_mon;
-}
 
 inline float d7MidAt(const CandleSeries& cs, int i, int period) {
   if (period < 1 || i + 1 < period) return NAN;
@@ -48,8 +35,20 @@ inline void d7DonchianMid(const CandleSeries& cs, int period,
   size_t n = cs.v.size();
   out.assign(n, NAN);
   if (period < 1 || n < (size_t)period) return;
-  for (size_t i = (size_t)period - 1; i < n; ++i)
-    out[i] = d7MidAt(cs, (int)i, period);
+  // Monotone windows visit each bar at most twice instead of rescanning the
+  // complete lookback for every output. Live last-bar updates use d7MidAt.
+  std::deque<size_t> highs, lows;
+  for (size_t i = 0; i < n; ++i) {
+    const size_t first = i + 1 > (size_t)period ? i + 1 - (size_t)period : 0;
+    while (!highs.empty() && highs.front() < first) highs.pop_front();
+    while (!lows.empty() && lows.front() < first) lows.pop_front();
+    while (!highs.empty() && cs.v[highs.back()].h <= cs.v[i].h) highs.pop_back();
+    while (!lows.empty() && cs.v[lows.back()].l >= cs.v[i].l) lows.pop_back();
+    highs.push_back(i);
+    lows.push_back(i);
+    if (i + 1 >= (size_t)period)
+      out[i] = (float)((cs.v[highs.front()].h + cs.v[lows.front()].l) * 0.5);
+  }
 }
 
 inline void d7EmaClose(const CandleSeries& cs, int period,
@@ -147,7 +146,9 @@ inline void d7FillScore(const CandleSeries& cs, const std::vector<float>& dLead,
     int8_t s = d7Vote(cs.v[i].c, d, k, r);
     dir[i] = s;
     if (std::isnan(d)) continue;
-    run = (s == prev) ? run + 1 : 1;
+    // Neutral is not a direction streak. It resets the count so the next
+    // confirmed vote starts at one instead of inheriting a neutral run.
+    run = s == 0 ? 0 : (s == prev ? run + 1 : 1);
     prev = s;
     if (asFloat) (*asFloat)[i] = (float)run;
   }
@@ -247,61 +248,13 @@ inline bool d7UpdateScoreLast(const CandleSeries& cs, int length,
   if (std::isnan(dLead)) series[n - 1] = NAN;
   else {
     float prev = series[n - 2];
-    int run = (!std::isnan(prev) && dir[n - 1] == dir[n - 2])
-                  ? (int)prev + 1
-                  : 1;
+    int run = dir[n - 1] == 0
+                  ? 0
+                  : (!std::isnan(prev) && dir[n - 1] == dir[n - 2]
+                         ? (int)prev + 1
+                         : 1);
     series[n - 1] = (float)run;
   }
-  return true;
-}
-
-inline void d7ComputeLevels(const CandleSeries& cs, std::vector<float>& dayOpen,
-                           std::vector<float>& weekOpen,
-                           std::vector<float>& monthOpen) {
-  size_t n = cs.v.size();
-  dayOpen.assign(n, NAN);
-  weekOpen.assign(n, NAN);
-  monthOpen.assign(n, NAN);
-  if (n == 0) return;
-  int64_t prevDay = std::numeric_limits<int64_t>::min();
-  int prevMonth = 0;
-  float dOpen = 0, wOpen = 0, mOpen = 0;
-  for (size_t i = 0; i < n; ++i) {
-    int64_t day = d7UtcDay(cs.v[i].ts);
-    if (i == 0 || day != prevDay) {
-      dOpen = (float)cs.v[i].o;
-      if (i == 0 || d7UtcWeek(day) != d7UtcWeek(prevDay))
-        wOpen = (float)cs.v[i].o;
-      int month = d7UtcMonth(cs.v[i].ts);
-      if (i == 0 || month != prevMonth) {
-        mOpen = (float)cs.v[i].o;
-        prevMonth = month;
-      }
-      prevDay = day;
-    }
-    dayOpen[i] = dOpen;
-    weekOpen[i] = wOpen;
-    monthOpen[i] = mOpen;
-  }
-}
-
-inline bool d7UpdateLevelsLast(const CandleSeries& cs,
-                              std::vector<float>& dayOpen,
-                              std::vector<float>& weekOpen,
-                              std::vector<float>& monthOpen) {
-  size_t n = cs.v.size();
-  if (n < 2 || dayOpen.size() != n || weekOpen.size() != n ||
-      monthOpen.size() != n)
-    return false;
-  int64_t day = d7UtcDay(cs.v[n - 1].ts);
-  int64_t prev = d7UtcDay(cs.v[n - 2].ts);
-  const Candle& c = cs.v[n - 1];
-  dayOpen[n - 1] = day != prev ? (float)c.o : dayOpen[n - 2];
-  weekOpen[n - 1] =
-      d7UtcWeek(day) != d7UtcWeek(prev) ? (float)c.o : weekOpen[n - 2];
-  monthOpen[n - 1] = d7UtcMonth(c.ts) != d7UtcMonth(cs.v[n - 2].ts)
-                         ? (float)c.o
-                         : monthOpen[n - 2];
   return true;
 }
 
@@ -585,91 +538,24 @@ inline void d7DrawRsi(DrawList& d, const ChartPane& pane,
 }
 
 inline void d7DrawScore(DrawList& d, const ChartPane& pane,
+                       const std::vector<float>& score,
                        const std::vector<int8_t>& dir, int vis0, int vis1,
                        float startF, float bw, Color up, Color down) {
   const Theme& th = theme();
-  for (int i = vis0; i <= vis1 && i < (int)dir.size(); ++i) {
+  const float zeroY = pane.yOf(0.0);
+  d.rect({pane.area.x, zeroY, pane.area.w, 1.0f},
+         withAlpha(th.textDim, 0.30f));
+  for (int i = vis0; i <= vis1 && i < (int)dir.size() &&
+                     i < (int)score.size(); ++i) {
     int8_t s = dir[(size_t)i];
+    float v = score[(size_t)i];
+    if (s == 0 || std::isnan(v) || !(v > 0)) continue;
     Color c = s > 0 ? up : s < 0 ? down : th.textDim;
-    float a = s == 0 ? 0.16f : 0.62f;
     float x = pane.area.x + (i - startF) * bw;
     float gap = std::max(0.0f, std::min(2.0f, bw * 0.12f));
-    d.rect({x + gap, pane.area.y + 3.0f, std::max(1.0f, bw - gap * 2.0f),
-            std::max(2.0f, pane.area.h - 6.0f)},
-           withAlpha(c, a));
-  }
-}
-
-inline void d7DrawLevel(DrawList& d, const ChartPane& pane, float y, Color c,
-                       const char* label, const char* value) {
-  if (y < pane.area.y || y > pane.area.y + pane.area.h) return;
-  d.linePattern(pane.area.x, y, pane.area.x + pane.area.w, y, c, 1.0f,
-                DrawList::LineStyle::Dashed);
-  d.circle(pane.area.x + pane.area.w - 5.0f, y, 2.2f, c);
-  char buf[40];
-  snprintf(buf, sizeof(buf), "%s %s", label, value);
-  d.textAligned({pane.area.x + pane.area.w - 92.0f, y - 8.0f, 88.0f, 16.0f},
-                buf, c, DrawList::Right, 0, true);
-}
-
-inline void d7DrawLevels(DrawList& d, const ChartPane& pane,
-                        const std::vector<float>& dayOpen,
-                        const std::vector<float>& weekOpen,
-                        const std::vector<float>& monthOpen, int mask,
-                        bool prev, Color dayC, Color weekC, Color monthC) {
-  auto last = [](const std::vector<float>& s) -> float {
-    for (size_t i = s.size(); i-- > 0;)
-      if (!std::isnan(s[i])) return s[i];
-    return NAN;
-  };
-  auto prevVal = [](const std::vector<float>& s, float cur) -> float {
-    for (size_t i = s.size(); i-- > 0;) {
-      if (std::isnan(s[i])) continue;
-      if (s[i] != cur) return s[i];
-    }
-    return NAN;
-  };
-  char vb[24];
-  if (mask & 1) {
-    float v = last(dayOpen);
-    if (!std::isnan(v)) {
-      chartFmtPrice(vb, sizeof(vb), v);
-      d7DrawLevel(d, pane, pane.yOf(v), dayC, "D-O", vb);
-    }
-    if (prev) {
-      float p = prevVal(dayOpen, v);
-      if (!std::isnan(p)) {
-        chartFmtPrice(vb, sizeof(vb), p);
-        d7DrawLevel(d, pane, pane.yOf(p), withAlpha(dayC, 0.45f), "PD-O", vb);
-      }
-    }
-  }
-  if (mask & 2) {
-    float v = last(weekOpen);
-    if (!std::isnan(v)) {
-      chartFmtPrice(vb, sizeof(vb), v);
-      d7DrawLevel(d, pane, pane.yOf(v), weekC, "W-O", vb);
-    }
-    if (prev) {
-      float p = prevVal(weekOpen, v);
-      if (!std::isnan(p)) {
-        chartFmtPrice(vb, sizeof(vb), p);
-        d7DrawLevel(d, pane, pane.yOf(p), withAlpha(weekC, 0.45f), "PW-O", vb);
-      }
-    }
-  }
-  if (mask & 4) {
-    float v = last(monthOpen);
-    if (!std::isnan(v)) {
-      chartFmtPrice(vb, sizeof(vb), v);
-      d7DrawLevel(d, pane, pane.yOf(v), monthC, "M-O", vb);
-    }
-    if (prev) {
-      float p = prevVal(monthOpen, v);
-      if (!std::isnan(p)) {
-        chartFmtPrice(vb, sizeof(vb), p);
-        d7DrawLevel(d, pane, pane.yOf(p), withAlpha(monthC, 0.45f), "PM-O", vb);
-      }
-    }
+    float y = pane.yOf(v);
+    d.rect({x + gap, y, std::max(1.0f, bw - gap * 2.0f),
+            std::max(1.0f, zeroY - y)},
+           withAlpha(c, 0.62f));
   }
 }

@@ -105,8 +105,12 @@ void listView(Ui& ui, Rect area, int rowCount, float rowH, ListState& state,
   ui.draw.pushClip(area);
   int i0 = (int)(state.scroll / rowH);
   int i1 = std::min(rowCount, (int)((state.scroll + area.h) / rowH) + 1);
+  // Snap the row grid to the physical pixel grid: fractional panel origins
+  // (docking splits) would otherwise leave the quad SDF's 1px AA band as a dim
+  // fringe row at every row boundary — a ladder of horizontal hairlines.
+  const float rowBase = std::floor(area.y - state.scroll);
   for (int i = i0; i < i1; ++i) {
-    Rect row{area.x, area.y + i * rowH - state.scroll, area.w, rowH};
+    Rect row{area.x, rowBase + i * rowH, area.w, rowH};
     drawRow(ui, ui.draw, row, i);
   }
   ui.draw.popClip();
@@ -157,7 +161,7 @@ bool textField(Ui& ui, Rect r, TextFieldState& st, const char* id,
 
   bool changed = false;
   if (st.focused) {
-    char buf[512]; // room for pasted values; the old 128 could cut mid-UTF-8
+    char buf[2048]; // JWT / pasted API tokens; 128 used to cut mid-UTF-8
     shell_ime_get(buf, sizeof(buf));
     buf[sizeof(buf) - 1] = '\0';
     if (st.text != buf) {

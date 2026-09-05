@@ -25,6 +25,7 @@ void shell_storage_remove(const char* key);
 void shell_set_cursor(const char* cursor);
 
 // Replaces the boot splash text with an error message (fatal init failures).
+void shell_boot_ready();
 void shell_boot_error(const char* msg);
 
 // Hidden-DOM-input text editing bridge (IME-compatible). One shared input is

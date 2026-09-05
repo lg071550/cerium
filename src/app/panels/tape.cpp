@@ -3,6 +3,7 @@
 
 #include "../../platform/shell.h"
 #include "../../ui/theme.h"
+#include "../price_format.h"
 #include "../symbols.h"
 
 #include <algorithm>
@@ -23,10 +24,11 @@ void saveTapeSettings(TapePanel& st) {
   st.amountPrecision = std::clamp(st.amountPrecision, 0, 3);
   char buf[256];
   snprintf(buf, sizeof(buf),
-           "1,%.12g,%.12g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+           "2,%.12g,%.12g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
            st.minUsd, st.maxUsd, st.showUsd, st.density, st.showTime,
            st.showVenue, st.showWash, st.showGradient, st.showMarker,
-           st.intensity, st.priceDecimals, st.amountPrecision);
+           st.intensity, st.priceDecimals, st.amountPrecision,
+           st.priceAuto ? 1 : 0);
   shell_storage_set(st.settingsKey.c_str(), buf);
 }
 
@@ -38,14 +40,19 @@ void loadTapeSettings(TapePanel& st) {
     double minUsd = 0.0, maxUsd = 0.0;
     int version = 0, showUsd = 1, density = 1, showTime = 1, showVenue = 1;
     int showWash = 1, showGradient = 1, showMarker = 1, intensity = 1;
-    int priceDecimals = 2, amountPrecision = 2;
+    int priceDecimals = 2, amountPrecision = 2, priceAuto = 1;
     int parsed = sscanf(saved,
-                        "%d,%lf,%lf,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+                        "%d,%lf,%lf,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
                         &version, &minUsd, &maxUsd, &showUsd, &density,
                         &showTime, &showVenue, &showWash, &showGradient,
                         &showMarker, &intensity, &priceDecimals,
-                        &amountPrecision);
-    if (parsed == 13 && version == 1 &&
+                        &amountPrecision, &priceAuto);
+    if (parsed == 13 && version == 1) {
+      priceAuto = priceDecimals == 2 ? 1 : 0;
+      parsed = 14;
+      version = 2;
+    }
+    if (parsed == 14 && version == 2 &&
         std::isfinite(minUsd) && minUsd >= 0.0 && std::isfinite(maxUsd) &&
         maxUsd >= 0.0 && (maxUsd == 0.0 || maxUsd >= minUsd)) {
       st.minUsd = minUsd;
@@ -59,6 +66,7 @@ void loadTapeSettings(TapePanel& st) {
       st.showMarker = showMarker != 0;
       st.intensity = intensity;
       st.priceDecimals = priceDecimals;
+      st.priceAuto = priceAuto != 0;
       st.amountPrecision = amountPrecision;
       saveTapeSettings(st);
     } else if (sscanf(saved, "%lf,%lf,%d", &minUsd, &maxUsd, &showUsd) == 3 &&
@@ -211,11 +219,15 @@ void drawTapeSettings(Ui& u, Rect area, TapePanel& st) {
                  option("STRONG", 70, st.intensity == 2, [&] { st.intensity = 2; });
                  break;
                case 5:
+                 option("AUTO", 54, st.priceAuto, [&] { st.priceAuto = true; });
                  for (int i = 0; i < 5; ++i) {
                    char label[4];
                    snprintf(label, sizeof(label), "%d", i);
-                   option(label, 42, st.priceDecimals == i,
-                          [&, i] { st.priceDecimals = i; });
+                   option(label, 42, !st.priceAuto && st.priceDecimals == i,
+                          [&, i] {
+                            st.priceAuto = false;
+                            st.priceDecimals = i;
+                          });
                  }
                  break;
                case 6: {
@@ -276,6 +288,7 @@ void drawTapeSettings(Ui& u, Rect area, TapePanel& st) {
                        st.showMarker = true;
                    st.density = st.intensity = 1;
                    st.priceDecimals = 2;
+                   st.priceAuto = true;
                    st.amountPrecision = 2;
                    saveTapeSettings(st);
                  }
@@ -485,7 +498,10 @@ void drawTape(Ui& u, Rect r, TapePanel& st, Feeds& feeds) {
 
              const char* timeBuf = st.timeLabel((int64_t)(e->ts / 1000.0));
              char price[32], amount[32];
-             snprintf(price, sizeof(price), "%.*f", st.priceDecimals, e->price);
+             snprintf(price, sizeof(price), "%.*f",
+                      st.priceAuto ? priceDecimalsForPrice(e->price)
+                                   : st.priceDecimals,
+                      e->price);
              if (st.showUsd)
                formatUsd(usd, amount, sizeof(amount));
              else

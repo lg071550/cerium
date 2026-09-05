@@ -2,6 +2,7 @@
 
 #include "book.h"
 #include "candles.h"
+#include "ht_map.h"
 #include "market.h"
 #include "orderflow.h"
 #include "tape.h"
@@ -43,6 +44,7 @@ struct Feeds {
   CandleSeries candles; // chart series (venue 0 klines + live trades)
   OrderFlowSeries orderFlow; // exact prints for footprint chart modes
   MarketSeries market;  // aggregated OI / funding / liquidations
+  HtMaps ht;            // HyperTracker HL liq / stop maps (optional overlay)
   int symbol = 0; // 0 = ETH, 1 = BTC, 2 = SOL (feeds/registry.ts SYMBOLS)
   // Venues (bit i = venue i) whose live prints feed the aggregated volume,
   // CVD delta, and footprint orderflow series. Default = every venue.
@@ -58,6 +60,10 @@ struct Feeds {
   void requestOrderFlow();                 // lazy exact trade history for footprints
   void refreshOrderFlow();                 // re-bootstrap even if already requested
   void setFlowMask(uint32_t mask);         // venues feeding volume/CVD/footprint
+  // HyperTracker overlay: token + which live profiles to keep warm. No-ops
+  // when unchanged. Empty token still notifies the worker so the overlay can
+  // show the missing-key state without spending quota.
+  void setHt(const char* token, bool liq, bool sl);
 
   VenueState* venue(size_t i) { return i < venues.size() ? &venues[i] : nullptr; }
   int liveCount() const;
@@ -91,6 +97,10 @@ private:
 
   bool m_started = false;
   bool m_orderFlowRequested = false;
+  std::string m_htToken;
+  bool m_htLiq = false;
+  bool m_htSl = false;
+  int m_htSym = -1;
   // snapshot assembly scratch
   bool m_collecting = false;
   uint8_t m_collectVenue = 0;

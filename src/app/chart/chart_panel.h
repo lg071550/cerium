@@ -3,8 +3,11 @@
 #include "../../data/candles.h"
 #include "../../data/feeds.h"
 #include "../../data/heatmap.h"
+#include "../../data/liq_map.h"
 #include "../../ui/widgets.h"
 #include "chart_panes.h"
+#include "period_levels.h"
+#include "drawings.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -20,9 +23,17 @@ struct IndicatorInstance;
 // compute, live last-bar update, and registry name. Presentation hooks —
 // pane format, y-range, body renderer — live in the file-local kPresent
 // table so the two halves stay side-by-side with their implementations.
+enum : uint8_t {
+  CapOnce = 1 << 0, // singleton, no series polyline / last-value
+  CapFlow = 1 << 1, // extra order-flow window (volume profile)
+  CapMkt = 1 << 2,  // mix MarketSeries::version
+  CapLiq = 1 << 3,  // mix MarketSeries::liqVersion
+};
+
 struct Indicator {
   const char* name;
   bool overlay;
+  uint8_t caps;
   void (*compute)(const CandleSeries&, IndicatorInstance&, const OrderFlowSeries*,
                   const MarketSeries*);
   bool (*updateLast)(const CandleSeries&, IndicatorInstance&, const OrderFlowSeries*,
@@ -36,14 +47,16 @@ struct IndicatorInstance {
   bool seriesVisible = true; // overlay legend click hides the plot, not the name
   float height = 104.0f; // pane plot height; unused for overlays
   uint8_t width = 1;     // 1 / 1.5 / 2 / 2.5px
-  uint8_t colorA = 0;    // primary series / up / %K / ADX
-  uint8_t colorB = 3;    // secondary / down / %D / +DI / signal
-  uint8_t colorC = 4;    // tertiary / −DI / hist / cipher money flow
-  uint8_t colorD = 3;    // vwap ±2σ band
-  uint8_t colorE = 3;    // vwap ±3σ band
+  // Palette slot index (0-7), or 0x80000000|rgb for a custom picker color.
+  uint32_t colorA = 0;   // primary series / up / %K / ADX
+  uint32_t colorB = 3;   // secondary / down / %D / +DI / signal
+  uint32_t colorC = 4;   // tertiary / −DI / hist
+  uint32_t colorD = 3;   // vwap ±2σ band
+  uint32_t colorE = 3;   // vwap ±3σ band
   int p0 = 0, p1 = 0, p2 = 0; // type-specific periods / volume mode
   int opt = 0;           // deviation / multiplier / volume intensity
   bool flag = true;      // guides / histogram / bands / DI / zero line
+  PeriodLevels levels; // calendar opens, independent of oscillator series
   std::vector<float> series;
   std::vector<float> aux;
   std::vector<float> aux2;
@@ -59,18 +72,24 @@ struct IndicatorInstance {
 struct ChartPanel {
   bool panning() const { return m_panning || m_timeScaling; } // cursor hint
   bool paneResizing() const { return m_resizePane >= 0 || m_resizeHotPane >= 0; }
+  bool drawing() const { return m_drawings.armed(); }
+  const char* drawingCursor() const { return m_drawings.cursor(); }
 
   bool scaleAuto = true;   // auto-fit price range to the visible window
   bool scaleLog = false;   // logarithmic price axis
 
   void draw(Ui& u, Rect r, Feeds& feeds);
-  void setStorageKey(const std::string& key) { m_settingsKey = key; }
+  void setStorageKey(const std::string& key) {
+    m_settingsKey = key;
+    m_drawings.setStorageKey(key);
+  }
 
   // popovers — drawn by the host during the overlay pass
   void drawIndicatorPicker(Ui& u);
   void drawIndicatorSettings(Ui& u);
   void drawTfPicker(Ui& u, Feeds& feeds);
   void drawFlowPicker(Ui& u, Feeds& feeds);
+  void drawToolPicker(Ui& u);
 private:
   float scroll = 0; // bars scrolled back from the latest (fractional: drag pans sub-bar)
   std::vector<IndicatorInstance> m_panes;    // stacked below price, top → bottom
@@ -152,13 +171,22 @@ private:
   int m_footprintMinCell = 0;  // hide cells under 0/1/2/5/10% of bar POC volume
   int m_tpoBracket = 0;        // 30 / 60 minutes
   bool m_heatOn = true;        // BOOK HEAT overlay; persisted separately
+  bool m_hlLiqOn = false;      // HL LIQ overlay
+  bool m_hlSlOn = false;       // HL SL overlay
+  bool m_liqMapOn = false;     // predicted LIQ MAP overlay
+  int m_liqBinSel = 0;         // 0 = AUTO (~1000 ticks), else log dollar bin
+  float m_liqGamma = 4.32f;    // crush faint bins; MMT default
+  float m_liqOpacity = 1.0f;
+  int m_liqBands = 15;         // bitmask 10/25/50/100x
+  bool m_liqProfile = true;
   int m_heatResSel = 100;      // capture resolution: slider % → 8/4/2/1 px per row
   float m_heatIntensity = 0.85f;
   float m_heatOpacity = 1.0f;  // overlay alpha multiplier, independent of intensity
-  int m_heatMinSel = 0;        // min USD clamp, slider % (log scale, 0 = off)
-  int m_heatMaxSel = 100;      // max USD clamp, slider % (log scale, 100 = auto)
+  int m_heatMinSel = 0;        // min USD clamp, slider % (log $100..$10M, 0 = off)
+  int m_heatMaxSel = 100;      // max USD clamp, slider % (log $10K..$1B, 100 = auto)
   int m_heatBinSel = 0;        // price bin, slider % (0 = AUTO from resolution)
   HeatmapSeries m_bookHeat;
+  LiqMapSeries m_liqMap;
   int m_emaPeriod = 21;
   int m_ema2Period = 200;
   int m_smaPeriod = 50;
@@ -229,11 +257,36 @@ private:
   int m_indicatorSettingsInst = 0;
   void openIndicatorSettings(Ui& u, int instId, Rect anchor);
 
+  // Custom color picker popover (opened from a palette row's custom swatch).
+  uint64_t m_colorPickerId = 0;
+  Rect m_colorPickerRect{};
+  int m_colorPickerInst = 0;
+  uint32_t IndicatorInstance::* m_colorPickerSlot = nullptr;
+  uint32_t m_lastCustom = 0x80000000u | 0x9c8fe8u; // last picked custom color
+  float m_cpHue = 0, m_cpSat = 0, m_cpVal = 0;
+  TextFieldState m_cpHex;
+  void openColorPicker(Ui& u, int instId, uint32_t IndicatorInstance::*slot,
+                       Rect anchor);
+  void drawColorPicker(Ui& u);
+
   TextFieldState m_tfInput;
   uint64_t m_tfPickerId = 0;
   Rect m_tfPickerRect{};
   bool m_autoFocusTf = false;
   bool m_tfError = false;
+
+  TextFieldState m_htToken;
+  bool m_htTokenLoaded = false;
+  int m_htUsed = 0;
+  int m_htQuota = 100;
+  int m_htStatus = 1;
+  double m_htLiqAt = 0;
+  double m_htSlAt = 0;
+  int m_htLiqN = 0;
+  int m_htSlN = 0;
+  void ensureHtToken();
+
+  DrawingSet m_drawings;
 
   bool indicatorOn(int ri) const;
   int instanceCount(int ri) const;
@@ -241,6 +294,7 @@ private:
   IndicatorInstance makeInstance(int ri);
   void addIndicator(int ri);
   void removeIndicator(Ui& u, int instId);
+  void setMapFlag(int ri, bool on);
   void setInstanceOnChart(int instId, bool onChart);
   void refreshEnabled();
   void noteSetChanged() { ++m_rngGen; ++m_calcGen; m_liveState = false; }
@@ -265,7 +319,7 @@ private:
   void drawSettings(Ui& u, Rect area);
 
   // --- persisted settings schema -------------------------------------------
-  // One entry per CSV column in the current (v19) storage order. Bools store
+  // One entry per CSV column in the current (v21) storage order. Bools store
   // 1/0, Pct100 fields store round(value * 100), Mask stores the venue bitmask.
   enum class SettType : uint8_t { Bool, Int, Pct100, Mask, Widths };
   struct Setting {
@@ -343,4 +397,5 @@ private:
   bool drawIndicatorPanes(Ui& u, Feeds& feeds, PlotCtx& ctx);
   void drawLastPriceRow(Ui& u, Feeds& feeds, PlotCtx& ctx);
   void drawCrosshairRow(Ui& u, Feeds& feeds, PlotCtx& ctx);
+  void drawHeatHover(Ui& u, Feeds& feeds, PlotCtx& ctx);
 };

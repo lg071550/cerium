@@ -88,6 +88,13 @@ export class WireWriter {
 
   push(type: number, venue: number, side: number, price: number, qty: number,
        ts: number, aux = 0): void {
+    // Validate numeric venue payloads before they reach book sorting, price
+    // quantization, or chart accumulators. Zero-size book updates are deletes.
+    if (type === EV.Trade || type === EV.BookUpdate || type === EV.SnapshotLevel) {
+      if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(qty) ||
+          qty < 0 || !Number.isFinite(ts) || ts <= 0 ||
+          (side !== 0 && side !== 1) || (type === EV.Trade && qty === 0)) return;
+    }
     this.pending.push({ type, venue, side, price, qty, ts, aux });
     this.flushPending();
   }
@@ -150,7 +157,7 @@ export class WireWriter {
       }
     }
     let cutoff = this.pending.length;
-    if (beginIdx >= this.pendingHead && beginIdx - this.pendingHead <= budget)
+    if (beginIdx > this.pendingHead && this.pending.length - beginIdx <= budget)
       cutoff = beginIdx; // keep the newest group intact
     for (let i = this.pendingHead; i < cutoff; i++) {
       const type = this.pending[i]!.type;

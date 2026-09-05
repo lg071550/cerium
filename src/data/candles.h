@@ -36,6 +36,13 @@ struct CandleSeries {
   Timeframe tf;
   int sym = -1;    // canonical symbol index these candles belong to
   int barCount = 0; // trades seen in the forming bar (tick bars only)
+  // Live trades must not open a new series until the worker bootstrap
+  // (or a timeout) lands — otherwise a TF switch that misses klines
+  // paints a live-only chart.
+  bool awaitingHistory = true;
+  bool historyLoaded = false;
+  double historyWaitT0 = 0;
+  uint64_t historyVersion = 0; // replacements can change interior bars only
 
   static constexpr size_t MAX_CANDLES = 2000;
 

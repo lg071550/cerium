@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 #include <vector>
 
 void HeatmapSeries::clear() {
@@ -46,6 +47,74 @@ static void holdCell(float& cell, float v) {
   if (!sameSide || std::fabs(v) > std::fabs(cell)) cell = v;
 }
 
+static void finishBar(HeatmapBar& b) {
+  if (b.rows.empty()) {
+    b.heat.clear();
+    b.row0 = 0;
+    return;
+  }
+  b.row0 = b.rows.front();
+}
+
+template <typename... Extra>
+static void keepClosest(int64_t midRow, int cap, std::vector<int64_t>& rows,
+                        Extra&... extra) {
+  if ((int)rows.size() <= cap) return;
+  std::vector<size_t> idx(rows.size());
+  for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+  std::nth_element(idx.begin(), idx.begin() + cap, idx.end(),
+                   [&](size_t a, size_t b) {
+                     int64_t da = rows[a] > midRow ? rows[a] - midRow
+                                                   : midRow - rows[a];
+                     int64_t db = rows[b] > midRow ? rows[b] - midRow
+                                                   : midRow - rows[b];
+                     if (da != db) return da < db;
+                     return a < b;
+                   });
+  idx.resize((size_t)cap);
+  std::sort(idx.begin(), idx.end(),
+            [&](size_t a, size_t b) { return rows[a] < rows[b]; });
+  auto compact = [&](auto& vec) {
+    using T = typename std::decay<decltype(vec[0])>::type;
+    std::vector<T> next;
+    next.reserve(idx.size());
+    for (size_t i : idx) next.push_back(vec[i]);
+    vec.swap(next);
+  };
+  compact(rows);
+  (compact(extra), ...);
+}
+
+static void mergeHold(std::vector<int64_t>& rows, std::vector<float>& heat,
+                      const std::vector<int64_t>& fRows,
+                      const std::vector<float>& fHeat) {
+  std::vector<int64_t> outR;
+  std::vector<float> outH;
+  outR.reserve(rows.size() + fRows.size());
+  outH.reserve(rows.size() + fRows.size());
+  size_t i = 0, j = 0;
+  while (i < rows.size() || j < fRows.size()) {
+    if (j == fRows.size() || (i < rows.size() && rows[i] < fRows[j])) {
+      outR.push_back(rows[i]);
+      outH.push_back(heat[i]);
+      ++i;
+    } else if (i == rows.size() || fRows[j] < rows[i]) {
+      outR.push_back(fRows[j]);
+      outH.push_back(fHeat[j]);
+      ++j;
+    } else {
+      float v = heat[i];
+      holdCell(v, fHeat[j]);
+      outR.push_back(rows[i]);
+      outH.push_back(v);
+      ++i;
+      ++j;
+    }
+  }
+  rows.swap(outR);
+  heat.swap(outH);
+}
+
 void HeatmapSeries::setBin(double newBin) {
   if (!(newBin > 0) || !std::isfinite(newBin)) return;
   const double oldBin = bin;
@@ -54,30 +123,30 @@ void HeatmapSeries::setBin(double newBin) {
     // smaller is boundary float noise, not a real change.
     if (std::fabs(newBin - bin) < bin * 0.05) return;
     for (HeatmapBar& b : bars) {
-      const int64_t n = (int64_t)b.heat.size();
-      if (n < 1) continue;
-      int64_t lo = INT64_MAX, hi = INT64_MIN;
-      for (int64_t r = 0; r < n; ++r) {
-        if (b.heat[(size_t)r] == 0) continue;
-        int64_t nr = (int64_t)std::floor(((double)(b.row0 + r) * oldBin) /
-                                         newBin);
-        lo = std::min(lo, nr);
-        hi = std::max(hi, nr);
-      }
-      if (lo > hi) {
+      const size_t n = b.rows.size();
+      if (n < 1) {
         b.heat.clear();
+        b.row0 = 0;
         continue;
       }
-      std::vector<float> next((size_t)(hi - lo + 1), 0.0f);
-      for (int64_t r = 0; r < n; ++r) {
-        float v = b.heat[(size_t)r];
+      std::vector<int64_t> nr;
+      std::vector<float> nh;
+      nr.reserve(n);
+      nh.reserve(n);
+      for (size_t i = 0; i < n; ++i) {
+        float v = b.heat[i];
         if (v == 0) continue;
-        int64_t nr = (int64_t)std::floor(((double)(b.row0 + r) * oldBin) /
-                                         newBin);
-        holdCell(next[(size_t)(nr - lo)], v);
+        int64_t row = (int64_t)std::floor(((double)b.rows[i] * oldBin) / newBin);
+        if (!nr.empty() && nr.back() == row) holdCell(nh.back(), v);
+        else {
+          nr.push_back(row);
+          nh.push_back(v);
+        }
       }
-      b.heat.swap(next);
-      b.row0 = lo;
+      b.rows.swap(nr);
+      b.heat.swap(nh);
+      finishBar(b);
+      b.mut = ++mutGen;
     }
   }
   bin = newBin;
@@ -136,69 +205,61 @@ void HeatmapSeries::sample(int bar, const Feeds& feeds, uint32_t mask,
   if ((size_t)bar >= bars.size()) bars.resize((size_t)bar + 1);
   HeatmapBar& dest = bars[(size_t)bar];
 
-  // Capture band: mid ±50%, capped so the row count stays bounded at very
-  // fine bins. Wide enough that panning back to earlier price action still
-  // finds the heat that was sampled while this bar was live.
-  double half = mid * 0.5;
-  const double capHalf = bin * (double)(kMaxRows / 2);
-  if (half > capHalf) half = capHalf;
-  const int64_t row0 = (int64_t)std::floor((mid - half) / bin);
-  const int rows =
-      (int)std::min<int64_t>(kMaxRows,
-                             (int64_t)std::ceil((mid + half) / bin) - row0);
-  if (rows < 1) return;
+  static thread_local std::vector<int64_t> freshRows;
+  static thread_local std::vector<float> freshBid, freshAsk, freshHeat, nearVals;
+  captureHeatmapSides(feeds, mask, bin, freshRows, freshBid, freshAsk);
 
-  static thread_local std::vector<float> freshBid, freshAsk;
-  freshBid.assign((size_t)rows, 0.0f);
-  freshAsk.assign((size_t)rows, 0.0f);
-  captureHeatmapSides(feeds, mask, bin, row0, rows, freshBid.data(),
-                      freshAsk.data());
+  freshHeat.resize(freshRows.size());
+  for (size_t i = 0; i < freshRows.size(); ++i) {
+    float b = freshBid[i], a = freshAsk[i];
+    freshHeat[i] = b >= a ? b : -a;
+  }
 
-  // Fold the fresh sample into the bar with max-hold, growing the bar's
-  // populated range to the union if the band moved since the last sample.
-  if (dest.heat.empty()) {
-    dest.row0 = row0;
-    dest.heat.assign((size_t)rows, 0.0f);
-  } else {
-    const int64_t destHi = dest.row0 + (int64_t)dest.heat.size();
-    const int64_t u0 = std::min(dest.row0, row0);
-    const int64_t u1 = std::max(destHi, row0 + (int64_t)rows);
-    if (u0 < dest.row0 || u1 > destHi) {
-      std::vector<float> next((size_t)(u1 - u0), 0.0f);
-      for (int64_t r = 0; r < (int64_t)dest.heat.size(); ++r)
-        next[(size_t)(dest.row0 + r - u0)] = dest.heat[(size_t)r];
-      dest.heat.swap(next);
-      dest.row0 = u0;
-    }
-  }
-  const int64_t off = row0 - dest.row0;
-  for (int r = 0; r < rows; ++r) {
-    float b = freshBid[(size_t)r], a = freshAsk[(size_t)r];
-    float v = b >= a ? b : -a;
-    holdCell(dest.heat[(size_t)(off + r)], v);
-  }
+  mergeHold(dest.rows, dest.heat, freshRows, freshHeat);
+  keepClosest((int64_t)std::floor(mid / bin), kMaxRows, dest.rows, dest.heat);
+  finishBar(dest);
+  dest.mut = ++mutGen;
 
   const double nearHalf = mid * kNearFrac;
-  const int r0 = std::clamp(
-      (int)((int64_t)std::floor((mid - nearHalf) / bin) - row0), 0, rows);
-  const int r1 = std::clamp(
-      (int)((int64_t)std::ceil((mid + nearHalf) / bin) - row0), 0, rows);
-  float fresh = heatmapPercentileRef(freshBid.data(), freshAsk.data(), r0, r1);
-  if (!(fresh > 0))
-    fresh = heatmapPercentileRef(freshBid.data(), freshAsk.data(), 0, rows);
+  const int64_t n0 = (int64_t)std::floor((mid - nearHalf) / bin);
+  const int64_t n1 = (int64_t)std::ceil((mid + nearHalf) / bin);
+  nearVals.clear();
+  for (size_t i = 0; i < freshRows.size(); ++i) {
+    if (freshRows[i] < n0 || freshRows[i] >= n1) continue;
+    float v = std::max(freshBid[i], freshAsk[i]);
+    if (v > 0) nearVals.push_back(v);
+  }
+  float fresh = heatmapPercentileRef(nearVals.data(), (int)nearVals.size());
+  if (!(fresh > 0)) {
+    nearVals.clear();
+    for (size_t i = 0; i < freshRows.size(); ++i) {
+      float v = std::max(freshBid[i], freshAsk[i]);
+      if (v > 0) nearVals.push_back(v);
+    }
+    fresh = heatmapPercentileRef(nearVals.data(), (int)nearVals.size());
+  }
   ref = heatmapSmoothRef(ref, fresh);
 }
 
 void captureHeatmapSides(const Feeds& feeds, uint32_t mask, double bin,
-                         int64_t row0, int rows, float* bid, float* ask) {
-  if (!bid || !ask || rows < 1 || !(bin > 0)) return;
-  std::fill(bid, bid + rows, 0.0f);
-  std::fill(ask, ask + rows, 0.0f);
-  const double lo = (double)row0 * bin;
-  const double hi = (double)(row0 + rows) * bin;
+                         std::vector<int64_t>& rows, std::vector<float>& bid,
+                         std::vector<float>& ask) {
+  rows.clear();
+  bid.clear();
+  ask.clear();
+  if (!(bin > 0)) return;
   const double mid = feeds.aggMid();
   const double fenceLo = mid > 0 ? mid / HeatmapSeries::kFence : 0;
   const double fenceHi = mid > 0 ? mid * HeatmapSeries::kFence : 0;
+
+  struct Acc {
+    int64_t row;
+    float bid;
+    float ask;
+  };
+  static thread_local std::vector<Acc> acc;
+  acc.clear();
+  acc.reserve(8192);
 
   bool healthy[64] = {};
   feeds.collectHealthy(50.0, healthy, std::size(healthy));
@@ -211,12 +272,10 @@ void captureHeatmapSides(const Feeds& feeds, uint32_t mask, double bin,
     // Prefer healthy books, but still take a live book if the 50bps filter
     // has not marked anyone yet (startup) so the overlay is not empty.
     if (!healthy[i] && venue.status != wire::Live) continue;
-    auto add = [&](const BookSide& side, float* dest, bool isBid) {
+    auto add = [&](const BookSide& side, bool isBid) {
       if (side.prices.empty()) return;
-      size_t start = side.lowerBound(lo);
-      for (size_t li = start; li < side.prices.size(); ++li) {
+      for (size_t li = 0; li < side.prices.size(); ++li) {
         double price = side.prices[li];
-        if (price >= hi) break;
         if (fenceLo > 0 && (price < fenceLo || price > fenceHi)) continue;
         // Crossed quotes (a venue's ask below the aggregate mid, or a bid
         // above it) are transient arb, not resting depth — they would paint
@@ -224,14 +283,62 @@ void captureHeatmapSides(const Feeds& feeds, uint32_t mask, double bin,
         if (mid > 0 && (isBid ? price > mid : price < mid)) continue;
         double size = side.sizes[li];
         if (!(price > 0) || !(size > 0)) continue;
-        int64_t row = (int64_t)std::floor(price / bin) - row0;
-        if (row < 0 || row >= rows) continue;
+        int64_t row = (int64_t)std::floor(price / bin);
         double usd = price * size;
-        if (std::isfinite(usd) && usd > 0) dest[row] += (float)usd;
+        if (!std::isfinite(usd) || usd <= 0) continue;
+        acc.push_back(
+            {row, isBid ? (float)usd : 0.0f, isBid ? 0.0f : (float)usd});
       }
     };
-    add(venue.book.bids, bid, true);
-    add(venue.book.asks, ask, false);
+    add(venue.book.bids, true);
+    add(venue.book.asks, false);
+  }
+  if (acc.empty()) return;
+  std::sort(acc.begin(), acc.end(),
+            [](const Acc& a, const Acc& b) { return a.row < b.row; });
+  rows.reserve(acc.size());
+  bid.reserve(acc.size());
+  ask.reserve(acc.size());
+  for (const Acc& a : acc) {
+    if (!rows.empty() && rows.back() == a.row) {
+      bid.back() += a.bid;
+      ask.back() += a.ask;
+    } else {
+      rows.push_back(a.row);
+      bid.push_back(a.bid);
+      ask.push_back(a.ask);
+    }
+  }
+  if ((int)rows.size() > HeatmapSeries::kMaxRows) {
+    const int64_t midRow = mid > 0 ? (int64_t)std::floor(mid / bin) : 0;
+    keepClosest(midRow, HeatmapSeries::kMaxRows, rows, bid, ask);
+  }
+}
+
+void heatmapFillTickHoles(const std::vector<int64_t>& rows,
+                          const std::vector<float>& heat, int maxGap,
+                          std::vector<int64_t>& outRows,
+                          std::vector<float>& outHeat) {
+  outRows.clear();
+  outHeat.clear();
+  if (rows.empty() || heat.size() != rows.size()) return;
+  outRows.reserve(rows.size());
+  outHeat.reserve(heat.size());
+  outRows.push_back(rows[0]);
+  outHeat.push_back(heat[0]);
+  for (size_t i = 1; i < rows.size(); ++i) {
+    const int64_t gap = rows[i] - rows[i - 1] - 1;
+    const float a = heat[i - 1], b = heat[i];
+    const bool same = (a > 0 && b > 0) || (a < 0 && b < 0);
+    if (same && gap > 0 && gap <= (int64_t)maxGap) {
+      const float fill = a > 0 ? std::min(a, b) : std::max(a, b);
+      for (int64_t r = rows[i - 1] + 1; r < rows[i]; ++r) {
+        outRows.push_back(r);
+        outHeat.push_back(fill);
+      }
+    }
+    outRows.push_back(rows[i]);
+    outHeat.push_back(heat[i]);
   }
 }
 
@@ -239,13 +346,19 @@ float heatmapStrength(float size, float ref) {
   if (!(size > 0) || !(ref > 0)) return 0;
   // Piecewise log2 ramp. Below the reference, eight octaves of visible
   // texture (ref/256 → 0) so ordinary depth reads as a continuous faint
-  // field instead of cutting to black; above it, five octaves to white-hot
-  // (32×ref → 1.5). The reference itself (near-book P95) sits at 0.50 — low
-  // enough that ordinary depth stays dim and real walls stand out.
+  // field instead of cutting to black; above it, eight octaves to white-hot
+  // (256×ref → 1.5). The reference itself (near-book P95) sits at 0.50 — low
+  // enough that ordinary depth stays dim and aggregated walls stay distinct.
   const float l = std::log2(size / ref);
   float v = l < 0 ? 0.50f + l * (0.50f / 8.0f)
-                  : 0.50f + l * (1.00f / 5.0f);
+                  : 0.50f + l * (1.00f / 8.0f);
   return std::clamp(v, 0.0f, 1.5f);
+}
+
+float heatmapStrengthCeil(float size, float ceil) {
+  if (!(size > 0) || !(ceil > 0)) return 0;
+  const float l = std::log2(size / ceil);
+  return std::clamp(1.5f + l * (1.5f / 8.0f), 0.0f, 1.5f);
 }
 
 float heatmapSmoothRef(float previous, float sample) {
@@ -256,6 +369,15 @@ float heatmapSmoothRef(float previous, float sample) {
   return previous + (sample - previous) * rate;
 }
 
+float heatmapPercentileRef(const float* values, int n) {
+  if (!values || n < 1) return 0;
+  static thread_local std::vector<float> tmp;
+  tmp.assign(values, values + n);
+  std::sort(tmp.begin(), tmp.end());
+  size_t i = std::min(tmp.size() - 1, (size_t)(tmp.size() * 0.95));
+  return tmp[i];
+}
+
 float heatmapPercentileRef(const float* bid, const float* ask, int r0, int r1) {
   static thread_local std::vector<float> values;
   values.clear();
@@ -264,8 +386,5 @@ float heatmapPercentileRef(const float* bid, const float* ask, int r0, int r1) {
     float v = std::max(bid[r], ask[r]);
     if (v > 0) values.push_back(v);
   }
-  if (values.empty()) return 0;
-  std::sort(values.begin(), values.end());
-  size_t i = std::min(values.size() - 1, (size_t)(values.size() * 0.95));
-  return values[i];
+  return heatmapPercentileRef(values.data(), (int)values.size());
 }
