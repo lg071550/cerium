@@ -10,6 +10,8 @@
 #include "vwap_series.h"
 #include "tpo_profile.h"
 #include "drawings.h"
+#include "profile_cache.h"
+#include "geometry_cache.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -58,6 +60,7 @@ struct IndicatorInstance {
   int p0 = 0, p1 = 0, p2 = 0; // type-specific periods / volume mode
   int opt = 0;           // deviation / multiplier / volume intensity
   bool flag = true;      // guides / histogram / bands / DI / zero line
+  mutable ChartGeometryCache bodyGeometry, bandGeometry;
   PeriodLevels levels; // calendar opens, independent of oscillator series
   VwapSeed vwap; // closed-bar moments for constant-time forming-bar updates
   std::vector<float> series;
@@ -94,6 +97,9 @@ struct ChartPanel {
   void drawFlowPicker(Ui& u, Feeds& feeds);
   void drawToolPicker(Ui& u);
 private:
+  HtProfileCache m_htLiqCache, m_htSlCache;
+  VolumeProfileCache m_vpCache;
+  BookHeatCache m_heatCache;
   float scroll = 0; // bars scrolled back from the latest (fractional: drag pans sub-bar)
   std::vector<IndicatorInstance> m_panes;    // stacked below price, top → bottom
   std::vector<IndicatorInstance> m_overlays; // drawn on the price pane

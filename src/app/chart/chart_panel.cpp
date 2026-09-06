@@ -2000,8 +2000,11 @@ bool ChartPanel::updateLastBar(const Feeds& feeds) {
   const MarketSeries* mkt = &feeds.market;
   const size_t n = cs.v.size();
   if (n < 2 || !m_liveState) return false;
-  for (IndicatorInstance& inst : m_overlays) if (!updateInstanceLast(cs, inst, of, mkt)) return false;
-  for (IndicatorInstance& inst : m_panes) if (!updateInstanceLast(cs, inst, of, mkt)) return false;
+  // A model that needs historical reconciliation must not invalidate every
+  // other indicator's valid last-bar seed.
+  for (auto* group : {&m_overlays, &m_panes})
+    for (IndicatorInstance& inst : *group)
+      if (!updateInstanceLast(cs, inst, of, mkt)) computeInstance(cs, inst, of, mkt);
   return true;
 }
 
@@ -2730,7 +2733,7 @@ static void drawVwapLine(DrawList& d, const ChartPane& pane, const CandleSeries&
 // so near-pixel rows tile seamlessly instead of moiréing into stripes. The
 // live bar extends through the chart's right-margin space so the overlay
 // runs to the plot edge.
-static void drawBookHeat(DrawList& d, const HeatmapSeries& hs, const ChartPane& pane,
+static void drawBookHeat(DrawList& d, BookHeatCache& cache, const HeatmapSeries& hs, const ChartPane& pane,
                          int vis0, int vis1, float startF, float bw, float intensity,
                          double minUsd, double maxUsd, int cellY, float opacity,
                          const char* coin) {
@@ -2782,14 +2785,8 @@ static void drawBookHeat(DrawList& d, const HeatmapSeries& hs, const ChartPane& 
   // closed columns reuse their filled vectors across frames instead of
   // re-walking every gap each draw. Bounded by entry count — past the cap
   // the cache drops and refills lazily on subsequent frames.
-  struct FillCache {
-    int64_t ts = 0;
-    uint64_t mut = 0;
-    std::vector<int64_t> rows;
-    std::vector<float> heat;
-  };
-  static thread_local std::vector<FillCache> fillCache;
-  static thread_local size_t fillTotal = 0;
+  auto& fillCache = cache.columns;
+  auto& fillTotal = cache.total;
   constexpr size_t kFillCacheCap = 2u << 20; // ~2M filled rows ≈ 24MB
   if (fillCache.size() < hs.bars.size()) fillCache.resize(hs.bars.size());
   else if (fillCache.size() > hs.bars.size() + 4096) {
@@ -2810,7 +2807,7 @@ static void drawBookHeat(DrawList& d, const HeatmapSeries& hs, const ChartPane& 
       fillTotal = 0;
       fillCache.resize(hs.bars.size());
     }
-    FillCache& fc = fillCache[(size_t)bar];
+    BookHeatCache::Column& fc = fillCache[(size_t)bar];
     if (fc.ts != col.ts || fc.mut != col.mut) {
       fc.ts = col.ts;
       fc.mut = col.mut;
@@ -3181,7 +3178,8 @@ static void drawHeatShelves(DrawList& d, const std::vector<HeatmapBar>& bars,
     if (run0v[ui] >= 0) flush(ui, runLastV[ui]);
 }
 
-static float drawHtProfile(DrawList& d, const HtLayer& layer, const ChartPane& pane,
+static float drawHtProfile(DrawList& d, HtProfileCache& cache, uint64_t version,
+                           const HtLayer& layer, const ChartPane& pane,
                            float opacity, bool magma, float xRight) {
   const float maxW = 72.0f;
   if (layer.bands.empty() || pane.area.w < maxW + 40.0f) return 0;
@@ -3194,23 +3192,9 @@ static float drawHtProfile(DrawList& d, const HtLayer& layer, const ChartPane& p
   const int bn = bMax - bMin + 1;
   if (bn < 1 || bn > (int)pane.area.h + 64) return 0;
 
-  static thread_local std::vector<float> longs, shorts;
-  longs.assign((size_t)bn, 0.0f);
-  shorts.assign((size_t)bn, 0.0f);
-  for (const HtBand& b : layer.bands) {
-    if (b.hi <= pane.lo || b.lo >= pane.hi) continue;
-    float yTop = pane.yOf(b.hi), yBot = pane.yOf(b.lo);
-    if (!std::isfinite(yTop) || !std::isfinite(yBot)) continue;
-    if (yBot < yTop) std::swap(yBot, yTop);
-    yTop = std::max(yTop, paneTop);
-    yBot = std::min(yBot, paneBot);
-    int r0 = std::max(bMin, (int)std::floor(yTop / (float)cellY));
-    int r1 = std::min(bMax, (int)std::floor((yBot - 1e-3f) / (float)cellY));
-    for (int r = r0; r <= r1; ++r) {
-      longs[(size_t)(r - bMin)] = std::max(longs[(size_t)(r - bMin)], b.longUsd);
-      shorts[(size_t)(r - bMin)] = std::max(shorts[(size_t)(r - bMin)], b.shortUsd);
-    }
-  }
+  cache.update(layer, version, pane);
+  const auto& longs = cache.longs;
+  const auto& shorts = cache.shorts;
 
   float maxUsd = 0, pocUsd = 0;
   int pocRow = -1;
@@ -3258,7 +3242,7 @@ static float drawHtProfile(DrawList& d, const HtLayer& layer, const ChartPane& p
   return maxW;
 }
 
-static float drawVolumeProfile(DrawList& d, const ChartPane& pane,
+static float drawVolumeProfile(DrawList& d, VolumeProfileCache& cache, const ChartPane& pane,
                                const CandleSeries& cs, const OrderFlowSeries* of,
                                int vis0, int vis1, int mode, bool showVa,
                                Color buyC, Color sellC, float xRight) {
@@ -3289,7 +3273,8 @@ static float drawVolumeProfile(DrawList& d, const ChartPane& pane,
   int64_t r1 = (int64_t)std::ceil(hi / bin);
   int rows = (int)(r1 - r0 + 1);
   if (rows < 2 || rows > 1024) return 0;
-  static thread_local std::vector<double> buy, sell;
+  auto& buy = cache.buy;
+  auto& sell = cache.sell;
   // Fold cache. The accumulation over [a0..a1] only changes when the flow
   // window, the candle window, or the bin changes — none of which happens per
   // frame — so VpAll's walk over every retained print (up to hundreds of
@@ -3298,7 +3283,7 @@ static float drawVolumeProfile(DrawList& d, const ChartPane& pane,
   // plus the forming bar's mutable fields.
   const uint64_t ofKey =
       of ? (of->version * 1099511628211ull) ^ of->generation : 0;
-  uint64_t csKey = 0;
+  uint64_t csKey = cs.historyVersion;
   for (double v : {cs.v.front().ts, cs.v.back().ts, cs.v.back().h, cs.v.back().l,
                    barVolume(cs.v.back()), cs.v.back().delta}) {
     uint64_t b;
@@ -3306,22 +3291,10 @@ static float drawVolumeProfile(DrawList& d, const ChartPane& pane,
     memcpy(&b, &v, sizeof(b));
     csKey = (csKey ^ b) * 1099511628211ull;
   }
-  struct FoldKey {
-    int mode, a0, a1, rows;
-    int64_t r0;
-    double bin;
-    uint64_t ofKey, csKey;
-    bool operator==(const FoldKey& o) const {
-      return mode == o.mode && a0 == o.a0 && a1 == o.a1 && rows == o.rows &&
-             r0 == o.r0 && bin == o.bin && ofKey == o.ofKey && csKey == o.csKey;
-    }
-  };
-  const FoldKey key{mode, a0, a1, rows, r0, bin, ofKey, csKey};
-  static thread_local FoldKey foldKey{};
-  static thread_local bool foldValid = false;
-  if (!foldValid || !(key == foldKey)) {
-    foldKey = key;
-    foldValid = true;
+  const VolumeProfileCache::Key key{mode, a0, a1, rows, r0, bin, ofKey, csKey};
+  if (!cache.valid || !(key == cache.key)) {
+    cache.key = key;
+    cache.valid = true;
     buy.assign((size_t)rows, 0);
     sell.assign((size_t)rows, 0);
     auto add = [&](double price, double qty, uint8_t side) {
@@ -3532,9 +3505,7 @@ static void htAgeText(char* out, size_t n, double fetchedAt) {
 }
 
 static double htLayerUsd(const HtLayer& layer) {
-  double tot = 0;
-  for (const HtBand& b : layer.bands) tot += (double)b.longUsd + (double)b.shortUsd;
-  return tot;
+  return layer.totalUsd;
 }
 
 static bool hlMapStatus(const IndicatorInstance& inst, const Feeds& feeds,
@@ -4978,7 +4949,7 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
     const char* coin = (feeds.symbol >= 0 && feeds.symbol < symbols::kCount)
                            ? symbols::kNames[feeds.symbol]
                            : nullptr;
-    drawBookHeat(u.draw, m_bookHeat, ctx.price, ctx.vis0, ctx.vis1, ctx.startF,
+    drawBookHeat(u.draw, m_heatCache, m_bookHeat, ctx.price, ctx.vis0, ctx.vis1, ctx.startF,
                  ctx.bw, m_heatIntensity,
                  heatMinUsdForSel(m_heatMinSel),
                  heatMaxUsdForSel(m_heatMaxSel),
@@ -5061,90 +5032,94 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       if (inst.reg != IndVwap || !inst.seriesVisible || !inst.flag ||
           inst.aux.size() != inst.series.size())
         continue;
-      // σ bands are linear in k: aux/aux2 hold ±1σ, selected multiples scale
-      // the distance from the line. Fills fade with k; each drawn band gets a
-      // 1px edge like Bollinger's.
-      int sigMask = (inst.opt & 7) ? (inst.opt & 7) : 1;
-      int maxK = (sigMask & 4) ? 3 : (sigMask & 2) ? 2 : 1;
-      static thread_local std::vector<float> bx, bTop, bBot;
-      for (int k = 1; k <= maxK; ++k) {
-        if (!(sigMask & (1 << (k - 1)))) continue;
-        float scale = (float)k;
-        Color band = indPalette(k == 1 ? inst.colorB : k == 2 ? inst.colorD : inst.colorE);
-        float fillA = k == 1 ? 0.10f : k == 2 ? 0.06f : 0.045f;
-        // Same x as drawVwapLine (candle centers) and the same UTC-day
-        // breaks, so the fill and the line share an endpoint instead of
-        // the midline poking a half-bar past a left-edge band.
-        auto flushBand = [&]() {
-          if (bx.size() >= 2) {
-            u.draw.seriesBand(bx.data(), bTop.data(), bBot.data(),
-                              (int)bx.size(), withAlpha(band, fillA));
-            static thread_local std::vector<float> exy;
-            for (int side = 0; side < 2; ++side) {
-              exy.clear();
-              for (size_t j = 0; j < bx.size(); ++j) {
-                exy.push_back(bx[j]);
-                exy.push_back(side ? bBot[j] : bTop[j]);
+      inst.bandGeometry.draw(u.draw, chartGeometryKey(m_computedSig, m_calcGen,
+          ctx.price, u.draw.currentClip(), ctx.vis0, ctx.vis1, ctx.startF, ctx.bw),
+          [&](DrawList& bandDraw) {
+          // σ bands are linear in k: aux/aux2 hold ±1σ, selected multiples scale
+          // the distance from the line. Fills fade with k; each drawn band gets a
+          // 1px edge like Bollinger's.
+          int sigMask = (inst.opt & 7) ? (inst.opt & 7) : 1;
+          int maxK = (sigMask & 4) ? 3 : (sigMask & 2) ? 2 : 1;
+          static thread_local std::vector<float> bx, bTop, bBot;
+          for (int k = 1; k <= maxK; ++k) {
+            if (!(sigMask & (1 << (k - 1)))) continue;
+            float scale = (float)k;
+            Color band = indPalette(k == 1 ? inst.colorB : k == 2 ? inst.colorD : inst.colorE);
+            float fillA = k == 1 ? 0.10f : k == 2 ? 0.06f : 0.045f;
+            // Same x as drawVwapLine (candle centers) and the same UTC-day
+            // breaks, so the fill and the line share an endpoint instead of
+            // the midline poking a half-bar past a left-edge band.
+            auto flushBand = [&]() {
+              if (bx.size() >= 2) {
+                bandDraw.seriesBand(bx.data(), bTop.data(), bBot.data(),
+                                  (int)bx.size(), withAlpha(band, fillA));
+                static thread_local std::vector<float> exy;
+                for (int side = 0; side < 2; ++side) {
+                  exy.clear();
+                  for (size_t j = 0; j < bx.size(); ++j) {
+                    exy.push_back(bx[j]);
+                    exy.push_back(side ? bBot[j] : bTop[j]);
+                  }
+                  bandDraw.polyline(exy.data(), (int)(exy.size() / 2),
+                                  withAlpha(band, 0.5f), 1.0f);
+                }
               }
-              u.draw.polyline(exy.data(), (int)(exy.size() / 2),
-                              withAlpha(band, 0.5f), 1.0f);
+              bx.clear();
+              bTop.clear();
+              bBot.clear();
+            };
+            int64_t day = std::numeric_limits<int64_t>::min();
+            for (int i = ctx.vis0; i <= ctx.vis1 && i < (int)inst.series.size() &&
+                                   i < (int)cs.v.size();
+                 ++i) {
+              float mid = inst.series[(size_t)i];
+              float up = inst.aux[(size_t)i], dn = inst.aux2[(size_t)i];
+              if (std::isnan(mid) || std::isnan(up) || std::isnan(dn)) {
+                flushBand();
+                continue;
+              }
+              int64_t d = vwapSession(cs.v[(size_t)i].ts, inst.p0);
+              if (d != day) {
+                flushBand();
+                day = d;
+              }
+              float dist = up - mid;
+              if (std::isnan(dist)) {
+                flushBand();
+                continue;
+              }
+              bx.push_back(ctx.xOf(i) + ctx.bw * 0.5f);
+              bTop.push_back(ctx.price.yOf(mid + dist * scale));
+              bBot.push_back(ctx.price.yOf(mid - dist * scale));
             }
-          }
-          bx.clear();
-          bTop.clear();
-          bBot.clear();
-        };
-        int64_t day = std::numeric_limits<int64_t>::min();
-        for (int i = ctx.vis0; i <= ctx.vis1 && i < (int)inst.series.size() &&
-                               i < (int)cs.v.size();
-             ++i) {
-          float mid = inst.series[(size_t)i];
-          float up = inst.aux[(size_t)i], dn = inst.aux2[(size_t)i];
-          if (std::isnan(mid) || std::isnan(up) || std::isnan(dn)) {
             flushBand();
-            continue;
           }
-          int64_t d = vwapSession(cs.v[(size_t)i].ts, inst.p0);
-          if (d != day) {
-            flushBand();
-            day = d;
-          }
-          float dist = up - mid;
-          if (std::isnan(dist)) {
-            flushBand();
-            continue;
-          }
-          bx.push_back(ctx.xOf(i) + ctx.bw * 0.5f);
-          bTop.push_back(ctx.price.yOf(mid + dist * scale));
-          bBot.push_back(ctx.price.yOf(mid - dist * scale));
-        }
-        flushBand();
-      }
 
-      // Session-end ticks: a 1px hairline where each UTC segment ends,
-      // spanning the widest drawn band on both sides of the line.
-      static thread_local std::vector<float> tickYs;
-      tickYs.clear();
-      int64_t prevDay = std::numeric_limits<int64_t>::min();
-      for (int i = std::max(ctx.vis0, 1);
-           i <= ctx.vis1 && i < (int)inst.series.size() && i < (int)cs.v.size();
-           ++i) {
-        float mid = inst.series[(size_t)i];
-        float up = inst.aux[(size_t)i], dn = inst.aux2[(size_t)i];
-        if (std::isnan(mid) || std::isnan(up) || std::isnan(dn)) continue;
-        int64_t dday = vwapSession(cs.v[(size_t)i].ts, inst.p0);
-        if (prevDay != std::numeric_limits<int64_t>::min() && dday != prevDay &&
-            tickYs.size() >= 2) {
-          float x = ctx.xOf(i - 1) + ctx.bw * 0.5f;
-          u.draw.rect({x, tickYs[0], 1.0f, tickYs[1] - tickYs[0]},
-                      withAlpha(t.border, 0.55f));
-        }
-        prevDay = dday;
-        float dist = up - mid;
-        tickYs.clear();
-        tickYs.push_back(ctx.price.yOf(mid + dist * (float)maxK));
-        tickYs.push_back(ctx.price.yOf(mid - dist * (float)maxK));
-      }
+          // Session-end ticks: a 1px hairline where each UTC segment ends,
+          // spanning the widest drawn band on both sides of the line.
+          static thread_local std::vector<float> tickYs;
+          tickYs.clear();
+          int64_t prevDay = std::numeric_limits<int64_t>::min();
+          for (int i = std::max(ctx.vis0, 1);
+               i <= ctx.vis1 && i < (int)inst.series.size() && i < (int)cs.v.size();
+               ++i) {
+            float mid = inst.series[(size_t)i];
+            float up = inst.aux[(size_t)i], dn = inst.aux2[(size_t)i];
+            if (std::isnan(mid) || std::isnan(up) || std::isnan(dn)) continue;
+            int64_t dday = vwapSession(cs.v[(size_t)i].ts, inst.p0);
+            if (prevDay != std::numeric_limits<int64_t>::min() && dday != prevDay &&
+                tickYs.size() >= 2) {
+              float x = ctx.xOf(i - 1) + ctx.bw * 0.5f;
+              bandDraw.rect({x, tickYs[0], 1.0f, tickYs[1] - tickYs[0]},
+                          withAlpha(t.border, 0.55f));
+            }
+            prevDay = dday;
+            float dist = up - mid;
+            tickYs.clear();
+            tickYs.push_back(ctx.price.yOf(mid + dist * (float)maxK));
+            tickYs.push_back(ctx.price.yOf(mid - dist * (float)maxK));
+          }
+      });
     }
   }
 
@@ -5573,7 +5548,7 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       switch (ri) {
         case IndVp:
           w = drawVolumeProfile(
-              u.draw, ctx.price, cs, &feeds.orderFlow, ctx.vis0, ctx.vis1, o->p0,
+              u.draw, m_vpCache, ctx.price, cs, &feeds.orderFlow, ctx.vis0, ctx.vis1, o->p0,
               o->flag, indPalette(o->colorA), indPalette(o->colorB), xRight);
           break;
         case IndLiqMap:
@@ -5587,8 +5562,9 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
           bool liq = ri == IndHlLiq;
           const HtLayer& layer = liq ? feeds.ht.liq : feeds.ht.sl;
           float op = std::clamp((float)o->opt / 100.0f, 0.10f, 1.0f);
-          w = drawHtProfile(u.draw, layer, ctx.price, op, !liq, xRight);
-          if (w > 0) {
+          w = drawHtProfile(u.draw, liq ? m_htLiqCache : m_htSlCache, feeds.ht.version,
+                            layer, ctx.price, op, !liq, xRight);
+          if (w > 0 && u.hovered({xRight - w, ctx.price.area.y, w, ctx.price.area.h})) {
             char* tipBuf = liq ? liqTip : slTip;
             htProfileTip(tipBuf, 192, liq ? "LIQ" : "SL", layer, ctx.lastC);
             u.tip(u.id(liq ? "hl-liq-profile" : "hl-sl-profile"),
@@ -5721,8 +5697,12 @@ bool ChartPanel::drawIndicatorPanes(Ui& u, Feeds& feeds, PlotCtx& ctx) {
 
     if (ctx.rangeOk[p]) {
       u.draw.pushClip(pane.area);
-      drawPaneBody(u.draw, pane, cs, inst, ctx.vis0, ctx.vis1, ctx.startF,
-                   ctx.bw, &feeds.market);
+      inst.bodyGeometry.draw(u.draw, chartGeometryKey(m_computedSig, m_calcGen,
+          pane, u.draw.currentClip(), ctx.vis0, ctx.vis1, ctx.startF, ctx.bw),
+          [&](DrawList& bodyDraw) {
+            drawPaneBody(bodyDraw, pane, cs, inst, ctx.vis0, ctx.vis1, ctx.startF,
+                         ctx.bw, &feeds.market);
+          });
       u.draw.popClip();
     }
 

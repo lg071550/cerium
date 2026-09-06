@@ -4,6 +4,7 @@
 
 static void loadLayer(HtLayer& layer, const double* rows, int n, double at, float ref) {
   layer.bands.clear();
+  layer.totalUsd = 0;
   layer.fetchedAt = at;
   layer.ref = ref > 0 ? ref : 1;
   if (!rows || n <= 0) return;
@@ -14,6 +15,7 @@ static void loadLayer(HtLayer& layer, const double* rows, int n, double at, floa
     b.hi = (float)rows[i * 4 + 1];
     b.longUsd = (float)rows[i * 4 + 2];
     b.shortUsd = (float)rows[i * 4 + 3];
+    layer.totalUsd += (double)b.longUsd + (double)b.shortUsd;
   }
 }
 

@@ -1,79 +1,62 @@
 # cerium
 
-Browser-based crypto orderflow terminal. C++20 compiled to WebAssembly with a
-custom WebGPU renderer and a custom immediate-mode UI toolkit — no DOM UI, no
-framework, no backend.
+A browser-based crypto orderflow terminal. Built with C++20, WebAssembly and
+[Lanthanum](https://github.com/lg071550/lanthanum), with WebGPU rendering and
+TypeScript market-data workers.
 
-## Status
+- Candles, custom timeframes, tick and volume bars, and footprints.
+- TPO profiles with split view, value area, POC, single prints and tails.
+- DOM, order books, trade tape and aggregated liquidations.
+- VWAP, CVD, open interest, calendar levels and other indicators.
+- Chart drawings, dockable panels and saved layouts.
+- 27 exchange adapters; BTC, ETH and SOL coverage varies by venue.
 
-Data plane phase: live Binance USDT-M perp feeds (depth + trades) stream from a
-Web Worker over a SharedArrayBuffer binary ring into WASM-side books; the
-Orderbook and Tape panels render real market data. Render core, UI toolkit, and
-docking workspace as before. Next: venue fan-out (the aggbook adapter set),
-merged book, symbol switching.
+Exchange feeds connect directly from the browser. No Cerium account is needed.
+Optional HyperTracker overlays require a provider token.
 
-## Requirements
+## Build and run
 
-- Windows: Git Bash (or any POSIX-y shell)
-- Everything else is vendored into `tools/` (see below)
-
-## Setup
-
-The toolchain is local to this repo (~2 GB, gitignored). To reproduce:
+The build script currently targets Windows with Git Bash. Install Git, Node.js,
+npm and Python, then:
 
 ```sh
-# 1. standalone python (bootstrap for emsdk) → tools/python
-#    https://github.com/astral-sh/python-build-standalone (cpython-*-windows-msvc-install_only)
+git clone --recurse-submodules https://github.com/lg071550/cerium.git
+cd cerium
 
-# 2. emscripten sdk → tools/emsdk
-git clone --depth 1 https://github.com/emscripten-core/emsdk.git tools/emsdk
-tools/python/python.exe tools/emsdk/emsdk.py install latest
-tools/python/python.exe tools/emsdk/emsdk.py activate latest
+git clone https://github.com/emscripten-core/emsdk.git tools/emsdk
+python tools/emsdk/emsdk.py install 6.0.6
+python tools/emsdk/emsdk.py activate 6.0.6
 
-# 3. esbuild binary → tools/esbuild
-#    https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-<ver>.tgz
-#    extract so that tools/esbuild/esbuild.exe exists
+npm install --prefix tools/esbuild --no-save @esbuild/win32-x64@0.28.2
+cp tools/esbuild/node_modules/@esbuild/win32-x64/esbuild.exe tools/esbuild/esbuild.exe
+
+bash build.sh
+node tools/serve.mjs 8788
 ```
 
-Note: `emsdk.bat` hardcodes its own python discovery and this machine has no
-system python — always invoke `emsdk.py` via `tools/python/python.exe`.
+Open [localhost:8788](http://localhost:8788) in Chrome or Edge with WebGPU enabled.
+Use `bash build.sh dev` for a debug build. Existing clones can fetch the renderer
+with `git submodule update --init --recursive`.
 
-## Build & run
+The server supplies the COOP/COEP headers required for SharedArrayBuffer.
+Other hosts must provide equivalent cross-origin isolation.
 
-```sh
-bash build.sh          # bundles feeds worker + release wasm;  bash build.sh dev for debug
-node tools/serve.mjs   # → http://localhost:8788 (sets COOP/COEP for SharedArrayBuffer)
-```
+## Data
 
-Open in Chrome or Edge (WebGPU required). Drag tabs between panels / to panel
-or workspace edges to split; drag splitters to resize; layout persists in
-localStorage (`cerium.layout.v1`).
+Historical candles and footprint bootstrap use Binance USD-M data. Live
+orderflow can combine selected venues. Availability depends on venue support,
+connectivity and regional restrictions.
 
-Headless verification screenshot (no deps, drives Chrome via CDP):
+Charts retain 2,000 candles; footprints retain up to 320,000 aggregate prints.
+Older candles can fall outside loaded tick history. Cold history loads may take
+minutes. DOM queue tiles are inferred from L2 changes, not market-by-order data.
 
-```sh
-node tools/shoot.mjs http://localhost:8788 build/shot.png 8000
-```
+## Renderer
 
-## Layout
+Lanthanum handles quads, lines and text. Its reproducible
+[benchmarks](third_party/lanthanum/bench/README.md) compare the renderer with
+Dear ImGui; they do not measure the complete trading terminal.
 
-```
-feeds/                  feeds worker (TS, bundled by esbuild)
-  main.ts               worker bootstrap + venue registry + command poller
-  wire.ts               SPSC binary ring writer over SharedArrayBuffer
-  venues/               exchange adapters (vendored from aggbook)
-src/
-  main.cpp              entry + frame loop
-  platform/             canvas/DPI/localStorage/cursor shell, input hooks
-  gpu/wgpu_context.*    WebGPU instance/surface/device (version-sensitive API here)
-  render/               pipelines, instanced quad + text batches, glyph atlas, renderer
-  ui/                   theme, draw list, immediate-mode context, widgets
-  dock/                 split/leaf tree, tab drag/drop state machine, JSON layout
-  data/                 wire events, L2 book, tape ring, venue registry, JS bridge
-  app/terminal.*        top bar, panel registry, panels
-third_party/stb/        stb_truetype
-assets/fonts/           IBM Plex Mono (OFL, see OFL.txt)
-```
+## License
 
-All coordinates in UI code are logical (CSS) px; the renderer scales by
-devicePixelRatio. Text is rasterized at physical resolution.
+[MIT](LICENSE). See [THIRD_PARTY.md](THIRD_PARTY.md) for dependency and font notices.

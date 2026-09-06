@@ -14,6 +14,7 @@ struct HtBand {
 
 struct HtLayer {
   std::vector<HtBand> bands;
+  double totalUsd = 0;  // accumulated when the snapshot changes, not per frame
   double fetchedAt = 0; // unix ms
   float ref = 1;        // p95 cell notional for heat ramps
 };

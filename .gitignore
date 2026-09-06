@@ -22,3 +22,11 @@ harness.next.exe
 *.swp
 .DS_Store
 Thumbs.db
+
+# local audits, tests and diagnostics
+/AGENTS.md
+/docs/
+/tools/*
+!/tools/check-venues.mjs
+!/tools/serve.mjs
+/feeds/smoke.ts
