@@ -1,6 +1,7 @@
 #include "orderflow.h"
 
 #include <algorithm>
+#include <cmath>
 
 void OrderFlowSeries::load(const double* data, int n, Timeframe tf_, int symIdx,
                            bool prepend) {
@@ -11,15 +12,19 @@ void OrderFlowSeries::load(const double* data, int n, Timeframe tf_, int symIdx,
   in.reserve((size_t)n);
   for (int i = 0; i < n; ++i) {
     const double* row = data + (size_t)i * 4;
-    if (!(row[0] > 0) || !(row[1] > 0) || !(row[2] > 0)) continue;
+    if (!(row[0] > 0) || !(row[1] > 0) || !(row[2] > 0) ||
+        !std::isfinite(row[0]) || !std::isfinite(row[1]) || !std::isfinite(row[2]) ||
+        (row[3] != 0 && row[3] != 1)) continue;
     in.push_back({row[0], row[1], row[2], (uint8_t)(row[3] != 0)});
   }
   if (in.empty()) return;
 
   if (prepend && !v.empty()) {
+    // Worker prepends disjoint ID ranges. Distinct trades at the seam can
+    // share a millisecond timestamp; strict timestamp comparison lost them.
     double front = v.front().ts;
     size_t keep = 0;
-    while (keep < in.size() && in[keep].ts < front) ++keep;
+    while (keep < in.size() && in[keep].ts <= front) ++keep;
     if (keep == 0) return;
     size_t room = v.size() < MAX_TRADES ? MAX_TRADES - v.size() : 0;
     if (room == 0) return;

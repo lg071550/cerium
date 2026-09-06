@@ -204,7 +204,8 @@ export class OkxBookAdapter implements VenueAdapter {
       return;
     }
 
-    if (this.lastSeq !== null && parsed.prevSeqId !== this.lastSeq) {
+    if(this.lastSeq===null) return;
+    if (parsed.prevSeqId !== this.lastSeq) {
       this.resync(`seq gap: expected prev ${this.lastSeq}, got ${parsed.prevSeqId}`);
       return;
     }

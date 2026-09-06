@@ -23,6 +23,16 @@ PeriodLevels computePeriodLevels(const CandleSeries& candles) {
   const auto at = [&](sys_days start) {
     PeriodOpen open;
     open.startMs = (double)duration_cast<milliseconds>(start.time_since_epoch()).count();
+    const auto daily = std::lower_bound(candles.calendarOpens.begin(), candles.calendarOpens.end(), open.startMs,
+        [](const auto& row, double ts) { return row[0] < ts; });
+    if (daily != candles.calendarOpens.end() && (*daily)[0] == open.startMs &&
+        std::isfinite((*daily)[1]) && (*daily)[1] > 0) {
+      open.price = (*daily)[1];
+      const auto bar = std::upper_bound(candles.v.begin(), candles.v.end(), open.startMs,
+          [](double ts, const Candle& c) { return ts < c.ts; });
+      open.bar = std::max(0, (int)(bar - candles.v.begin()) - 1);
+      return open;
+    }
     const auto it = std::lower_bound(candles.v.begin(), candles.v.end(), open.startMs,
         [](const Candle& candle, double ts) { return candle.ts < ts; });
     if (it != candles.v.end() && it->ts == open.startMs &&

@@ -195,6 +195,7 @@ export class GateBaseAdapter implements VenueAdapter {
 
   private teardown(): void {
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -227,6 +228,7 @@ export class GateBaseAdapter implements VenueAdapter {
 
     if (this.lastU === null) return;
     if (parsed.u <= this.lastU) return;
+    if(parsed.U!==this.lastU+1) {this.resync(`depth gap: expected ${this.lastU+1}, got ${parsed.U}`);return;}
     this.deps.book.applyUpdates(parsed.updates);
     this.lastU = parsed.u;
   }

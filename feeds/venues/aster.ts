@@ -148,6 +148,7 @@ export class AsterAdapter implements VenueAdapter {
     this.abortController?.abort();
     this.abortController = null;
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -178,6 +179,7 @@ export class AsterAdapter implements VenueAdapter {
     if (!ev) return;
 
     if (this.state.mode === "buffering") {
+      if(this.buffer.length>=2000) {this.resync("snapshot buffer overflow"); return;}
       this.buffer.push(ev);
       return;
     }
@@ -213,7 +215,7 @@ export class AsterAdapter implements VenueAdapter {
 
     let snap: FuturesSnapshot;
     try {
-      const res = await fetch(this.restUrl, { signal: abort.signal });
+      const res = await fetch(this.restUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15000)]) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = parseSnapshotResponse(await res.json());
       if (!data) throw new Error("malformed snapshot");
@@ -305,10 +307,11 @@ export class AsterAdapter implements VenueAdapter {
     this.abortController?.abort();
     this.abortController = null;
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
-      if (this.ws.readyState === WebSocket.OPEN) this.ws.close();
+      this.ws.close();
       this.ws = null;
     }
     this.state = { updateId: 0, mode: "buffering" };
@@ -326,8 +329,8 @@ export class AsterAdapter implements VenueAdapter {
     this.abortController = abort;
     try {
       const [depthResponse, tradesResponse] = await Promise.all([
-        fetch(this.fallbackDepthUrl, { signal: abort.signal }),
-        fetch(this.fallbackTradesUrl, { signal: abort.signal }),
+        fetch(this.fallbackDepthUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15000)]) }),
+        fetch(this.fallbackTradesUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15000)]) }),
       ]);
       if (!depthResponse.ok) throw new Error(`depth HTTP ${depthResponse.status}`);
       if (!tradesResponse.ok) throw new Error(`trades HTTP ${tradesResponse.status}`);
@@ -368,7 +371,7 @@ export class AsterAdapter implements VenueAdapter {
       );
     } finally {
       if (this.abortController === abort) this.abortController = null;
-      if (this.conn.isRunning && this.fallbackActive) {
+      if (!abort.signal.aborted && this.conn.isRunning && this.fallbackActive) {
         // A plain 1006 close must not demote this venue to REST polling
         // forever — every ~30 polls, leave the loop and retry the WebSocket
         // through Reconnect.

@@ -139,6 +139,7 @@ export class BitstampAdapter implements VenueAdapter {
     this.abortController?.abort();
     this.abortController = null;
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -170,6 +171,7 @@ export class BitstampAdapter implements VenueAdapter {
 
     if (this.buffer) {
 
+      if(this.buffer.length>=2000) {this.resync("snapshot buffer overflow"); return;}
       this.buffer.push(diff);
       return;
     }
@@ -185,7 +187,7 @@ export class BitstampAdapter implements VenueAdapter {
 
     let snap: BitstampSnapshot;
     try {
-      const res = await fetch(this.restUrl, { signal: abort.signal });
+      const res = await fetch(this.restUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15000)]) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = parseBitstampSnapshot(await res.json());
       if (!data) throw new Error("malformed snapshot");

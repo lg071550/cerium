@@ -10,14 +10,14 @@ export type ParsedKrakenPerp =
   | { kind: "update"; seq: number; update: L2Update }
   | null;
 
-export function parseKrakenPerp(msg: unknown): ParsedKrakenPerp {
+export function parseKrakenPerp(msg: unknown, inverse = true): ParsedKrakenPerp {
   if (!isRecord(msg)) return null;
 
   if (msg.feed === "book_snapshot") {
     const seq = safeInteger(msg.seq);
     if (seq === null) return null;
-    const bids = levels(msg.bids);
-    const asks = levels(msg.asks);
+    const bids = levels(msg.bids, inverse);
+    const asks = levels(msg.asks, inverse);
     if (!bids || !asks) return null;
     return { kind: "snapshot", seq, bids, asks };
   }
@@ -38,13 +38,13 @@ export function parseKrakenPerp(msg: unknown): ParsedKrakenPerp {
     if (msg.side !== "buy" && msg.side !== "sell") return null;
     const side = msg.side === "buy" ? "bid" : "ask";
 
-    return { kind: "update", seq, update: { side, price, size: qty / price } };
+    return { kind: "update", seq, update: { side, price, size: inverse ? qty / price : qty } };
   }
 
   return null;
 }
 
-function levels(v: unknown): PriceLevel[] | null {
+function levels(v: unknown, inverse: boolean): PriceLevel[] | null {
   if (!Array.isArray(v)) return null;
   const out: PriceLevel[] = [];
   for (const row of v) {
@@ -54,12 +54,12 @@ function levels(v: unknown): PriceLevel[] | null {
     if (!Number.isFinite(row.price) || !Number.isFinite(row.qty) || row.price <= 0 || row.qty < 0) {
       return null;
     }
-    out.push({ price: row.price, size: row.qty / row.price });
+    out.push({ price: row.price, size: inverse ? row.qty / row.price : row.qty });
   }
   return out;
 }
 
-export function parseKrakenPerpTrades(msg: unknown): TradePrint[] | null {
+export function parseKrakenPerpTrades(msg: unknown, inverse = true): TradePrint[] | null {
   if (!isRecord(msg)) return null;
   if (msg.feed !== "trade") return null;
   const price = typeof msg.price === "number" ? msg.price : null;
@@ -76,7 +76,7 @@ export function parseKrakenPerpTrades(msg: unknown): TradePrint[] | null {
     qty <= 0
   ) return null;
   if (msg.side !== "buy" && msg.side !== "sell") return null;
-  return [{ price, size: qty / price, side: msg.side, ts: time }];
+  return [{ price, size: inverse ? qty / price : qty, side: msg.side, ts: time }];
 }
 
 export class KrakenPerpAdapter implements VenueAdapter {
@@ -140,6 +140,7 @@ export class KrakenPerpAdapter implements VenueAdapter {
       this.pingTimer = null;
     }
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -157,14 +158,14 @@ export class KrakenPerpAdapter implements VenueAdapter {
     } catch {
       return;
     }
-    const parsed = parseKrakenPerp(raw);
+    const parsed = parseKrakenPerp(raw, this.symbol.startsWith("PI_"));
     if (!parsed) {
       if (isRecord(raw) && raw.feed === "heartbeat") {
 
         this.deps.book.noteActivity();
       } else {
 
-        const prints = parseKrakenPerpTrades(raw);
+        const prints = parseKrakenPerpTrades(raw, this.symbol.startsWith("PI_"));
         if (prints) this.deps.onTrade?.(prints);
       }
       return;

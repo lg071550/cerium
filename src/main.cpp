@@ -14,7 +14,6 @@ static Terminal g_terminal;
 static bool g_termInited = false;
 static double g_last = 0;
 static double g_lastRender = 0;
-static float g_lastMX = -1, g_lastMY = -1;
 
 // --- perf window (1s rolling): CPU-side frame cost attribution -------------
 static double g_accFeed = 0, g_accUi = 0, g_accRender = 0;
@@ -45,6 +44,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE double cerium_perf(int i) {
     case 13: return (double)g_terminal.feeds.orderFlow.v.size();
     case 14: return (double)g_terminal.feeds.candles.tf.kind;
     case 15: return g_terminal.feeds.candles.tf.value;
+    case 16: return g_terminal.uncappedFps ? 1 : 0;
     default: return 0;
   }
 }
@@ -99,18 +99,9 @@ static bool frame() {
   int applied = g_terminal.feeds.frame();
   double tFeed1 = emscripten_performance_now();
 
-  // on-demand rendering: skip the GPU submit when nothing could have changed
-  bool inputEdge = in.pressed || in.released || in.dblClick || in.rightPressed ||
-                   in.rightReleased || in.wheelY != 0 || in.wheelX != 0 ||
-                   in.keyCount > 0 || in.escapePressed;
-  bool moved = in.mouseX != g_lastMX || in.mouseY != g_lastMY;
-  g_lastMX = in.mouseX;
-  g_lastMY = in.mouseY;
-  bool heartbeat = (now - g_lastRender) > 250.0; // fps text + time-driven widgets
-
-  bool busy = applied > 0 || inputEdge || moved || heartbeat ||
-             g_terminal.drag.active;
-  if (busy) {
+  // AUTO is display-paced: frameTick invokes one render for every rAF.
+  // The optional MessageChannel invokes additional frames only in uncapped mode.
+  {
     double tUi0 = emscripten_performance_now();
     float uiDt = g_lastRender > 0 ? (float)((now - g_lastRender) / 1000.0) : dt;
     g_terminal.frame(in, dt, uiDt, s.cssW, s.cssH);
@@ -142,7 +133,6 @@ static bool frame() {
     g_winEvents += applied;
     g_lastRender = now;
   }
-  ++g_winRaf;
   if (g_winStart <= 0) g_winStart = now;
   if (now - g_winStart >= 1000.0) { // close the 1s window
     double sec = (now - g_winStart) / 1000.0;
@@ -158,13 +148,38 @@ static bool frame() {
   }
 
   input_end_frame();
-  return busy;
+  return true;
 }
 
-// Dawn's browser surface presents implicitly when the requestAnimationFrame
-// callback returns. GPU submits from MessageChannel/timer tasks never reach
-// the canvas, so the render loop must remain rAF-owned.
-static void frameTick() { (void)frame(); }
+// Keep the display callback for browser presentation, and allow additional
+// render submissions between display frames when the user enables uncapped mode.
+// One queued message at a time yields to input, workers and the compositor.
+EM_JS(void, cerium_queue_fast_frame, (), {
+  if (document.hidden) return;
+  if (!Module.ceriumFastChannel) {
+    const channel = new MessageChannel();
+    Module.ceriumFastChannel = channel;
+    Module.ceriumFastPending = false;
+    channel.port1.onmessage = function() {
+      Module.ceriumFastPending = false;
+      if (!document.hidden) Module._cerium_fast_frame();
+    };
+  }
+  if (!Module.ceriumFastPending) {
+    Module.ceriumFastPending = true;
+    Module.ceriumFastChannel.port2.postMessage(0);
+  }
+});
+extern "C" EMSCRIPTEN_KEEPALIVE void cerium_fast_frame() {
+  if (!g_termInited || !g_terminal.uncappedFps) return;
+  (void)frame();
+  if (g_terminal.uncappedFps) cerium_queue_fast_frame();
+}
+static void frameTick() {
+  ++g_winRaf;
+  (void)frame();
+  if (g_termInited && g_terminal.uncappedFps) cerium_queue_fast_frame();
+}
 
 int main() {
   input_install_hooks();

@@ -3,6 +3,8 @@
 #include "feeds.h"
 
 #include <cstdint>
+#include <array>
+#include <queue>
 #include <unordered_map>
 #include <vector>
 
@@ -88,9 +90,24 @@ private:
   std::unordered_map<int64_t, size_t> m_index;
   std::unordered_map<int64_t, DomFlow> m_flow;
   std::unordered_map<int64_t, DomChange> m_changes;
-  size_t m_flowHead = (size_t)-1;
-  size_t m_flowCount = (size_t)-1;
+  uint64_t m_flowRevision = ~0ull;
   uint64_t m_flowSourceSignature = ~0ull;
+  uint64_t m_flowResetRevision = ~0ull;
+  std::array<bool, 64> m_flowAllowed{};
+  std::array<double, 64> m_flowScales{};
+  // Retain raw venue/price totals so normalization and grouping changes only
+  // revisit distinct prices, not every print in the five-minute window.
+  struct RawFlow : DomFlow { size_t buyCount = 0, sellCount = 0; };
+  std::array<std::unordered_map<double, RawFlow>, 64> m_rawFlow, m_rawHits;
+  struct FlowPrint {
+    double expires, price, qty;
+    uint8_t venue;
+    bool buy;
+    bool operator<(const FlowPrint& other) const { return expires > other.expires; }
+  };
+  std::priority_queue<FlowPrint> m_flowExpiry, m_hitExpiry;
+  double m_hitClockOffset = 0, m_lastHitOrigin = 0;
+  double m_futureRetry = INFINITY;
   int m_flowVenue = -2;
   uint32_t m_flowMask = 0;
   double m_flowStep = 0, m_flowWindow = 0, m_flowNextExpiry = -1;

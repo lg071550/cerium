@@ -77,6 +77,7 @@ export class BinanceAdapter implements VenueAdapter {
     this.abortController?.abort();
     this.abortController = null;
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -100,6 +101,7 @@ export class BinanceAdapter implements VenueAdapter {
 
     if (this.state.mode === "buffering") {
 
+      if(this.buffer.length>=2000) {this.resync("snapshot buffer overflow"); return;}
       this.buffer.push(ev);
       return;
     }
@@ -126,7 +128,7 @@ export class BinanceAdapter implements VenueAdapter {
 
     let snap: BinanceSnapshot;
     try {
-      const res = await fetch(this.restUrl, { signal: abort.signal });
+      const res = await fetch(this.restUrl, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(15000)]) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = parseSnapshotResponse(await res.json());
       if (!data) throw new Error("malformed snapshot");

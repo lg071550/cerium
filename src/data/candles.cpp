@@ -12,7 +12,12 @@ bool holdForHistory(CandleSeries& s, double tsMs) {
 }
 } // namespace
 
-void CandleSeries::load(const double* data, int n, Timeframe tf_, int symIdx) {
+void CandleSeries::load(const double* data, int n, Timeframe tf_, int symIdx, bool preserveLive) {
+  std::vector<Candle> liveTail;
+  if (preserveLive && tf == tf_ && sym == symIdx && tf.kind == Timeframe::Time && data && n > 0) {
+    const double lastTs = data[(size_t)(n - 1) * 7];
+    for (const auto& c : v) if (c.ts >= lastTs) liveTail.push_back(c);
+  }
   ++historyVersion;
   tf = tf_;
   sym = symIdx;
@@ -37,6 +42,10 @@ void CandleSeries::load(const double* data, int n, Timeframe tf_, int symIdx) {
     // Historical seed is Binance-only: aggregated volume/delta start from the
     // same reference and diverge only as live prints from other venues fold in.
     v.push_back({k[0], k[1], k[2], k[3], k[4], vol, 2.0 * takerBuy - vol, vol});
+  }
+  for (const auto& c : liveTail) {
+    if (!v.empty() && v.back().ts == c.ts) v.back() = c;
+    else if (v.empty() || c.ts > v.back().ts) v.push_back(c);
   }
   if (v.size() > MAX_CANDLES) v.erase(v.begin(), v.end() - (ptrdiff_t)MAX_CANDLES);
   awaitingHistory = false;

@@ -72,8 +72,8 @@ export function parseDepthMessage(raw: unknown): DepthEvent | null {
   if (
     typeof U !== "number" ||
     typeof u !== "number" ||
-    !Number.isSafeInteger(U) ||
-    !Number.isSafeInteger(u)
+    !Number.isSafeInteger(U) || U < 0 || U > u ||
+    !Number.isSafeInteger(u) || u < 0
   ) {
     return null;
   }
@@ -91,9 +91,9 @@ export function parseFuturesDepthMessage(raw: unknown): FuturesDepthEvent | null
     typeof U !== "number" ||
     typeof u !== "number" ||
     typeof pu !== "number" ||
-    !Number.isSafeInteger(U) ||
+    !Number.isSafeInteger(U) || U < 0 || U > u ||
     !Number.isSafeInteger(u) ||
-    !Number.isSafeInteger(pu)
+    !Number.isSafeInteger(pu) || pu < 0
   ) {
     return null;
   }
@@ -146,7 +146,7 @@ export function reconcileSnapshot(
   }
 
   const first = buffer[0];
-  if (first && snap.lastUpdateId < first.U) {
+  if (first && snap.lastUpdateId + 1 < first.U) {
     return { actions: [{ kind: "resync" }], newState: state };
   }
 
@@ -167,6 +167,8 @@ export function reconcileSnapshot(
   ];
   let updateId = snap.lastUpdateId;
   for (const ev of remaining) {
+    if(ev.u<=updateId) continue;
+    if(ev.U>updateId+1) return {actions:[{kind:"resync"}],newState:state};
     actions.push({ kind: "applyUpdates", updates: toUpdates(ev), updateId: ev.u });
     updateId = ev.u;
   }
@@ -177,7 +179,7 @@ export function reconcileEvent(
   state: BinanceSyncState,
   ev: DepthEvent,
 ): ReconcileEventResult {
-  if (ev.u < state.updateId) {
+  if (ev.u <= state.updateId) {
     return { action: { kind: "skip" }, newState: state };
   }
   if (ev.U > state.updateId + 1) {

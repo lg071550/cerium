@@ -30,6 +30,7 @@ struct Terminal {
   DockTree dock;
   DockDrag drag;
   Feeds feeds;
+  bool uncappedFps = false;
 
   void init(Renderer* renderer);
   void frame(const Input& input, float frameDt, float uiDt, float cssW, float cssH);

@@ -584,81 +584,121 @@ void DomModel::suppressExecutedPulls(double newStep) {
 
 void DomModel::updateTrades(const Feeds& feeds, int selected, uint32_t mask,
                             double newStep, double window, double nowMs) {
-  uint64_t signature = sourceSignature(feeds, selected, nowMs);
-  bool stale = m_flowHead != feeds.tape.head || m_flowCount != feeds.tape.count ||
-               m_flowSourceSignature != signature || m_flowVenue != selected ||
-               m_flowMask != mask || m_flowStep != newStep ||
-               m_flowWindow != window || nowMs >= m_flowNextExpiry ||
-               nowMs >= m_hitNextExpiry;
-  if (stale) {
-    m_flowHead = feeds.tape.head;
-    m_flowCount = feeds.tape.count;
-    m_flowSourceSignature = signature;
-    m_flowVenue = selected;
-    m_flowMask = mask;
-    m_flowStep = newStep;
-    m_flowWindow = window;
-    m_flowNextExpiry = INFINITY;
-    m_hitNextExpiry = INFINITY;
-    m_flow.clear();
-    m_hits.clear();
-    m_sweepBuy = 0;
-    m_sweepSell = 0;
-    recentFlow = {};
-    lastTradePrice = 0;
-
+  if (!(newStep > 0) || !std::isfinite(newStep) || !(window > 0)) return;
+  const uint64_t signature = sourceSignature(feeds, selected, nowMs);
+  std::array<bool, 64> allowed = m_flowAllowed;
+  std::array<double, 64> scales = m_flowScales;
+  if (signature != m_flowSourceSignature || selected != m_flowVenue || mask != m_flowMask) {
+    allowed.fill(false); scales.fill(0);
     bool healthy[64]{};
     feeds.collectHealthy(50.0, healthy, std::size(healthy));
-    // Hit matching must follow the tape's clock, not wall time: exchange
-    // timestamps routinely sit a second or more off Date.now(), which is why
-    // the previous print filter never caught live sweeps.
-    double origin = nowMs;
-    if (const TapeEntry* newest = feeds.tape.latest(0)) {
-      if (newest->ts > 0 && std::fabs(newest->ts - nowMs) < 120000.0)
-        origin = newest->ts;
+    const double referenceMid = selected >= 0 && selected < (int)feeds.venues.size()
+        ? feeds.venues[(size_t)selected].book.mid() : feeds.aggMid();
+    for (int v = 0; v < (int)feeds.venues.size() && v < 64; ++v) {
+      allowed[v] = sourceAllowed(feeds, v, selected, mask, healthy, nowMs);
+      if (allowed[v]) scales[v] = priceScale(feeds, v, selected, referenceMid);
     }
-    double cutoff = nowMs - window * 1000.0;
-    double hitCutoff = origin - kHitWindowMs;
-    for (size_t i = 0; i < feeds.tape.count; ++i) {
-      const TapeEntry* trade = feeds.tape.latest(i);
-      if (!trade) continue;
-      // The ring is arrival-ordered, but venue clocks skew a few seconds, so
-      // ts is not strictly monotonic. Only break past a skew margin (mirrors the
-      // +5000 future guard below); trades nearer the cutoff are scanned so a
-      // behind-clock venue's prints aren't dropped at the window edge.
-      if (trade->ts < cutoff - 5000.0 && trade->ts < hitCutoff) break;
-      if (trade->ts > origin + 30000.0 || trade->venue >= feeds.venues.size()) continue;
-      if (!sourceAllowed(feeds, (int)trade->venue, selected, mask, healthy, nowMs))
-        continue;
-      double normalizedPrice = trade->price *
-          priceScale(feeds, (int)trade->venue, selected,
-                     selected >= 0 ? feeds.venues[(size_t)selected].book.mid()
-                                   : feeds.aggMid());
-      if (lastTradePrice == 0 && trade->ts >= cutoff)
-        lastTradePrice = normalizedPrice;
-      if (trade->ts >= cutoff) {
-        int64_t tick = (int64_t)std::llround(normalizedPrice / newStep);
-        DomFlow& flow = m_flow[tick];
-        if (trade->side == wire::BidOrBuy) {
-          flow.buy += trade->qty;
-          recentFlow.buy += trade->qty;
-        } else {
-          flow.sell += trade->qty;
-          recentFlow.sell += trade->qty;
-        }
-        m_flowNextExpiry = std::min(m_flowNextExpiry, trade->ts + window * 1000.0);
+  }
+  const bool newTrades = m_flowRevision != feeds.tape.revision;
+  if (newTrades) {
+    const TapeEntry* newest = feeds.tape.latest(0);
+    m_hitClockOffset = newest && newest->ts > 0 && std::fabs(newest->ts - nowMs) < 120000.0
+        ? newest->ts - nowMs : 0;
+  }
+  // Preserve exchange clock skew, but advance the hit clock while the tape is
+  // quiet. A frozen newest timestamp used to leave an expired hit pending and
+  // rescan all five minutes of history on every uncapped frame.
+  const double origin = std::max(m_lastHitOrigin, nowMs + m_hitClockOffset);
+  const uint64_t added = feeds.tape.revision - m_flowRevision;
+  const bool reset = m_flowWindow != window ||
+      m_flowResetRevision != feeds.tape.clearRevision ||
+      added > feeds.tape.domHistory.size() || nowMs >= m_futureRetry;
+  const bool projectionChanged = allowed != m_flowAllowed || scales != m_flowScales ||
+                                 newStep != m_flowStep;
+  const bool changed = reset || projectionChanged || newTrades ||
+                       nowMs >= m_flowNextExpiry || origin >= m_hitNextExpiry;
+  m_flowSourceSignature = signature;
+  m_flowAllowed = allowed; m_flowScales = scales;
+  m_flowVenue = selected; m_flowMask = mask;
+  m_flowStep = newStep; m_flowWindow = window;
+  m_flowResetRevision = feeds.tape.clearRevision;
+  m_lastHitOrigin = origin;
+  if (!changed) return;
+  if (reset) {
+    for (auto& prices : m_rawFlow) prices.clear();
+    for (auto& prices : m_rawHits) prices.clear();
+    m_flowExpiry = {}; m_hitExpiry = {};
+    m_futureRetry = INFINITY;
+  }
+  auto expire = [](auto& queue, auto& venues, double clock) {
+    while (!queue.empty() && queue.top().expires <= clock) {
+      const FlowPrint p = queue.top(); queue.pop();
+      auto& prices = venues[p.venue];
+      auto it = prices.find(p.price);
+      if (it != prices.end()) {
+        double& value = p.buy ? it->second.buy : it->second.sell;
+        value = std::max(0.0, value - p.qty);
+        size_t& count = p.buy ? it->second.buyCount : it->second.sellCount;
+        if (--count == 0) value = 0;
+        if (!it->second.buyCount && !it->second.sellCount) prices.erase(it);
       }
-      if (trade->ts >= hitCutoff) {
-        if (trade->side == wire::BidOrBuy) {
-          m_hits[askTick(normalizedPrice, newStep)].buy += trade->qty;
-          m_sweepBuy = std::max(m_sweepBuy, normalizedPrice);
-        } else {
-          m_hits[bidTick(normalizedPrice, newStep)].sell += trade->qty;
-          m_sweepSell = m_sweepSell == 0
-                            ? normalizedPrice
-                            : std::min(m_sweepSell, normalizedPrice);
-        }
-        m_hitNextExpiry = std::min(m_hitNextExpiry, trade->ts + kHitWindowMs);
+    }
+  };
+  expire(m_flowExpiry, m_rawFlow, nowMs);
+  expire(m_hitExpiry, m_rawHits, origin);
+  const size_t count = reset ? feeds.tape.domHistory.size() : (size_t)added;
+  auto it = feeds.tape.domHistory.end();
+  std::advance(it, -(std::ptrdiff_t)count);
+  for (; it != feeds.tape.domHistory.end(); ++it) {
+    const TapeEntry& trade = *it;
+    if (trade.venue >= 64) continue;
+    if (trade.ts > origin + 30000.0) {
+      m_futureRetry = std::min(m_futureRetry, nowMs + trade.ts - origin - 30000.0);
+      continue;
+    }
+    const bool buy = trade.side == wire::BidOrBuy;
+    auto add = [&](auto& venues, auto& queue, double expires) {
+      RawFlow& flow = venues[trade.venue][trade.price];
+      ++(buy ? flow.buyCount : flow.sellCount);
+      (buy ? flow.buy : flow.sell) += trade.qty;
+      queue.push({expires, trade.price, trade.qty, trade.venue, buy});
+    };
+    if (trade.ts + window * 1000.0 > nowMs)
+      add(m_rawFlow, m_flowExpiry, trade.ts + window * 1000.0);
+    if (trade.ts + kHitWindowMs > origin)
+      add(m_rawHits, m_hitExpiry, trade.ts + kHitWindowMs);
+  }
+  m_flowRevision = feeds.tape.revision;
+  m_flowNextExpiry = m_flowExpiry.empty() ? INFINITY : m_flowExpiry.top().expires;
+  m_hitNextExpiry = m_hitExpiry.empty() ? INFINITY : m_hitExpiry.top().expires;
+  m_flow.clear(); m_hits.clear(); recentFlow = {};
+  m_sweepBuy = m_sweepSell = 0;
+  for (size_t v = 0; v < allowed.size(); ++v) {
+    if (!allowed[v]) continue;
+    for (const auto& [price, raw] : m_rawFlow[v]) {
+      auto& row = m_flow[(int64_t)std::llround(price * scales[v] / newStep)];
+      row.buy += raw.buy; row.sell += raw.sell;
+      recentFlow.buy += raw.buy; recentFlow.sell += raw.sell;
+    }
+    for (const auto& [price, raw] : m_rawHits[v]) {
+      const double normalized = price * scales[v];
+      if (raw.buy > 0) {
+        m_hits[askTick(normalized, newStep)].buy += raw.buy;
+        m_sweepBuy = std::max(m_sweepBuy, normalized);
+      }
+      if (raw.sell > 0) {
+        m_hits[bidTick(normalized, newStep)].sell += raw.sell;
+        m_sweepSell = m_sweepSell == 0 ? normalized : std::min(m_sweepSell, normalized);
+      }
+    }
+  }
+  lastTradePrice = 0;
+  if (!m_flow.empty()) {
+    for (auto it = feeds.tape.domHistory.rbegin(); it != feeds.tape.domHistory.rend(); ++it) {
+      if (it->venue < 64 && allowed[it->venue] && it->ts + window * 1000.0 > nowMs &&
+          it->ts <= origin + 30000.0) {
+        lastTradePrice = it->price * scales[it->venue];
+        break;
       }
     }
   }

@@ -10,7 +10,7 @@ export type ParsedDeribit =
   | { kind: "change"; changeId: number; prevChangeId: number; updates: L2Update[] }
   | null;
 
-export function parseDeribit(msg: unknown): ParsedDeribit {
+export function parseDeribit(msg: unknown, inverse = true): ParsedDeribit {
   if (!isRecord(msg) || msg.method !== "subscription" || !isRecord(msg.params)) return null;
   const d = msg.params.data;
   if (!isRecord(d)) return null;
@@ -18,8 +18,8 @@ export function parseDeribit(msg: unknown): ParsedDeribit {
   if (changeId === null) return null;
 
   if (d.type === "snapshot") {
-    const bids = rows(d.bids);
-    const asks = rows(d.asks);
+    const bids = rows(d.bids, inverse);
+    const asks = rows(d.asks, inverse);
     if (!bids || !asks) return null;
     return { kind: "snapshot", changeId, bids, asks };
   }
@@ -27,8 +27,8 @@ export function parseDeribit(msg: unknown): ParsedDeribit {
   if (d.type === "change") {
     const prevChangeId = safeInteger(d.prev_change_id);
     if (prevChangeId === null) return null;
-    const bids = rows(d.bids);
-    const asks = rows(d.asks);
+    const bids = rows(d.bids, inverse);
+    const asks = rows(d.asks, inverse);
     if (!bids || !asks) return null;
     const updates: L2Update[] = [];
     for (const l of bids) updates.push({ side: "bid", ...l });
@@ -47,6 +47,7 @@ export function parseDeribitTestRequest(msg: unknown): { id: number } | null {
 export function parseDeribitTrades(
   msg: unknown,
   channel = `trades.${DEFAULT_INST}.100ms`,
+  inverse = true,
 ): TradePrint[] | null {
   if (!isRecord(msg) || msg.method !== "subscription" || !isRecord(msg.params)) return null;
   if (msg.params.channel !== channel) return null;
@@ -60,7 +61,7 @@ export function parseDeribitTrades(
     if (typeof row.timestamp !== "number" || !Number.isFinite(row.timestamp)) return null;
     prints.push({
       price: row.price,
-      size: row.amount / row.price,
+      size: inverse ? row.amount / row.price : row.amount,
       side: row.direction,
       ts: row.timestamp,
     });
@@ -68,7 +69,7 @@ export function parseDeribitTrades(
   return prints.length > 0 ? prints : null;
 }
 
-function rows(v: unknown): PriceLevel[] | null {
+function rows(v: unknown, inverse: boolean): PriceLevel[] | null {
   if (!Array.isArray(v)) return null;
   const out: PriceLevel[] = [];
   for (const row of v) {
@@ -85,7 +86,7 @@ function rows(v: unknown): PriceLevel[] | null {
       price <= 0 ||
       amount < 0
     ) return null;
-    out.push({ price, size: action === "delete" ? 0 : amount / price });
+    out.push({ price, size: action === "delete" ? 0 : inverse ? amount / price : amount });
   }
   return out;
 }
@@ -104,7 +105,7 @@ export class DeribitAdapter implements VenueAdapter {
   constructor(deps: AdapterDeps, inst = DEFAULT_INST) {
     this.deps = deps;
     this.symbol = inst;
-    this.channel = `book.${inst}.none.100ms`;
+    this.channel = `book.${inst}.100ms`;
     this.tradesChannel = `trades.${inst}.100ms`;
     this.conn = new Reconnect(
       deps.setState,
@@ -154,6 +155,7 @@ export class DeribitAdapter implements VenueAdapter {
 
   private teardown(): void {
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -181,13 +183,13 @@ export class DeribitAdapter implements VenueAdapter {
       return;
     }
 
-    const prints = parseDeribitTrades(raw, this.tradesChannel);
+    const prints = parseDeribitTrades(raw, this.tradesChannel, !this.symbol.includes("_USDC"));
     if (prints) {
       this.deps.onTrade?.(prints);
       return;
     }
 
-    const parsed = parseDeribit(raw);
+    const parsed = parseDeribit(raw, !this.symbol.includes("_USDC"));
     if (!parsed) return;
 
     if (parsed.kind === "snapshot") {

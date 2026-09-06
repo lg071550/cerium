@@ -905,11 +905,11 @@ void drawOrderbook(Ui& u, Rect r, OrderbookPanel& st, Feeds& feeds) {
         if (sh < 1.0f) continue;
         Rect depthSlice{area.x + area.w - cw, sy0, cw, sh};
         if (st.showGradient)
-          u.draw.rectGradientHDithered(
+          u.draw.rectTileGradientH(
               depthSlice, withAlpha(c, 0.004f * visual),
-              withAlpha(c, (0.045f + 0.105f * depth) * visual));
+              withAlpha(c, (0.045f + 0.105f * depth) * visual), true);
         else
-          u.draw.rect(depthSlice, withAlpha(c, (0.025f + 0.075f * depth) * visual));
+          u.draw.rectTile(depthSlice, withAlpha(c, (0.025f + 0.075f * depth) * visual));
       }
     }
 

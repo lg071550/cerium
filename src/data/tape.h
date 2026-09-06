@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <algorithm>
 
 // Fixed-capacity trade ring, newest at the write head. 10k entries is ~320 KB.
 struct TapeEntry {
@@ -14,12 +16,22 @@ struct Tape {
   TapeEntry buf[CAP];
   size_t head = 0;  // next write slot
   size_t count = 0; // entries currently held
+  // DOM retention is time-based and must survive the visible tape's 10k wrap.
+  std::deque<TapeEntry> domHistory;
+  double newestTs = 0;
+  uint64_t revision = 0;
+  uint64_t clearRevision = 0;
 
   void push(double price, double qty, double ts, uint8_t venue, uint8_t side) {
     TapeEntry& e = buf[head];
     e = {price, qty, ts, venue, side};
     head = (head + 1) % CAP;
     if (count < CAP) count++;
+    ++revision;
+    newestTs = std::max(newestTs, ts);
+    domHistory.push_back(e);
+    while (!domHistory.empty() && domHistory.front().ts < newestTs - 305000.0)
+      domHistory.pop_front();
   }
 
   // Drop retained prints without touching the live feed. New trades begin
@@ -27,6 +39,7 @@ struct Tape {
   void clear() {
     head = 0;
     count = 0;
+    domHistory.clear(); newestTs = 0; ++revision; clearRevision = revision;
   }
 
   // i = 0 → newest

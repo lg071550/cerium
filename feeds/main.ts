@@ -5,7 +5,7 @@ import { CMD, EV, STATUS, WireWriter } from "./wire";
 import type { L2Update, PriceLevel, TradePrint } from "./types";
 import type { AdapterDeps, VenueAdapter } from "./venues/types";
 import { SYMBOLS, VENUES, type VenueDef } from "./registry";
-import { fetchCandles, fetchOrderFlow, TF_TIME } from "./candles";
+import { fetchCandles, fetchOrderFlow, fetchCalendarOpens, candleRetryDelay, TF_TIME } from "./candles";
 import { startMarketFeed } from "./market";
 import { configureHt } from "./hypertracker";
 
@@ -44,42 +44,65 @@ function refreshOrderFlow(): void {
   const tf = candleTf;
   const forSymbol = symbolIndex;
   const request = ++flowRequest;
+  const stale = () => request !== flowRequest || forSymbol !== symbolIndex ||
+    tf.kind !== candleTf.kind || tf.value !== candleTf.value;
+  const retry = () => {
+    if (stale()) return;
+    const delay = Math.max(candleRetryDelay() + 250,
+      Math.min(30000, 1500 * 2 ** Math.min(orderFlowRetries++, 5)));
+    setTimeout(() => { if (!stale()) refreshOrderFlow(); }, delay);
+  };
   fetchOrderFlow(sym, tf.kind, tf.value, (flow, prepend) => {
-    if (request !== flowRequest || forSymbol !== symbolIndex ||
-        tf.kind !== candleTf.kind || tf.value !== candleTf.value) return false;
-    if (flow.length === 0) return true;
-    orderFlowRetries = 0;
-    postOrderFlow(forSymbol, tf, flow, prepend);
+    if (stale()) return false;
+    if (flow.length) postOrderFlow(forSymbol, tf, flow, prepend);
     return true;
-  }).then((n) => {
-    if (request !== flowRequest || forSymbol !== symbolIndex) return;
-    if (n === 0 && orderFlowRetries < 3) {
-      const delay = 1500 * ++orderFlowRetries;
-      setTimeout(() => {
-        if (request === flowRequest && forSymbol === symbolIndex) refreshOrderFlow();
-      }, delay);
-    }
+  }, stale).then(n => {
+    if (stale()) return;
+    if (n === 0) retry();
+    else orderFlowRetries = 0;
+  }).catch(retry);
+}
+
+let calendarTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleCalendarRefresh(delay: number): void {
+  if (calendarTimer !== undefined) clearTimeout(calendarTimer);
+  calendarTimer = setTimeout(refreshCalendarOpens, delay);
+}
+function refreshCalendarOpens(): void {
+  const forSymbol = symbolIndex;
+  // Refresh after UTC rollover even if this custom chart stays open overnight.
+  scheduleCalendarRefresh(86400000 - Date.now() % 86400000 + 2000);
+  fetchCalendarOpens(SYMBOLS[forSymbol]).then(data => {
+    if (forSymbol !== symbolIndex) return;
+    if (!data.length) { scheduleCalendarRefresh(300000); return; }
+    // Keep the cache owned by the worker; the bridge receives a copy.
+    const copy = data.slice();
+    (self as unknown as Worker).postMessage({kind: "calendar", sym: forSymbol, data: copy}, [copy.buffer]);
+  }).catch(() => {
+    if (forSymbol === symbolIndex) scheduleCalendarRefresh(300000);
   });
 }
 
-function refreshCandles(): void {
+function refreshCandles(preserveLive = false): void {
   const sym = SYMBOLS[symbolIndex];
   const tf = candleTf;
   const forSymbol = symbolIndex;
   const request = ++candleRequest;
-  // Progressive bootstrap for tick/volume TFs: post partial bar/flow
+  // Progressive bootstrap for custom time and tick/volume TFs: post partial bar/flow
   // snapshots as the walk streams older pages, instead of leaving the chart
   // blank until the whole pull completes.
+  let postedPartial = preserveLive;
   const postPartial = (bars: Float64Array, flow: Float64Array): void => {
     if (request !== candleRequest || forSymbol !== symbolIndex ||
         tf.kind !== candleTf.kind || tf.value !== candleTf.value) return;
     (self as unknown as Worker).postMessage(
       {
         kind: "candles", sym: forSymbol, tfKind: tf.kind, tfValue: tf.value,
-        data: bars, flow,
+        data: bars, flow, preserveLive: postedPartial,
       },
       [bars.buffer, flow.buffer],
     );
+    postedPartial = true;
   };
   // Supersede check for the network work itself, not just the result: without
   // it a symbol/TF switch mid-walk leaves the old walk paging to completion
@@ -91,10 +114,9 @@ function refreshCandles(): void {
     if (request !== candleRequest || forSymbol !== symbolIndex ||
         tf.kind !== candleTf.kind || tf.value !== candleTf.value) return;
     if (!history) {
-      if (candleRetries >= 4) return;
-      const delay = 700 * (1 << candleRetries++);
+      const delay = Math.max(candleRetryDelay() + 250, Math.min(30000, 700 * (2 ** Math.min(candleRetries++, 6))));
       setTimeout(() => {
-        if (request === candleRequest && forSymbol === symbolIndex) refreshCandles();
+        if (request === candleRequest && forSymbol === symbolIndex) refreshCandles(postedPartial);
       }, delay);
       return;
     }
@@ -104,7 +126,7 @@ function refreshCandles(): void {
         orderFlowRetries < 3) {
       const delay = 1500 * ++orderFlowRetries;
       setTimeout(() => {
-        if (request === candleRequest && forSymbol === symbolIndex) refreshCandles();
+        if (request === candleRequest && forSymbol === symbolIndex) refreshCandles(postedPartial);
       }, delay);
     } else if (flow.length > 0) {
       orderFlowRetries = 0;
@@ -112,10 +134,11 @@ function refreshCandles(): void {
     (self as unknown as Worker).postMessage(
       {
         kind: "candles", sym: forSymbol, tfKind: tf.kind, tfValue: tf.value,
-        data: bars, flow,
+        data: bars, flow, preserveLive: postedPartial,
       },
       [bars.buffer, flow.buffer],
     );
+    refreshCalendarOpens();
     // Klines first: kicking the aggTrade walk in parallel 429s the shared
     // www.binance.com WAF and is the usual reason a TF switch paints live-only.
     if (orderFlowRequested && tf.kind === TF_TIME) refreshOrderFlow();
@@ -219,7 +242,8 @@ function handleCommand(type: number, venue: number, arg: number): void {
   if (type === CMD.RequestOrderFlow) {
     orderFlowRequested = true;
     orderFlowRetries = 0;
-    refreshOrderFlow();
+    if (candleTf.kind === TF_TIME) refreshOrderFlow();
+    else refreshCandles(true); // one shared tick/volume walk carries bars and prints
     return;
   }
 }

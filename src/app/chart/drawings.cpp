@@ -1,4 +1,5 @@
 #include "drawings.h"
+#include "drawing_geometry.h"
 
 #include "../../platform/shell.h"
 #include "../../ui/theme.h"
@@ -10,106 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 
+using namespace drawing_geometry;
 namespace {
-constexpr float kHit = 7.0f;
-constexpr float kFib[] = {0.0f, 0.236f, 0.382f, 0.5f, 0.618f, 0.786f, 1.0f};
-constexpr const char* kFibLbl[] = {"0", "0.236", "0.382", "0.5", "0.618", "0.786", "1"};
-
-int barAtTime(const CandleSeries& cs, double ts) {
-  if (cs.v.empty()) return 0;
-  int lo = 0, hi = (int)cs.v.size() - 1;
-  if (ts <= cs.v.front().ts) return 0;
-  if (ts >= cs.v.back().ts) return hi;
-  while (lo < hi) {
-    int mid = lo + (hi - lo + 1) / 2;
-    if (cs.v[(size_t)mid].ts <= ts) lo = mid;
-    else hi = mid - 1;
-  }
-  return lo;
-}
-
-double timeAtBar(const CandleSeries& cs, int i) {
-  if (cs.v.empty()) return 0;
-  i = std::clamp(i, 0, (int)cs.v.size() - 1);
-  return cs.v[(size_t)i].ts;
-}
-
-float xOfBar(const ChartPane& pane, float startF, float bw, int i) {
-  return pane.area.x + ((float)i - startF) * bw + bw * 0.5f;
-}
-
-int barAtX(const ChartPane& pane, float startF, float bw, int size, float x) {
-  if (!(bw > 0)) return 0;
-  int i = (int)std::floor(startF + (x - pane.area.x) / bw);
-  return std::clamp(i, 0, std::max(0, size - 1));
-}
-
-double barVolume(const Candle& c) { return c.aggVol > 0 ? c.aggVol : c.vol; }
-
-float distPtSeg(float px, float py, float x0, float y0, float x1, float y1) {
-  float dx = x1 - x0, dy = y1 - y0;
-  float len2 = dx * dx + dy * dy;
-  float t = 0;
-  if (len2 > 1e-6f) t = std::clamp(((px - x0) * dx + (py - y0) * dy) / len2, 0.0f, 1.0f);
-  float x = x0 + t * dx, y = y0 + t * dy;
-  return std::hypot(px - x, py - y);
-}
-
-void screenOf(const ChartDrawing& g, const ChartPane& pane, const CandleSeries& cs,
-              float startF, float bw, float& x0, float& y0, float& x1, float& y1) {
-  int b0 = barAtTime(cs, g.t0);
-  int b1 = barAtTime(cs, g.t1);
-  x0 = xOfBar(pane, startF, bw, b0);
-  x1 = xOfBar(pane, startF, bw, b1);
-  y0 = pane.yOf(g.p0);
-  y1 = pane.yOf(g.p1);
-}
-
-int hitHandle(const ChartDrawing& g, const ChartPane& pane, const CandleSeries& cs,
-              float startF, float bw, float mx, float my) {
-  if (drawClickCommit(g.kind)) return 0;
-  float x0, y0, x1, y1;
-  screenOf(g, pane, cs, startF, bw, x0, y0, x1, y1);
-  if (std::hypot(mx - x0, my - y0) <= kHit + 2.0f) return 1;
-  if (std::hypot(mx - x1, my - y1) <= kHit + 2.0f) return 2;
-  return 0;
-}
-
-float hitDist(const ChartDrawing& g, const ChartPane& pane, const CandleSeries& cs,
-              float startF, float bw, float mx, float my) {
-  float x0, y0, x1, y1;
-  screenOf(g, pane, cs, startF, bw, x0, y0, x1, y1);
-  const Rect& a = pane.area;
-  switch (g.kind) {
-    case DrawTool::HLine:
-      return std::fabs(my - y0);
-    case DrawTool::Avwap:
-      return distPtSeg(mx, my, x0, y0, a.x + a.w, y0);
-    case DrawTool::Rect:
-    case DrawTool::Fib: {
-      float l = std::min(x0, x1), r = std::max(x0, x1);
-      float t = std::min(y0, y1), b = std::max(y0, y1);
-      float dx = mx < l ? l - mx : mx > r ? mx - r : 0;
-      float dy = my < t ? t - my : my > b ? my - b : 0;
-      if (dx == 0 && dy == 0)
-        return std::min({mx - l, r - mx, my - t, b - my});
-      return std::hypot(dx, dy);
-    }
-    case DrawTool::Ray: {
-      float ux = x1 - x0, uy = y1 - y0;
-      float len = std::hypot(ux, uy);
-      if (len < 1.0f) return std::hypot(mx - x0, my - y0);
-      ux /= len;
-      uy /= len;
-      float t = (mx - x0) * ux + (my - y0) * uy;
-      if (t < 0) return std::hypot(mx - x0, my - y0);
-      return std::hypot(mx - (x0 + ux * t), my - (y0 + uy * t));
-    }
-    default:
-      return distPtSeg(mx, my, x0, y0, x1, y1);
-  }
-}
-
 Color drawColor(bool selected, bool hover) {
   const Theme& t = theme();
   return (selected || hover) ? t.text : t.accent;
@@ -121,26 +24,12 @@ void drawHandle(DrawList& d, float x, float y, Color c) {
 
 void drawAvwap(DrawList& d, const ChartDrawing& g, const ChartPane& pane,
                const CandleSeries& cs, float startF, float bw, Color c) {
-  int a0 = barAtTime(cs, g.t0);
   static thread_local std::vector<float> xy;
-  xy.clear();
-  double pv = 0, vol = 0;
-  for (int i = a0; i < (int)cs.v.size(); ++i) {
-    const Candle& bar = cs.v[(size_t)i];
-    double tp = (bar.h + bar.l + bar.c) / 3.0;
-    double v = barVolume(bar);
-    pv += tp * v;
-    vol += v;
-    if (!(vol > 0)) continue;
-    float x = xOfBar(pane, startF, bw, i);
-    float y = pane.yOf(pv / vol);
-    if (x < pane.area.x - 4.0f) continue;
-    if (x > pane.area.x + pane.area.w + 4.0f) break;
-    xy.push_back(x);
-    xy.push_back(y);
+  avwapPoints(g, pane, cs, startF, bw, xy);
+  if (xy.size() >= 4) d.polyline(xy.data(), (int)(xy.size()/2), c, 1.5f);
+  if (!xy.empty()) {
+    d.textAligned({xy[0]+4,xy[1]-14,56,14}, "AVWAP", c, DrawList::Left);
   }
-  if (xy.size() >= 4)
-    d.polyline(xy.data(), (int)(xy.size() / 2), c, 1.5f);
 }
 
 void drawOne(DrawList& d, const ChartDrawing& g, const ChartPane& pane,
@@ -168,9 +57,6 @@ void drawOne(DrawList& d, const ChartDrawing& g, const ChartPane& pane,
     }
     case DrawTool::Avwap:
       drawAvwap(d, g, pane, cs, startF, bw, c);
-      d.textAligned({x0 + 4.0f, y0 - 14.0f, 56.0f, 14.0f}, "AVWAP", c,
-                    DrawList::Left);
-      handles();
       return;
     case DrawTool::Trend:
       d.line(x0, y0, x1, y1, c, thick);
@@ -218,58 +104,6 @@ void drawOne(DrawList& d, const ChartDrawing& g, const ChartPane& pane,
 }
 } // namespace
 
-void DrawingSet::setStorageKey(const std::string& chartSettingsKey) {
-  key = chartSettingsKey;
-  auto pos = key.find(".settings.");
-  if (pos != std::string::npos) key.replace(pos, 10, ".drawings.");
-  else key += ".drawings";
-  loaded = false;
-}
-
-void DrawingSet::load() {
-  if (loaded) return;
-  loaded = true;
-  items.clear();
-  nextId = 1;
-  if (key.empty()) return;
-  char* saved = shell_storage_get(key.c_str());
-  if (!saved) return;
-  const char* p = saved;
-  int ver = 0;
-  if (std::sscanf(p, "%d", &ver) != 1 || ver != 1) {
-    std::free(saved);
-    return;
-  }
-  while (*p && *p != '\n') ++p;
-  if (*p == '\n') ++p;
-  while (*p) {
-    ChartDrawing g;
-    int kind = 0;
-    int n = std::sscanf(p, "%d,%d,%d,%lf,%lf,%lf,%lf", &g.id, &kind, &g.symbol,
-                        &g.t0, &g.p0, &g.t1, &g.p1);
-    if (n == 7) {
-      g.kind = (DrawTool)std::clamp(kind, 1, kDrawToolN - 1);
-      items.push_back(g);
-      nextId = std::max(nextId, g.id + 1);
-    }
-    while (*p && *p != '\n') ++p;
-    if (*p == '\n') ++p;
-  }
-  std::free(saved);
-}
-
-void DrawingSet::save() const {
-  if (key.empty()) return;
-  std::string out = "1\n";
-  char line[160];
-  for (const ChartDrawing& g : items) {
-    snprintf(line, sizeof(line), " %d,%d,%d,%.6f,%.10g,%.6f,%.10g\n", g.id,
-             (int)g.kind, g.symbol, g.t0, g.p0, g.t1, g.p1);
-    out += line;
-  }
-  shell_storage_set(key.c_str(), out.c_str());
-}
-
 const char* DrawingSet::cursor() const {
   if (placing || tool != DrawTool::Pointer) return "crosshair";
   if (dragging) return "grabbing";
@@ -281,21 +115,8 @@ const char* DrawingSet::toolLabel() const {
   return kDrawToolNames[std::clamp((int)tool, 0, kDrawToolN - 1)];
 }
 
-ChartDrawing* DrawingSet::find(int id) {
-  for (ChartDrawing& g : items)
-    if (g.id == id) return &g;
-  return nullptr;
-}
-
-void DrawingSet::commitDraft() {
-  draft.id = nextId++;
-  items.push_back(draft);
-  selectedId = draft.id;
-  placing = false;
-  save();
-}
-
 void DrawingSet::drawPicker(Ui& u) {
+  load();
   if (!pickerId || !u.overlayOpen(pickerId)) return;
   const Theme& t = theme();
   u.updateOverlayRect(pickerId, pickerRect);
@@ -314,173 +135,40 @@ void DrawingSet::drawPicker(Ui& u) {
     Behavior b = behavior(u, row, u.id("##draw-tool") + (uint64_t)(i + 1));
     if (b.clicked) {
       tool = (DrawTool)i;
-      placing = false;
+      placing = awaitingEnd = dragging = false;
       u.closeOverlay(pickerId);
       u.input.released = false;
     }
   }
-}
-
-bool DrawingSet::handle(Ui& u, const ChartPane& pane, const CandleSeries& cs,
-                        int symbol, float startF, float bw, int size) {
-  load();
-  hovering = false;
-  if (cs.v.empty() || size <= 0) return false;
-
-  auto pointAt = [&](float mx, float my, double& ts, double& price) {
-    int b = barAtX(pane, startF, bw, size, mx);
-    ts = timeAtBar(cs, b);
-    price = pane.vOf(my);
-  };
-
-  for (int i = 0; i < u.input.keyCount; ++i) {
-    const KeyEvent& k = u.input.keys[i];
-    if (!k.down) continue;
-    if (k.keyCode == 27) {
-      if (placing) {
-        placing = false;
-        return true;
-      }
-      if (tool != DrawTool::Pointer) {
-        tool = DrawTool::Pointer;
-        return true;
-      }
-      if (selectedId) {
-        selectedId = 0;
-        return true;
-      }
-    }
-    if ((k.keyCode == 46 || k.keyCode == 8) && selectedId && !u.focusedField) {
-      items.erase(std::remove_if(items.begin(), items.end(),
-                                 [&](const ChartDrawing& g) {
-                                   return g.id == selectedId;
-                                 }),
-                  items.end());
-      selectedId = 0;
+  const float y=r.y+4+kDrawToolN*22;
+  u.draw.textAligned({r.x+10,y,r.w-20,20},"DRAWINGS / CURRENT SYMBOL",t.textDim,DrawList::Left);
+  if (chip(u,{r.x+6,y+22,(r.w-16)*.5f,22},"DELETE SELECTED",false)) {
+    items.erase(std::remove_if(items.begin(),items.end(),[&](const ChartDrawing& g){return g.symbol==currentSymbol && g.id==selectedId;}),items.end());
+    selectedId=0; placing=dragging=awaitingEnd=false; tool=DrawTool::Pointer; save();
+  }
+  if (chip(u,{r.x+r.w*.5f+2,y+22,(r.w-16)*.5f,22},"CLEAR SYMBOL",false)) {
+    items.erase(std::remove_if(items.begin(),items.end(),[&](const ChartDrawing& g){return g.symbol==currentSymbol;}),items.end());
+    selectedId=0; placing=dragging=awaitingEnd=false; tool=DrawTool::Pointer; save();
+  }
+  std::vector<int> ids;
+  for (auto it=items.rbegin();it!=items.rend();++it) if(it->symbol==currentSymbol)ids.push_back(it->id);
+  Rect list{r.x+4,y+48,r.w-8,std::max(0.0f,r.y+r.h-y-52)};
+  if(ids.empty()) u.draw.textAligned(list,"No drawings for this symbol",t.textDim,DrawList::Center);
+  listView(u,list,(int)ids.size(),24,managerList,[&](Ui& rowUi,DrawList& d,Rect row,int index){
+    auto* g=find(ids[index]); if(!g)return;
+    char label[64];snprintf(label,sizeof(label),"%s #%d",kDrawToolNames[(int)g->kind],g->id);
+    rowUi.pushId(label);
+    Rect select{row.x,row.y,std::max(0.0f,row.w-42),22};
+    if(chip(rowUi,select,label,g->id==selectedId)) {selectedId=g->id;tool=DrawTool::Pointer;placing=dragging=awaitingEnd=false;}
+    if(chip(rowUi,{row.x+row.w-40,row.y,38,22},"DEL",false)) {
+      const int id=g->id;
+      items.erase(std::remove_if(items.begin(),items.end(),[&](const ChartDrawing& item){return item.id==id;}),items.end());
+      if(selectedId==id)selectedId=0;
       save();
-      return true;
     }
-  }
-  auto cancelTool = [&] {
-    placing = false;
-    tool = DrawTool::Pointer;
-  };
-  if (u.input.escapePressed && (placing || tool != DrawTool::Pointer)) {
-    cancelTool();
-    return true;
-  }
-  if (u.input.rightPressed && pane.area.contains(u.input.mouseX, u.input.mouseY) &&
-      (placing || tool != DrawTool::Pointer)) {
-    cancelTool();
-    u.input.rightPressed = false;
-    return true;
-  }
+    rowUi.popId();
+  },false);
 
-  float mx = u.input.mouseX, my = u.input.mouseY;
-  bool over = pane.area.contains(mx, my);
-
-  if (dragging && selectedId) {
-    ChartDrawing* g = find(selectedId);
-    if (!g || !u.input.down) {
-      dragging = false;
-      save();
-      return true;
-    }
-    double ts, price;
-    pointAt(mx, my, ts, price);
-    switch (dragHandle) {
-      case 1:
-        g->t0 = ts;
-        g->p0 = price;
-        break;
-      case 2:
-        g->t1 = ts;
-        g->p1 = price;
-        break;
-      default:
-        if (drawClickCommit(g->kind)) {
-          g->p0 = price;
-          if (g->kind == DrawTool::Avwap) g->t0 = ts;
-        } else {
-          double dP = price - pane.vOf(grabY);
-          int dB = barAtX(pane, startF, bw, size, mx) -
-                   barAtX(pane, startF, bw, size, grabX);
-          auto shiftT = [&](double t) {
-            int b = std::clamp(barAtTime(cs, t) + dB, 0, size - 1);
-            return timeAtBar(cs, b);
-          };
-          g->p0 = grabP0 + dP;
-          g->p1 = grabP1 + dP;
-          g->t0 = shiftT(grabT0);
-          g->t1 = shiftT(grabT1);
-        }
-        break;
-    }
-    return true;
-  }
-
-  if (placing) {
-    if (!over && !u.input.down) {
-      placing = false;
-      return false;
-    }
-    pointAt(mx, my, draft.t1, draft.p1);
-    if (u.input.released) {
-      if (drawClickCommit(draft.kind)) {
-        draft.t1 = draft.t0;
-        draft.p1 = draft.p0;
-      }
-      commitDraft();
-      u.input.released = false;
-      return true;
-    }
-    return true;
-  }
-
-  if (tool != DrawTool::Pointer && over && u.input.pressed) {
-    double ts, price;
-    pointAt(mx, my, ts, price);
-    draft = {};
-    draft.kind = tool;
-    draft.symbol = symbol;
-    draft.t0 = draft.t1 = ts;
-    draft.p0 = draft.p1 = price;
-    placing = true;
-    u.input.pressed = false;
-    if (drawClickCommit(tool)) commitDraft();
-    return true;
-  }
-
-  if (!over) return false;
-
-  int hitId = 0;
-  float best = kHit;
-  for (const ChartDrawing& g : items) {
-    if (g.symbol != symbol) continue;
-    float dist = hitDist(g, pane, cs, startF, bw, mx, my);
-    if (dist < best) {
-      best = dist;
-      hitId = g.id;
-    }
-  }
-  hovering = hitId != 0;
-  if (hitId && u.input.pressed) {
-    selectedId = hitId;
-    if (ChartDrawing* g = find(hitId)) {
-      dragHandle = hitHandle(*g, pane, cs, startF, bw, mx, my);
-      dragging = true;
-      grabX = mx;
-      grabY = my;
-      grabP0 = g->p0;
-      grabP1 = g->p1;
-      grabT0 = g->t0;
-      grabT1 = g->t1;
-    }
-    u.input.pressed = false;
-    return true;
-  }
-  if (u.input.pressed && selectedId) selectedId = 0;
-  return false;
 }
 
 void DrawingSet::draw(DrawList& d, const ChartPane& pane, const CandleSeries& cs,

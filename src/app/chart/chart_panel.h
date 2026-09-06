@@ -7,6 +7,8 @@
 #include "../../ui/widgets.h"
 #include "chart_panes.h"
 #include "period_levels.h"
+#include "vwap_series.h"
+#include "tpo_profile.h"
 #include "drawings.h"
 
 #include <cstdint>
@@ -57,6 +59,7 @@ struct IndicatorInstance {
   int opt = 0;           // deviation / multiplier / volume intensity
   bool flag = true;      // guides / histogram / bands / DI / zero line
   PeriodLevels levels; // calendar opens, independent of oscillator series
+  VwapSeed vwap; // closed-bar moments for constant-time forming-bar updates
   std::vector<float> series;
   std::vector<float> aux;
   std::vector<float> aux2;
@@ -170,6 +173,16 @@ private:
   int m_footprintHeatmap = 1; // quiet / normal / strong
   int m_footprintMinCell = 0;  // hide cells under 0/1/2/5/10% of bar POC volume
   int m_tpoBracket = 0;        // 30 / 60 minutes
+  int m_tpoSessions = 3, m_tpoRows = 256;
+  double m_tpoSourceMinutes = 0;
+  bool m_tpoSplit = false;
+  int m_tpoExtend = 121, m_tpoLabels = 31;
+  bool m_tpoOptions = false;
+  int m_tpoMarks = 15; // POC, singles, tails, poor extremes
+  int64_t m_tpoSelected = -1;
+  std::vector<int> m_tpoJoins;
+  uint64_t m_tpoSignature = ~0ull;
+  TpoProfiles m_tpoProfiles;
   bool m_heatOn = true;        // BOOK HEAT overlay; persisted separately
   bool m_hlLiqOn = false;      // HL LIQ overlay
   bool m_hlSlOn = false;       // HL SL overlay
@@ -315,6 +328,8 @@ private:
   void ensureFootprint(const Feeds& feeds, double step);
   void loadSettings();
   void saveSettings();
+  void saveIndicatorSettings();
+  bool loadIndicatorSettings();
   void resetSettings();
   void drawSettings(Ui& u, Rect area);
 
@@ -372,6 +387,7 @@ private:
     int nPanes = 0;
     int size = 0;
     int slots = 10;
+    float tpoBarsPerDay = 0;
     float bw = 7.0f, freeMax = 0.0f, endSlot = 0.0f, startF = 0.0f;
     float scroll = 0;
     int vis0 = 0, vis1 = 0;

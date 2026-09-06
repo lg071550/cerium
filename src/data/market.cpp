@@ -1,6 +1,16 @@
 #include "market.h"
 
 #include <algorithm>
+#include <cmath>
+
+namespace {
+bool validLiq(const double* row) {
+  return std::isfinite(row[0]) && std::isfinite(row[1]) && std::isfinite(row[2]) &&
+      std::isfinite(row[1]*row[2]) && row[0]>0 && row[1]>0 && row[2]>0 &&
+      (row[3]==0 || row[3]==1);
+}
+}
+
 
 void MarketSeries::loadOi(const double* data, int n, int symIdx) {
   sym = symIdx;
@@ -33,27 +43,16 @@ void MarketSeries::loadFunding(const double* data, int n, int symIdx) {
 }
 
 void MarketSeries::loadLiq(const double* data, int n, int symIdx, int64_t base) {
-  if (n <= 0) {
-    // The periodic market heartbeat re-posts oi/funding live points but omits
-    // the liq payload when no print arrived since the last full sync. Keep the
-    // retained series and leave liqVersion alone: a spurious bump at publish
-    // rate re-sorted nothing but still invalidated every liq-gated consumer
-    // (liquidations filter cache, chart compute signature) several times per
-    // second. A base change (symbol switch resets it) still resets liqTop —
-    // setSymbol already cleared the series.
-    if (liqTop != base) {
-      liq.clear();
-      liqTop = base;
-      ++liqVersion;
-    }
-    return;
-  }
+  // An omitted heartbeat payload is not a replacement snapshot. Symbol
+  // changes explicitly clear the series through Feeds::setSymbol.
+  if (!data || n <= 0) return;
+  liq.clear();
   sym = symIdx;
   int first = std::max(0, n - (int)MAX_SAMPLES);
   liq.reserve((size_t)(n - first));
   for (int i = first; i < n; ++i) {
     const double* row = data + (size_t)i * 4;
-    if (!(row[0] > 0) || !(row[1] > 0) || !(row[2] > 0)) continue;
+    if (!validLiq(row)) continue;
     liq.push_back({row[0], row[1], row[2], (uint8_t)(row[3] != 0)});
   }
   // Binance and Bybit streams arrive independently, so prints interleave in
@@ -73,7 +72,7 @@ void MarketSeries::appendLiq(const double* data, int n, int64_t start, int symId
   for (int i = 0; i < n; ++i) {
     if (start + i < liqTop) continue; // already known via the last full sync
     const double* row = data + (size_t)i * 4;
-    if (!(row[0] > 0) || !(row[1] > 0) || !(row[2] > 0)) continue;
+    if (!validLiq(row)) continue;
     liq.push_back({row[0], row[1], row[2], (uint8_t)(row[3] != 0)});
     changed = true;
   }

@@ -66,7 +66,7 @@ function pairLevels(v: unknown): PriceLevel[] | null {
 }
 
 export function parseDydxTrades(msg: unknown): TradePrint[] | null {
-  if (!isRecord(msg) || msg.channel !== "v4_trades") return null;
+  if (!isRecord(msg) || msg.channel !== "v4_trades" || msg.type==="subscribed") return null;
   if (msg.type !== "subscribed" && msg.type !== "channel_data" && msg.type !== "channel_batch_data") {
     return null;
   }
@@ -153,6 +153,7 @@ export class DydxAdapter implements VenueAdapter {
 
   private teardown(): void {
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;

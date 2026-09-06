@@ -62,7 +62,7 @@ export function parseLighterTrades(
   channel = `trade:${DEFAULT_MARKET_ID}`,
 ): TradePrint[] | null {
   if (!isRecord(msg) || msg.channel !== channel) return null;
-  if (msg.type !== "subscribed/trade" && msg.type !== "update/trade") return null;
+  if (msg.type !== "update/trade") return null;
   if (!Array.isArray(msg.trades)) return null;
   const prints: TradePrint[] = [];
   for (const row of msg.trades) {
@@ -143,6 +143,7 @@ export class LighterAdapter implements VenueAdapter {
       this.pingTimer = null;
     }
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -183,6 +184,7 @@ export class LighterAdapter implements VenueAdapter {
 
     if (this.lastNonce === null) return;
 
+    if(parsed.nonce<=this.lastNonce) return;
     if (parsed.beginNonce !== this.lastNonce) {
       this.resync(`nonce gap: expected begin_nonce ${this.lastNonce}, got ${parsed.beginNonce}`);
       return;

@@ -5,6 +5,9 @@
 #include "period_levels_draw.h"
 #include "chart_cache.h"
 #include "chart_input.h"
+#include "vwap_series.h"
+#include "cvd_series.h"
+#include "tpo_draw.h"
 
 #include "../flow_sources.h"
 #include "../../data/feeds.h"
@@ -15,6 +18,7 @@
 #include "../../ui/widgets.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -34,10 +38,10 @@ static constexpr float kStMultipliers[] = {1.5f, 2.0f, 3.0f, 4.0f};
 static constexpr const char* kChartTypeNames[] = {"CANDLES", "CLUSTER", "PROFILE", "TPO"};
 
 // Mode-specific bar spacing defaults (presentation only, not a data limit).
-static float barWidthDefault(int chartType) {
+static float barWidthDefault(int chartType, double minutes = 5) {
   if (chartType == 0) return 7.0f;
   if (chartType == 1 || chartType == 2) return 18.0f;
-  return 5.0f;
+  return (float)(150.0 * std::max(1.0, minutes) / 1440.0);
 }
 
 static float barWidthMax(int chartType) {
@@ -326,30 +330,8 @@ static double trueRange(const Candle& c, double prevC) {
 
 static int64_t utcDay(double tsMs) { return (int64_t)std::floor(tsMs / 86400000.0); }
 
-// TPO shows the latest few UTC sessions; profile column count scales to the
-// pane. Shared by the price-range scan and the TPO session builder so both
-// agree on how many sessions exist.
-static inline int tpoMaxSessions(float paneW) {
-  return paneW >= 760 ? 4 : paneW >= 460 ? 3 : 2;
-}
-
 // First bar of the visible TPO window: walk back from `vis1` across whole
 // UTC days until one more session than the pane can show has been crossed.
-static inline int tpoWindowFirst(const CandleSeries& cs, int vis1,
-                                 int maxSessions) {
-  int first = vis1;
-  int64_t lastDay = -1;
-  int days = 0;
-  for (int i = vis1; i >= 0; --i) {
-    int64_t day = utcDay(cs.v[(size_t)i].ts);
-    if (day != lastDay) {
-      lastDay = day;
-      if (++days > maxSessions) return i + 1;
-    }
-    first = i;
-  }
-  return first;
-}
 
 static void atrSeries(const CandleSeries& cs, int period, std::vector<float>& out) {
   size_t n = cs.v.size();
@@ -366,65 +348,6 @@ static void atrSeries(const CandleSeries& cs, int period, std::vector<float>& ou
   for (size_t i = (size_t)period; i < n; ++i) {
     atr = (atr * (period - 1) + trueRange(cs.v[i], cs.v[i - 1].c)) / period;
     out[i] = (float)atr;
-  }
-}
-
-static void vwapSeries(const CandleSeries& cs, std::vector<float>& out,
-                       std::vector<float>& upper, std::vector<float>& lower) {
-  size_t n = cs.v.size();
-  out.assign(n, NAN);
-  upper.assign(n, NAN);
-  lower.assign(n, NAN);
-  double pv = 0, vol = 0, pv2 = 0;
-  int64_t day = std::numeric_limits<int64_t>::min();
-  for (size_t i = 0; i < n; ++i) {
-    int64_t d = utcDay(cs.v[i].ts);
-    if (d != day) {
-      pv = vol = pv2 = 0;
-      day = d;
-    }
-    double tp = (cs.v[i].h + cs.v[i].l + cs.v[i].c) / 3.0;
-    double v = barVolume(cs.v[i]);
-    pv += tp * v;
-    pv2 += tp * tp * v;
-    vol += v;
-    if (!(vol > 0)) continue;
-    double vwap = pv / vol;
-    double sd = std::sqrt(std::max(0.0, pv2 / vol - vwap * vwap));
-    out[i] = (float)vwap;
-    upper[i] = (float)(vwap + sd);
-    lower[i] = (float)(vwap - sd);
-  }
-}
-
-static void supertrendSeries(const CandleSeries& cs, int period, float mult,
-                             std::vector<float>& out, std::vector<int8_t>& dir) {
-  size_t n = cs.v.size();
-  out.assign(n, NAN);
-  dir.assign(n, 0);
-  if (n < (size_t)period || period < 1 || !(mult > 0)) return;
-  std::vector<float> atr;
-  atrSeries(cs, period, atr);
-  double finalUp = 0, finalDn = 0;
-  int trend = 1;
-  for (size_t i = (size_t)period - 1; i < n; ++i) {
-    if (std::isnan(atr[i])) continue;
-    double hl2 = (cs.v[i].h + cs.v[i].l) * 0.5;
-    double up = hl2 + mult * atr[i];
-    double dn = hl2 - mult * atr[i];
-    if (i == (size_t)period - 1) {
-      finalUp = up;
-      finalDn = dn;
-      trend = cs.v[i].c <= finalUp ? -1 : 1;
-    } else {
-      double prevUp = finalUp, prevDn = finalDn;
-      finalUp = cs.v[i - 1].c > prevUp ? std::min(up, prevUp) : up;
-      finalDn = cs.v[i - 1].c < prevDn ? std::max(dn, prevDn) : dn;
-      if (trend == -1 && cs.v[i].c > prevUp) trend = 1;
-      else if (trend == 1 && cs.v[i].c < prevDn) trend = -1;
-    }
-    out[i] = (float)(trend == 1 ? finalDn : finalUp);
-    dir[i] = (int8_t)trend;
   }
 }
 
@@ -549,62 +472,15 @@ static int cvdMaxSel(const IndicatorInstance& inst) {
   return inst.reg == IndCvd ? std::clamp(inst.p1, 0, kCvdMaxN - 1) : 0;
 }
 static bool cvdNeedsFlow(const IndicatorInstance& inst) {
-  return inst.reg == IndCvd && (inst.opt == CvdCandles || inst.p0 > 0 || inst.p1 > 0);
+  return inst.reg == IndCvd && (inst.p0 > 0 || inst.p1 > 0);
 }
-static bool cvdTradePass(const OrderFlowTrade& t, double minUsd, double maxUsd) {
-  double usd = t.price * t.qty;
-  if (!(usd > 0) || !std::isfinite(usd)) return false;
-  if (minUsd > 0 && usd < minUsd) return false;
-  if (maxUsd > 0 && usd >= maxUsd) return false;
-  return true;
-}
-
 static void computeCvdSeries(const CandleSeries& cs, IndicatorInstance& inst,
                              const OrderFlowSeries* of) {
-  const size_t n = cs.v.size();
-  inst.series.resize(n);
-  inst.aux.resize(n);
-  inst.aux2.resize(n);
-  const double minUsd = kCvdMinUsd[cvdMinSel(inst)];
-  const double maxUsd = kCvdMaxUsd[cvdMaxSel(inst)];
-  const bool useFlow = (minUsd > 0 || maxUsd > 0 || inst.opt == CvdCandles) &&
-                       of && !of->v.empty();
-  if (!useFlow) {
-    double acc = 0;
-    for (size_t i = 0; i < n; ++i) {
-      double open = acc;
-      acc += cs.v[i].delta;
-      inst.series[i] = (float)acc;
-      inst.aux[i] = (float)std::max(open, acc);
-      inst.aux2[i] = (float)std::min(open, acc);
-    }
-    inst.liveI = of ? (int)of->v.size() : 0;
-    inst.liveShift = of ? of->indexShift : 0;
-    inst.liveDay = 0;
-    return;
-  }
-  size_t ti = 0;
-  double acc = 0;
-  for (size_t i = 0; i < n; ++i) {
-    double open = acc;
-    double hi = open, lo = open;
-    const double barTs = cs.v[i].ts;
-    const double barEnd = i + 1 < n ? cs.v[i + 1].ts : 1e300;
-    while (ti < of->v.size() && of->v[ti].ts < barTs) ++ti;
-    while (ti < of->v.size() && of->v[ti].ts < barEnd) {
-      const OrderFlowTrade& t = of->v[ti++];
-      if (t.ts < barTs || !cvdTradePass(t, minUsd, maxUsd)) continue;
-      acc += t.side == 0 ? t.qty : -t.qty;
-      if (acc > hi) hi = acc;
-      if (acc < lo) lo = acc;
-    }
-    inst.series[i] = (float)acc;
-    inst.aux[i] = (float)hi;
-    inst.aux2[i] = (float)lo;
-  }
-  inst.liveI = (int)of->v.size();
-  inst.liveShift = of->indexShift;
-  inst.liveDay = (int64_t)of->generation;
+  buildCvdSeries(cs, of, kCvdMinUsd[cvdMinSel(inst)], kCvdMaxUsd[cvdMaxSel(inst)],
+                 inst.series, inst.aux, inst.aux2);
+  inst.liveI = of ? (int)of->v.size() : 0;
+  inst.liveShift = of ? of->indexShift : 0;
+  inst.liveDay = of ? (int64_t)of->generation : 0;
 }
 
 static void drawOscCandles(DrawList& d, const ChartPane& pane,
@@ -614,7 +490,8 @@ static void drawOscCandles(DrawList& d, const ChartPane& pane,
   for (int i = vis0; i <= vis1 && i < (int)s.size(); ++i) {
     float cl = s[(size_t)i];
     if (std::isnan(cl)) continue;
-    float op = (i > 0 && !std::isnan(s[(size_t)i - 1])) ? s[(size_t)i - 1] : cl;
+    float op = (i > 0 && !std::isnan(s[(size_t)i - 1])) ? s[(size_t)i - 1]
+                  : inst.reg == IndCvd ? 0.0f : cl;
     float hi = i < (int)inst.aux.size() && !std::isnan(inst.aux[(size_t)i])
                    ? inst.aux[(size_t)i] : std::max(op, cl);
     float lo = i < (int)inst.aux2.size() && !std::isnan(inst.aux2[(size_t)i])
@@ -971,8 +848,8 @@ static void computeCvd(const CandleSeries& cs, IndicatorInstance& inst,
                        const OrderFlowSeries* of, const MarketSeries* mkt) {
   computeCvdSeries(cs, inst, of);
   const size_t n = cs.v.size();
-  if (n >= 2 && inst.series.size() == n) {
-    inst.live0 = (double)inst.series[n - 2];
+  if (n && inst.series.size() == n) {
+    inst.live0 = n >= 2 && std::isfinite(inst.series[n - 2]) ? inst.series[n - 2] : 0;
     inst.live1 = (double)inst.series[n - 1];
     inst.live2 = inst.aux.size() == n ? (double)inst.aux[n - 1] : inst.live1;
     inst.live3 = inst.aux2.size() == n ? (double)inst.aux2[n - 1] : inst.live1;
@@ -986,7 +863,7 @@ static bool updateCvd(const CandleSeries& cs, IndicatorInstance& inst,
   if (inst.aux.size() != n) inst.aux.assign(n, NAN);
   if (inst.aux2.size() != n) inst.aux2.assign(n, NAN);
   const bool needFlow = cvdNeedsFlow(inst);
-  if (needFlow && of && !of->v.empty() && inst.liveDay == 0) return false;
+  if (needFlow && (!of || of->v.empty() || !std::isfinite(inst.live1))) return false;
   if (needFlow && of && !of->v.empty()) {
     if ((uint64_t)inst.liveDay != of->generation || inst.liveI < 0)
       return false;
@@ -1006,7 +883,9 @@ static bool updateCvd(const CandleSeries& cs, IndicatorInstance& inst,
     size_t ti = (size_t)inst.liveI;
     while (ti < of->v.size()) {
       const OrderFlowTrade& t = of->v[ti++];
-      if (t.ts < barTs || !cvdTradePass(t, minUsd, maxUsd)) continue;
+      // Late prints can change a closed bar and every subsequent CVD value.
+      if (t.ts < barTs) return false;
+      if (!cvdTradePass(t, minUsd, maxUsd)) continue;
       acc += t.side == 0 ? t.qty : -t.qty;
       if (acc > hi) hi = acc;
       if (acc < lo) lo = acc;
@@ -1022,8 +901,8 @@ static bool updateCvd(const CandleSeries& cs, IndicatorInstance& inst,
   }
   double acc = inst.live0 + c.delta;
   inst.series[n - 1] = (float)acc;
-  inst.aux[n - 1] = (float)std::max(inst.live0, acc);
-  inst.aux2[n - 1] = (float)std::min(inst.live0, acc);
+  inst.aux[n - 1] = (float)std::max({inst.live0, inst.live2, acc});
+  inst.aux2[n - 1] = (float)std::min({inst.live0, inst.live3, acc});
   inst.live1 = acc;
   inst.live2 = inst.aux[n - 1];
   inst.live3 = inst.aux2[n - 1];
@@ -1154,60 +1033,21 @@ static bool updateMacd(const CandleSeries& cs, IndicatorInstance& inst,
 }
 
 static void computeVwap(const CandleSeries& cs, IndicatorInstance& inst,
-                        const OrderFlowSeries* of, const MarketSeries* mkt) {
-  vwapSeries(cs, inst.series, inst.aux, inst.aux2);
-  const size_t n = cs.v.size();
-  if (n >= 2 && inst.aux.size() == n && inst.series.size() == n) {
-    double pv = 0, vol = 0, pv2 = 0;
-    int64_t day = std::numeric_limits<int64_t>::min();
-    for (size_t i = 0; i <= n - 2; ++i) {
-      int64_t d = utcDay(cs.v[i].ts);
-      if (d != day) {
-        pv = vol = pv2 = 0;
-        day = d;
-      }
-      double tp = (cs.v[i].h + cs.v[i].l + cs.v[i].c) / 3.0;
-      double v = barVolume(cs.v[i]);
-      pv += tp * v;
-      pv2 += tp * tp * v;
-      vol += v;
-    }
-    inst.live0 = pv;
-    inst.live1 = vol;
-    inst.live2 = pv2;
-    inst.liveDay = day;
-  }
+                        const OrderFlowSeries*, const MarketSeries*) {
+  computeVwapSeries(cs, inst.p0, inst.p1 > 0 ? inst.p1 : 24,
+                    inst.series, inst.aux, inst.aux2, &inst.vwap);
 }
 
 static bool updateVwap(const CandleSeries& cs, IndicatorInstance& inst,
                        const OrderFlowSeries* of, const MarketSeries* mkt) {
-  const size_t n = cs.v.size();
-  const Candle& c = cs.v[n - 1];
-  if (inst.aux.size() != n || inst.aux2.size() != n) return false;
-  double pv = inst.live0, vol = inst.live1, pv2 = inst.live2;
-  int64_t day = utcDay(c.ts);
-  if (day != inst.liveDay) pv = vol = pv2 = 0;
-  double tp = (c.h + c.l + c.c) / 3.0;
-  double v = barVolume(c);
-  pv += tp * v;
-  pv2 += tp * tp * v;
-  vol += v;
-  if (vol > 0) {
-    double vwap = pv / vol;
-    double sd = std::sqrt(std::max(0.0, pv2 / vol - vwap * vwap));
-    inst.series[n - 1] = (float)vwap;
-    inst.aux[n - 1] = (float)(vwap + sd);
-    inst.aux2[n - 1] = (float)(vwap - sd);
-  }
+  if (cs.v.empty() || inst.series.size() != cs.v.size() ||
+      inst.aux.size() != cs.v.size() || inst.aux2.size() != cs.v.size()) return false;
+  // Chart shape invalidation rebuilds on a new timestamp / shifted history.
+  // Within the forming bar, reuse closed moments without double counting it.
+  updateVwapPoint(cs.v.back(), inst.vwap, inst.series.back(), inst.aux.back(), inst.aux2.back());
   return true;
 }
 
-static void computeSt(const CandleSeries& cs, IndicatorInstance& inst,
-                      const OrderFlowSeries* of, const MarketSeries* mkt) {
-  supertrendSeries(cs, std::max(2, inst.p0),
-                   kStMultipliers[std::clamp(inst.opt, 0, 3)], inst.series,
-                   inst.dir);
-}
 
 static void computeStoch(const CandleSeries& cs, IndicatorInstance& inst,
                          const OrderFlowSeries* of, const MarketSeries* mkt) {
@@ -1427,7 +1267,7 @@ static const Indicator kRegistry[] = {
     {"BB", true, 0, computeBoll, updateSmaBoll},
     {"BOOK HEAT", true, CapOnce, computePlotless, nullptr},
     {"VWAP", true, 0, computeVwap, updateVwap},
-    {"ST", true, 0, computeSt, nullptr},
+    {"", true, 0, computePlotless, nullptr},
     {"EMA", true, 0, computeEma, updateEma},
     {"STOCH", false, 0, computeStoch, updateStoch},
     {"ATR", false, 0, computeAtr, updateAtr},
@@ -1471,7 +1311,7 @@ static bool paneKind(int ri) {
 
 // SuperTrend and the duplicate long-EMA slot stay in the registry so the
 // settings width vector does not shift. They are not offered in the picker.
-static bool catalogReg(int ri) { return ri != IndEma2; }
+static bool catalogReg(int ri) { return ri != IndEma2 && ri != IndSt; }
 
 static int catalogCount() {
   int n = 0;
@@ -1494,6 +1334,14 @@ static int catalogAt(int vis) {
 static void indicatorName(int ri, int p0, int p1, int p2, int opt, char* out,
                           size_t n) {
   switch (ri) {
+    case IndVwap:
+      if (p0 == 5) snprintf(out, n, "RVWAP %dH", p1 > 0 ? p1 : 24);
+      else if (p0 == 1) snprintf(out, n, "VWAP WEEK");
+      else if (p0 == 2) snprintf(out, n, "VWAP MONTH");
+      else if (p0 == 3) snprintf(out, n, "VWAP 08 UTC");
+      else if (p0 == 4) snprintf(out, n, "VWAP 13:30 UTC");
+      else snprintf(out, n, "VWAP");
+      break;
     case IndEma:
     case IndEma2: snprintf(out, n, "EMA %d", p0); break;
     case IndSma: snprintf(out, n, "SMA %d", p0); break;
@@ -1714,6 +1562,7 @@ IndicatorInstance ChartPanel::makeInstance(int ri) {
       break;
     case IndVwap:
       inst.flag = m_showVwapBands;
+      inst.p1 = 24;
       inst.opt = 1; // ±1σ bands by default
       inst.colorD = inst.colorE = inst.colorB; // bands share one hue initially
       break;
@@ -1740,6 +1589,7 @@ IndicatorInstance ChartPanel::makeInstance(int ri) {
       inst.colorB = 4;
       break;
     case IndLevels:
+      inst.opt = 0;
       inst.p0 = 7;
       inst.flag = false;
       inst.colorA = 0;
@@ -1794,6 +1644,7 @@ void ChartPanel::addIndicator(int ri) {
     setMapFlag(ri, true);
     saveSettings();
   }
+  saveIndicatorSettings();
 }
 
 void ChartPanel::removeIndicator(Ui& u, int instId) {
@@ -1823,6 +1674,7 @@ void ChartPanel::removeIndicator(Ui& u, int instId) {
     saveSettings();
   }
   noteSetChanged();
+  saveIndicatorSettings();
 }
 
 void ChartPanel::setMapFlag(int ri, bool on) {
@@ -2082,6 +1934,7 @@ void ChartPanel::ensureComputed(const Feeds& feeds) {
     if (of.prepends != m_flowSeenPrepends) {
       m_flowSeenPrepends = of.prepends;
       m_flowHistoryStale = true;
+      forceFull = true;
     }
     if (of.version != m_flowShadowVer) {
       m_flowShadowVer = of.version;
@@ -2817,7 +2670,8 @@ static void drawPaneBody(DrawList& d, const ChartPane& pane, const CandleSeries&
 
 static void drawVwapLine(DrawList& d, const ChartPane& pane, const CandleSeries& cs,
                          const std::vector<float>& s, int vis0, int vis1,
-                         float startF, float bw, Color c, float thick) {
+                         float startF, float bw, Color c, float thick,
+                         int sessionMode, int previousCount) {
   static thread_local std::vector<float> xy;
   // Dark casing under the line so the VWAP keeps a crisp outline over
   // candles and band fills instead of dissolving into them.
@@ -2832,7 +2686,7 @@ static void drawVwapLine(DrawList& d, const ChartPane& pane, const CandleSeries&
   int64_t day = std::numeric_limits<int64_t>::min();
   for (int i = vis0; i <= vis1 && i < (int)s.size() && i < (int)cs.v.size(); ++i) {
     float v = s[(size_t)i];
-    int64_t d = utcDay(cs.v[(size_t)i].ts);
+    int64_t d = vwapSession(cs.v[(size_t)i].ts, sessionMode);
     if (std::isnan(v)) {
       flush();
       continue;
@@ -2845,6 +2699,21 @@ static void drawVwapLine(DrawList& d, const ChartPane& pane, const CandleSeries&
     xy.push_back(pane.yOf(v));
   }
   flush();
+  if (sessionMode == 5 || previousCount <= 0 || cs.v.empty()) return;
+  int remaining = std::clamp(previousCount, 0, 5);
+  // Walk completed sessions backwards, extending their final VWAP to today.
+  for (int i = std::min(vis1, (int)s.size() - 1); i > 0 && remaining; --i) {
+    if (vwapSession(cs.v[i].ts, sessionMode) ==
+        vwapSession(cs.v[i - 1].ts, sessionMode)) continue;
+    if (!std::isfinite(s[i - 1])) continue;
+    const float y = pane.yOf(s[i - 1]);
+    const float x = std::max(pane.area.x, pane.area.x + (i - startF) * bw);
+    const float right = pane.area.x + pane.area.w;
+    if (x < right && y >= pane.area.y && y <= pane.area.y + pane.area.h)
+      d.linePattern(x, y, right, y, withAlpha(c, 0.55f), thick,
+                    DrawList::LineStyle::Dashed);
+    --remaining;
+  }
 }
 
 // Liquidity heat overlay: one full-width column per candle, two-toned at the
@@ -3357,7 +3226,7 @@ static float drawHtProfile(DrawList& d, const HtLayer& layer, const ChartPane& p
   if (!(maxUsd > 0)) return 0;
 
   const float origin = xRight;
-  d.rect({origin, paneTop, 1.0f, paneBot - paneTop}, withAlpha(t.border, 0.55f));
+  d.rectTile({origin, paneTop, 1.0f, paneBot - paneTop}, withAlpha(t.border, 0.55f));
 
   for (int r = bMin; r <= bMax; ++r) {
     // cellY bands are integer; floor only absorbs the fractional pane-edge
@@ -3373,17 +3242,17 @@ static float drawHtProfile(DrawList& d, const HtLayer& layer, const ChartPane& p
     float tRamp = std::clamp(heatmapStrength(usd, ref) / 1.5f, 0.0f, 1.0f);
     tRamp = tRamp * tRamp * (3.0f - 2.0f * tRamp);
     Color fill = magma ? magmaColor(tRamp) : viridisColor(tRamp);
-    d.rect({origin - w, yTop, w, yH},
+    d.rectTile({origin - w, yTop, w, yH},
            withAlpha(fill, std::clamp(opacity * (0.48f + 0.46f * str), 0.28f, 0.94f)));
-    d.rect({origin - w, yTop, 1.0f, yH},
+    d.rectTile({origin - w, yTop, 1.0f, yH},
            withAlpha(longs[i] >= shorts[i] ? t.green : t.red, 0.88f));
   }
   if (pocRow >= 0) {
     float y = std::floor(std::max(paneTop, (float)(bMin + pocRow) * (float)cellY) +
                          0.5f * (float)cellY);
     if (y > paneTop + 1.0f && y < paneBot - 1.0f) {
-      d.rect({origin - maxW, y, maxW, 1.0f}, withAlpha(t.text, 0.70f));
-      d.rect({origin - 3.0f, y - 1.0f, 4.0f, 3.0f}, withAlpha(t.text, 0.85f));
+      d.rectTile({origin - maxW, y, maxW, 1.0f}, withAlpha(t.text, 0.70f));
+      d.rectTile({origin - 3.0f, y - 1.0f, 4.0f, 3.0f}, withAlpha(t.text, 0.85f));
     }
   }
   return maxW;
@@ -3527,7 +3396,7 @@ static float drawVolumeProfile(DrawList& d, const ChartPane& pane,
   }
   const Theme& t = theme();
   const float origin = xRight;
-  d.rect({origin, pane.area.y, 1.0f, pane.area.h}, withAlpha(t.border, 0.55f));
+  d.rectTile({origin, pane.area.y, 1.0f, pane.area.h}, withAlpha(t.border, 0.55f));
   for (int i = 0; i < rows; ++i) {
     double b = buy[(size_t)i], s = sell[(size_t)i];
     double v = b + s;
@@ -3544,18 +3413,18 @@ static float drawVolumeProfile(DrawList& d, const ChartPane& pane,
     float w = std::max(1.0f, (float)(v / pocV) * maxW);
     bool inVa = showVa && i >= vaLo && i <= vaHi;
     float buyW = w * (float)(b / v);
-    d.rect({origin - w, top, buyW, h}, withAlpha(buyC, inVa ? 0.55f : 0.28f));
-    d.rect({origin - w + buyW, top, w - buyW, h},
+    d.rectTile({origin - w, top, buyW, h}, withAlpha(buyC, inVa ? 0.55f : 0.28f));
+    d.rectTile({origin - w + buyW, top, w - buyW, h},
            withAlpha(sellC, inVa ? 0.55f : 0.28f));
   }
   if (showVa) {
     float yPoc = std::floor(pane.yOf(((double)(r0 + poc) + 0.5) * bin));
-    d.rect({origin - maxW, yPoc, maxW, 1.0f}, withAlpha(t.text, 0.80f));
+    d.rectTile({origin - maxW, yPoc, maxW, 1.0f}, withAlpha(t.text, 0.80f));
     float yLo = pane.yOf((double)(r0 + vaHi + 1) * bin);
     float yHi = pane.yOf((double)(r0 + vaLo) * bin);
     float vaTop = std::floor(std::min(yLo, yHi));
     float vaBot = std::floor(std::max(yLo, yHi));
-    d.rect({origin - 2.0f, vaTop, 2.0f, std::max(1.0f, vaBot - vaTop)},
+    d.rectTile({origin - 2.0f, vaTop, 2.0f, std::max(1.0f, vaBot - vaTop)},
            withAlpha(t.accent, 0.55f));
   }
   return maxW;
@@ -3592,7 +3461,7 @@ static float drawLiqProfile(DrawList& d, const LiqMapSeries& lm, const ChartPane
   }
   if (!(maxUsd > 0)) return 0;
   const float origin = xRight;
-  d.rect({origin, paneTop, 1.0f, paneBot - paneTop}, withAlpha(t.border, 0.55f));
+  d.rectTile({origin, paneTop, 1.0f, paneBot - paneTop}, withAlpha(t.border, 0.55f));
   for (size_t i = 0; i < col.rows.size(); ++i) {
     const int64_t row = col.rows[i];
     if (row + 1 <= visLo || row >= visHi) continue;
@@ -3618,7 +3487,7 @@ static float drawLiqProfile(DrawList& d, const LiqMapSeries& lm, const ChartPane
     float tNorm = liqHeatT(usd, maxUsd, gamma);
     float w = std::max(1.0f, maxW * tNorm);
     Color fill = magmaColor(std::clamp(tNorm, 0.0f, 1.0f));
-    d.rect({origin - w, yTop, w, yH},
+    d.rectTile({origin - w, yTop, w, yH},
            withAlpha(fill, std::clamp(opacity * (0.50f + 0.44f * tNorm), 0.30f,
                                       0.94f)));
   }
@@ -3759,6 +3628,11 @@ void ChartPanel::resetSettings() {
   m_footprintHeatmap = 1;
   m_footprintMinCell = 0;
   m_tpoBracket = 0;
+  m_tpoSessions = 3;
+  m_tpoRows = 256;
+  m_tpoSplit = false;
+  m_tpoExtend=121; m_tpoLabels=31; m_tpoOptions=false;
+  m_tpoMarks = 15; m_tpoSelected = -1; m_tpoJoins.clear();
   m_emaPeriod = 21;
   m_ema2Period = 200;
   m_smaPeriod = 50;
@@ -3831,7 +3705,7 @@ const ChartPanel::Setting ChartPanel::kSettings[] = {
     {.type = SettType::Int, .lo = 0, .hi = 3, .i = &ChartPanel::m_footprintGrouping},
     {.type = SettType::Int, .lo = 0, .hi = 2, .i = &ChartPanel::m_footprintImbalance},
     {.type = SettType::Bool, .b = &ChartPanel::m_showFootprintText},
-    {.type = SettType::Int, .lo = 0, .hi = 1, .i = &ChartPanel::m_tpoBracket},
+    {.type = SettType::Int, .lo = 0, .hi = 2, .i = &ChartPanel::m_tpoBracket},
     {.type = SettType::Bool, .b = &ChartPanel::m_showFootprintPoc},
     {.type = SettType::Bool, .b = &ChartPanel::m_showFootprintImbalances},
     {.type = SettType::Bool, .b = &ChartPanel::m_showFootprintStacked},
@@ -3918,9 +3792,87 @@ void ChartPanel::saveSettings() {
       appendSetting(this->*(s.i));
   }
   shell_storage_set(m_settingsKey.c_str(), saved.c_str());
+  const std::string tpo = std::to_string(m_tpoSessions) + "," + std::to_string(m_tpoRows) + "," + std::to_string(m_tpoSplit);
+  shell_storage_set((m_settingsKey + ".tpo.v2").c_str(), tpo.c_str());
+  std::string structure=std::to_string(m_tpoMarks);
+  for(int day:m_tpoJoins) structure+=","+std::to_string(day);
+  shell_storage_set((m_settingsKey+".tpo.structure.v2").c_str(),structure.c_str());
+  const std::string display=std::to_string(m_tpoExtend)+","+std::to_string(m_tpoLabels);
+  shell_storage_set((m_settingsKey+".tpo.display.v1").c_str(),display.c_str());
+  saveIndicatorSettings();
   ++m_calcGen;
   ++m_rngGen;
   m_liveState = false;
+}
+
+void ChartPanel::saveIndicatorSettings() {
+  // loadSettings and first-frame defaults must not overwrite saved instances.
+  if (!m_pickerId) return;
+  std::string saved = "1;";
+  auto append = [&](const IndicatorInstance& inst, bool overlay) {
+    const int fields[] = {overlay ? 1 : 0, inst.reg, inst.width,
+      std::bit_cast<int32_t>(inst.colorA), std::bit_cast<int32_t>(inst.colorB),
+      std::bit_cast<int32_t>(inst.colorC), std::bit_cast<int32_t>(inst.colorD),
+      std::bit_cast<int32_t>(inst.colorE), inst.p0, inst.p1, inst.p2, inst.opt,
+      inst.flag ? 1 : 0, inst.labelVisible ? 1 : 0, inst.seriesVisible ? 1 : 0,
+      (int)std::lround(inst.height)};
+    for (size_t i = 0; i < std::size(fields); ++i) {
+      if (i) saved += ',';
+      saved += std::to_string(fields[i]);
+    }
+    saved += ';';
+  };
+  for (const auto& inst : m_overlays) append(inst, true);
+  for (const auto& inst : m_panes) append(inst, false);
+  shell_storage_set((m_settingsKey + ".indicators.v1").c_str(), saved.c_str());
+}
+
+bool ChartPanel::loadIndicatorSettings() {
+  char* raw = shell_storage_get((m_settingsKey + ".indicators.v1").c_str());
+  if (!raw) return false;
+  const std::string saved(raw);
+  std::free(raw);
+  if (!saved.starts_with("1;") || saved.size() > 32768) return false;
+  std::vector<IndicatorInstance> overlays, panes;
+  size_t start = 2;
+  while (start < saved.size()) {
+    if (overlays.size() + panes.size() >= 64) return false;
+    const size_t end = saved.find(';', start);
+    if (end == std::string::npos) return false;
+    int v[16]{};
+    if (parseChartSettings(std::string_view(saved).substr(start, end - start), v) != 16 ||
+        v[0] < 0 || v[0] > 1 || v[1] < 0 || v[1] >= indicatorCount() ||
+        (v[1] != IndSt && !catalogReg(v[1])) || (!v[0] && !paneKind(v[1])) || v[2] < 0 || v[2] > 3)
+      return false;
+    if (v[1] == IndSt) { start = end + 1; continue; } // retired slot; preserve all other instances
+    for (int i = 8; i <= 11; ++i) if (v[i] < 0 || v[i] > 10000) return false;
+    for (int i = 12; i <= 14; ++i) if (v[i] < 0 || v[i] > 1) return false;
+    // Period-based models require nonzero lengths. Preserve valid UI ranges.
+    if ((v[1] == IndRsi || v[1] == IndMacd || v[1] == IndEma ||
+         v[1] == IndSma || v[1] == IndBoll || v[1] == IndSt ||
+         v[1] == IndEma2 || v[1] == IndStoch || v[1] == IndAtr ||
+         v[1] == IndAdx || v[1] == IndCipherB) && v[8] < 1) return false;
+    if ((v[1] == IndMacd || v[1] == IndStoch || v[1] == IndCipherB) &&
+        (v[9] < 1 || v[10] < 1)) return false;
+    IndicatorInstance inst = makeInstance(v[1]);
+    inst.width = (uint8_t)v[2];
+    uint32_t* colors[] = {&inst.colorA, &inst.colorB, &inst.colorC, &inst.colorD, &inst.colorE};
+    for (int i = 0; i < 5; ++i) {
+      const uint32_t color = std::bit_cast<uint32_t>((int32_t)v[3 + i]);
+      if (color >= kIndPaletteN && (color & 0xff000000u) != kIndCustomBit) return false;
+      *colors[i] = color;
+    }
+    inst.p0 = v[8]; inst.p1 = v[9]; inst.p2 = v[10]; inst.opt = v[11];
+    inst.flag = v[12] != 0; inst.labelVisible = v[13] != 0; inst.seriesVisible = v[14] != 0;
+    inst.height = (float)std::clamp(v[15], 32, 800);
+    (v[0] ? overlays : panes).push_back(std::move(inst));
+    start = end + 1;
+  }
+  m_overlays = std::move(overlays); m_panes = std::move(panes);
+  refreshEnabled();
+  for (int reg : {IndHeat, IndHlLiq, IndHlSl, IndLiqMap}) setMapFlag(reg, indicatorOn(reg));
+  noteSetChanged();
+  return true;
 }
 
 void ChartPanel::ensureHtToken() {
@@ -3935,6 +3887,29 @@ void ChartPanel::ensureHtToken() {
 void ChartPanel::loadSettings() {
   if (m_settingsLoaded) return;
   m_settingsLoaded = true;
+  if (char* raw = shell_storage_get((m_settingsKey + ".tpo.v2").c_str())) {
+    int v[3]{};
+    if (parseChartSettings(raw, v) == 3) {
+      m_tpoSessions = std::clamp(v[0], 1, 5);
+      m_tpoRows = std::clamp(v[1], 16, 512);
+      m_tpoSplit = v[2] != 0;
+    }
+    std::free(raw);
+  }
+  char* structureRaw=shell_storage_get((m_settingsKey+".tpo.structure.v2").c_str());
+  const bool migrateStructure=!structureRaw;
+  if(!structureRaw) structureRaw=shell_storage_get((m_settingsKey+".tpo.structure.v1").c_str());
+  if(char* raw=structureRaw) {
+    int v[65]{}; int count=parseChartSettings(raw,v);
+    if(count>0) m_tpoMarks=migrateStructure?15:v[0]&15;
+    for(int i=1;i<count;++i) if(v[i]>0 && v[i]<2932897) m_tpoJoins.push_back(v[i]);
+    std::free(raw);
+  }
+  if(char* raw=shell_storage_get((m_settingsKey+".tpo.display.v1").c_str())) {
+    int values[2]{};
+    if(parseChartSettings(raw,values)==2){m_tpoExtend=values[0]&127; m_tpoLabels=values[1]&31;}
+    std::free(raw);
+  }
   char* saved = shell_storage_get(m_settingsKey.c_str());
   if (!saved) return;
   int values[96]{};
@@ -4107,12 +4082,6 @@ const ChartPanel::SettingRow ChartPanel::kRows[] = {
       {.label = "STRONG", .width = 68, .kind = RowKind::Int, .v0 = 2,
        .i = &ChartPanel::m_footprintHeatmap}},
      3},
-    {"TPO BRACKET",
-     {{.label = "30 MIN", .width = 70, .kind = RowKind::Int, .v0 = 0,
-       .i = &ChartPanel::m_tpoBracket},
-      {.label = "60 MIN", .width = 70, .kind = RowKind::Int, .v0 = 1,
-       .i = &ChartPanel::m_tpoBracket}},
-     2},
     {"RESTORE", {}, 0},
 };
 
@@ -4213,7 +4182,7 @@ void ChartPanel::drawSettings(Ui& u, Rect area) {
 void ChartPanel::PlotCtx::updateView(float barWidth) {
   slots = std::max(10, (int)std::floor(price.area.w / barWidth));
   bw = price.area.w / slots;
-  freeMax = (float)std::min(20, slots / 4);
+  freeMax = tpoBarsPerDay > 0 ? tpoBarsPerDay * .65f : (float)std::min(20, slots / 4);
   endSlot = size - 1 + freeMax - scroll;
   startF = endSlot - (slots - 1);
 }
@@ -4223,6 +4192,8 @@ void ChartPanel::PlotCtx::clampScroll() {
 }
 
 float ChartPanel::PlotCtx::clampBarWidth(int chartType, float value) const {
+  if (chartType == 3 && tpoBarsPerDay > 0)
+    return std::clamp(value, 48.0f / tpoBarsPerDay, 720.0f / tpoBarsPerDay);
   return std::clamp(value, 2.0f, barWidthMax(chartType));
 }
 
@@ -4231,11 +4202,14 @@ void ChartPanel::draw(Ui& u, Rect r, Feeds& feeds) {
   const CandleSeries& cs = feeds.candles;
   loadSettings();
   feeds.setFlowMask(m_flowMask);
+  if(m_chartType==3 && (cs.tf.kind!=Timeframe::Time || cs.tf.value!=30))
+    feeds.setTimeframe({Timeframe::Time,30});
   if (m_appliedChartType != m_chartType) {
     // Mode-specific spacing is a presentation default, not a history limit.
     // Reset it on mode entry so footprint/profile's wide text layout cannot
     // leave the chart showing only a handful of bars after a mode switch.
-    m_barWidth = barWidthDefault(m_chartType);
+    m_barWidth = barWidthDefault(m_chartType, cs.tf.value);
+    m_tpoSourceMinutes = m_chartType == 3 ? cs.tf.value : 0;
     m_appliedChartType = m_chartType;
     if ((m_chartType == 1 || m_chartType == 2) && feeds.orderFlow.v.empty())
       feeds.refreshOrderFlow();
@@ -4245,6 +4219,7 @@ void ChartPanel::draw(Ui& u, Rect r, Feeds& feeds) {
   if (!m_pickerId) { // first frame: defaults
     if (m_indicatorWidths.size() != (size_t)regN)
       m_indicatorWidths.assign((size_t)regN, (uint8_t)m_lineWidth);
+    if (!loadIndicatorSettings()) {
     addIndicator(IndEma);
     if (m_heatOn) addIndicator(IndHeat);
     if (m_hlLiqOn) addIndicator(IndHlLiq);
@@ -4252,6 +4227,7 @@ void ChartPanel::draw(Ui& u, Rect r, Feeds& feeds) {
     if (m_liqMapOn) addIndicator(IndLiqMap);
     addIndicator(IndVol);
     addIndicator(IndCvd);
+    }
     m_pickerId = u.id("##indpicker");
     m_tfPickerId = u.id("##tfpicker");
   }
@@ -4289,6 +4265,14 @@ void ChartPanel::draw(Ui& u, Rect r, Feeds& feeds) {
   drawTimeAxisRow(u, feeds, ctx);
   if (drawPricePane(u, feeds, ctx)) return;
   if (drawIndicatorPanes(u, feeds, ctx)) return;
+  if ((m_chartType == 1 || m_chartType == 2) &&
+      (feeds.orderFlow.v.empty() || cs.v[(size_t)ctx.vis0].ts < feeds.orderFlow.v.front().ts)) {
+    Rect notice{ctx.price.area.x + 8, ctx.price.area.y + ctx.price.area.h - 18,
+                std::max(0.0f, ctx.price.area.w - 16), 16};
+    u.draw.breakCmd();
+    u.draw.textFit(notice, feeds.orderFlow.v.empty() ? "Waiting for tick history"
+        : "Older candles are outside loaded tick history", t.textDim, DrawList::Left);
+  }
   drawLastPriceRow(u, feeds, ctx);
   drawCrosshairRow(u, feeds, ctx);
   drawHeatHover(u, feeds, ctx);
@@ -4353,12 +4337,14 @@ float ChartPanel::drawHeader(Ui& u, Rect r, Feeds& feeds) {
                                        : m_chartType == 2 ? "PROF" : "TPO";
   if (chip(u, typeBtn, typeLabel, m_chartType != 0)) {
     m_chartType = (m_chartType + 1) % 4;
-    m_barWidth = barWidthDefault(m_chartType);
+    m_barWidth = barWidthDefault(m_chartType, cs.tf.value);
+    m_tpoSourceMinutes = m_chartType == 3 ? cs.tf.value : 0;
     saveSettings();
   }
   u.tip(u.id("##chart-type"), typeBtn,
         "chart type: candles / footprint cluster / footprint profile / TPO");
 
+  m_drawings.currentSymbol = feeds.symbol;
   if (drawW > 0) {
     bool toolsOn = m_drawings.tool != DrawTool::Pointer ||
                    (m_drawings.pickerId && u.overlayOpen(m_drawings.pickerId));
@@ -4370,8 +4356,8 @@ float ChartPanel::drawHeader(Ui& u, Rect r, Feeds& feeds) {
       if (u.overlayOpen(m_drawings.pickerId)) u.closeOverlay(m_drawings.pickerId);
       else {
         if (u.overlayOpen(m_pickerId)) u.closeOverlay(m_pickerId);
-        float pw = 140.0f;
-        float ph = (float)kDrawToolN * 22.0f + 8.0f;
+        float pw = std::min(280.0f, r.w);
+        float ph = std::min(400.0f, u.draw.currentClip().y + u.draw.currentClip().h - r.y - 30.0f);
         m_drawings.pickerRect = {
             std::clamp(drawBtn.x, r.x, r.x + r.w - pw), r.y + 26.0f, pw, ph};
         u.openOverlay(m_drawings.pickerId, m_drawings.pickerRect);
@@ -4420,7 +4406,12 @@ float ChartPanel::drawHeader(Ui& u, Rect r, Feeds& feeds) {
   // usable plotting surface instead of being crushed beneath fixed chrome.
   const bool showTfRow = r.h >= 90.0f;
   const float chartTop = showTfRow ? 50.0f : 27.0f;
-  if (showTfRow) {
+  if(showTfRow && m_chartType==3) {
+    u.draw.textAligned({r.x+6,r.y+27,88,20},"30m TPO",t.text,DrawList::Left);
+    u.draw.textAligned({r.x+98,r.y+27,66,20},"SINGLES",hexColor(0xd9ac59),DrawList::Left);
+    u.draw.textAligned({r.x+170,r.y+27,52,20},"TAILS",hexColor(0x55b6a5),DrawList::Left);
+  }
+  if (showTfRow && m_chartType!=3) {
     float cx = r.x;
     const float cy = r.y + 27;
     bool presetActive = false;
@@ -4448,8 +4439,48 @@ float ChartPanel::drawHeader(Ui& u, Rect r, Feeds& feeds) {
     }
     u.tip(u.id("customtf"), {cx, cy, 22, 20}, "custom timeframe (45m, 2h, 100t, 500v)");
   }
-  u.draw.rect({r.x, r.y + chartTop - 1.0f, r.w, 1}, t.border);
-  return chartTop;
+  float resultTop = chartTop;
+  if (m_chartType == 3 && r.h >= 180) {
+    float x = r.x + 4, y = r.y + chartTop;
+    auto control = [&](const char* label, float width, bool on, auto apply) {
+      if (x + width > r.x + r.w - 4) { x = r.x + 4; y += 24; }
+      if (chip(u, {x, y, width, 20}, label, on)) { apply(); saveSettings(); }
+      const char* tip=nullptr;
+      if(std::string_view(label)=="SPLIT") tip="Show brackets from left to right in time order; hover for UTC time.";
+      if(std::string_view(label)=="SINGLES") tip="Gold: interior rows traded in one bracket, excluding the latest bracket.";
+      if(std::string_view(label)=="TAILS") tip="Teal: at least two consecutive one-bracket rows at a profile extreme.";
+      if(std::string_view(label)=="POOR H/L") tip="PH / PL: two or more brackets at the same highest / lowest row.";
+      if(tip) u.tip(u.id(label),{x,y,width,20},tip);
+      x += width + 4;
+    };
+    control("COMPACT", 68, !m_tpoSplit, [&] { m_tpoSplit = false; });
+    control("SPLIT", 52, m_tpoSplit, [&] { m_tpoSplit = true; });
+    control("ROWS -", 56, false, [&] { m_tpoRows = std::max(16, m_tpoRows - 32); });
+    control("ROWS +", 56, false, [&] { m_tpoRows = std::min(512, m_tpoRows + 32); });
+    control("POC",38,m_tpoMarks&1,[&]{m_tpoMarks^=1;});
+    control("SINGLES",66,m_tpoMarks&2,[&]{m_tpoMarks^=2;});
+    control("TAILS",52,m_tpoMarks&4,[&]{m_tpoMarks^=4;});
+    control("POOR H/L",76,m_tpoMarks&8,[&]{m_tpoMarks^=8;});
+    control("OPTIONS",68,m_tpoOptions,[&]{m_tpoOptions=!m_tpoOptions;});
+    if(m_tpoOptions) {
+      u.pushId("tpo-extensions");
+      x=r.x+4; y+=24;
+      u.draw.textAligned({x,y,62,20},"EXTEND",t.textDim,DrawList::Left); x+=66;
+      const char* ext[]={"POC","VAH","VAL","SINGLES","TAILS","POOR HIGH","POOR LOW"};
+      for(int i=0;i<7;++i) control(ext[i],i<3?42:i<5?66:86,m_tpoExtend&(1<<i),[&,i]{m_tpoExtend^=1<<i;});
+      u.popId(); u.pushId("tpo-labels");
+      x=r.x+4; y+=24;
+      u.draw.textAligned({x,y,62,20},"LABELS",t.textDim,DrawList::Left); x+=66;
+      const char* lab[]={"POC","VAH","VAL","PH","PL"};
+      for(int i=0;i<5;++i) control(lab[i],42,m_tpoLabels&(1<<i),[&,i]{m_tpoLabels^=1<<i;});
+      control("HIDE ALL",76,m_tpoLabels==0,[&]{m_tpoLabels=0;});
+      control("SHOW ALL",76,m_tpoLabels==31,[&]{m_tpoLabels=31;});
+      u.popId();
+    }
+    resultTop = y - r.y + 24;
+  }
+  u.draw.rect({r.x, r.y + resultTop - 1.0f, r.w, 1}, t.border);
+  return resultTop;
 }
 
 // ---------------------------------------------------------------------------
@@ -4469,7 +4500,7 @@ void ChartPanel::layoutPlot(Ui& u, Feeds& feeds, Rect r, float chartTop, PlotCtx
   const float minPaneH = 56.0f;
   const float minPriceH = ctx.chart.h >= 80.0f ? 80.0f : std::max(20.0f, ctx.chart.h);
 
-  ctx.nPanes = ctx.chart.h >= 150.0f ? std::min((int)m_panes.size(), 8) : 0;
+  ctx.nPanes = m_chartType != 3 && ctx.chart.h >= 150.0f ? std::min((int)m_panes.size(), 8) : 0;
 
   ctx.gutter = {ctx.chart.x + ctx.chart.w - ctx.gutterW, ctx.chart.y, ctx.gutterW,
                 ctx.chart.h - timeAxisH};
@@ -4548,6 +4579,13 @@ void ChartPanel::layoutPlot(Ui& u, Feeds& feeds, Rect r, float chartTop, PlotCtx
   if (!u.input.down && !u.input.released) m_resizePane = -1;
   if (paneSizeChanged) layoutPanes();
 
+  ctx.tpoBarsPerDay = m_chartType == 3 && cs.tf.kind == Timeframe::Time && cs.tf.value > 0
+      ? (float)(1440.0 / cs.tf.value) : 0;
+  if (m_chartType == 3) {
+    if (m_tpoSourceMinutes > 0 && m_tpoSourceMinutes != cs.tf.value)
+      m_barWidth *= (float)(cs.tf.value / m_tpoSourceMinutes);
+    m_tpoSourceMinutes = cs.tf.value;
+  } else m_tpoSourceMinutes = 0;
   ctx.size = (int)cs.v.size();
   ctx.scroll = scroll;
   ctx.clampScroll();
@@ -4566,12 +4604,12 @@ void ChartPanel::navAndRanges(Ui& u, Feeds& feeds, PlotCtx& ctx) {
   const CandleSeries& cs = feeds.candles;
   const int size = ctx.size;
 
-  Rect stackAll{ctx.chart.x, ctx.chart.y, ctx.chart.w - ctx.gutterW, ctx.stackH};
+  Rect stackAll{ctx.chart.x, ctx.chart.y, ctx.chart.w - ctx.gutterW, ctx.stackH - (m_chartType==3?16:0)};
   Rect navArea{ctx.price.area.x, ctx.chart.y, ctx.price.area.w, ctx.chart.h};
   if (u.hovered(navArea) && (u.input.wheelY != 0.0f || u.input.wheelX != 0.0f)) {
     if (u.input.shift || u.input.wheelX != 0.0f) {
       float delta = u.input.wheelX != 0.0f ? u.input.wheelX : u.input.wheelY;
-      ctx.scroll += delta / std::max(ctx.bw, 1.0f);
+      ctx.scroll += delta / std::max(ctx.bw, 0.001f);
       ctx.clampScroll();
       ctx.updateView(m_barWidth);
     } else {
@@ -4592,7 +4630,7 @@ void ChartPanel::navAndRanges(Ui& u, Feeds& feeds, PlotCtx& ctx) {
   Rect timeScale{ctx.price.area.x, ctx.timeAxis.y, ctx.price.area.w, ctx.timeAxis.h};
   uint64_t timeScaleId = u.id("##timescale");
   if (u.input.dblClick && u.hovered(timeScale)) {
-    m_barWidth = barWidthDefault(m_chartType);
+    m_barWidth = barWidthDefault(m_chartType, cs.tf.value);
     ctx.scroll = 0.0f;
     ctx.updateView(m_barWidth);
   }
@@ -4623,13 +4661,17 @@ void ChartPanel::navAndRanges(Ui& u, Feeds& feeds, PlotCtx& ctx) {
   Rect overlayLegend{ctx.price.area.x, ctx.price.area.y,
                      std::min(260.0f, ctx.price.area.w), overlayLegendH + 8.0f};
 
+  // Input must use the last displayed range, before the range scan below.
+  // A freshly constructed PlotCtx otherwise still has the default 0..1 range.
+  const double inputPad = (m_rngPriceHi-m_rngPriceLo)*.06+1e-9;
+  ctx.price.lo = m_rngPriceLo-inputPad;
+  ctx.price.hi = m_rngPriceHi+inputPad;
   uint64_t panId = u.id("##chartpan");
   m_drawings.load();
   bool drawBusy = m_drawings.tool != DrawTool::Pointer || m_drawings.placing ||
                   m_drawings.dragging;
-  if (ctx.size > 0 &&
-      m_drawings.handle(u, ctx.price, cs, feeds.symbol, ctx.startF, ctx.bw,
-                        ctx.size))
+  if (m_drawings.handle(u, ctx.price, cs, feeds.symbol, ctx.startF, ctx.bw,
+                        ctx.size, overlayLegend))
     drawBusy = true;
   if (u.input.pressed && u.hovered(stackAll) && !u.hovered(overlayLegend) &&
       m_resizePane < 0 &&
@@ -4689,15 +4731,14 @@ void ChartPanel::navAndRanges(Ui& u, Feeds& feeds, PlotCtx& ctx) {
 
     double lo = 1e300, hi = -1e300; // price range over visible candles
     int rangeStart = ctx.vis0;
-    if (m_chartType == 3)
-      rangeStart = tpoWindowFirst(cs, ctx.vis1,
-                                  tpoMaxSessions(ctx.price.area.w));
-    for (int i = rangeStart; i <= ctx.vis1; ++i) {
+    if (m_chartType == 3) rangeStart = 0;
+    const int rangeEnd = m_chartType == 3 ? size - 1 : ctx.vis1;
+    for (int i = rangeStart; i <= rangeEnd; ++i) {
       lo = std::min(lo, cs.v[(size_t)i].l);
       hi = std::max(hi, cs.v[(size_t)i].h);
     }
     for (const IndicatorInstance& inst : m_overlays) {
-      if (!inst.seriesVisible || inst.reg != IndD7) continue;
+      if (m_chartType == 3 || !inst.seriesVisible || inst.reg != IndD7) continue;
       auto grow = [&](const std::vector<float>& s) {
         for (int i = rangeStart; i <= ctx.vis1 && i < (int)s.size(); ++i) {
           if (std::isnan(s[(size_t)i])) continue;
@@ -4730,7 +4771,9 @@ void ChartPanel::navAndRanges(Ui& u, Feeds& feeds, PlotCtx& ctx) {
     ctx.ind[p].hi = pr.hi;
     ctx.rangeOk[p] = pr.ok;
   }
-  double padv = (m_rngPriceHi - m_rngPriceLo) * 0.06 + 1e-9;
+  const double span = m_rngPriceHi - m_rngPriceLo;
+  // Leave a small margin around the fitted price range.
+  double padv = span * .06 + 1e-9;
   ctx.price.lo = m_rngPriceLo - padv;
   ctx.price.hi = m_rngPriceHi + padv;
 
@@ -4903,6 +4946,27 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
   // candles + overlays, clipped to the price pane
   u.draw.pushClip(ctx.price.area);
 
+  if (m_chartType == 3) {
+    constexpr int minutes = 30;
+    const double tpoNow=(double)time(nullptr)*1000.0;
+    // Volume/close-only ticks and viewport motion cannot alter TPO counts.
+    uint64_t sig = chartMix(shapeSig(cs), minutes);
+    sig = chartMix(sig, m_tpoRows);
+    sig = chartMix(sig, (uint64_t)(tpoNow / (minutes*60000.0)));
+    if (!cs.v.empty()) for (double v : {cs.v.back().h, cs.v.back().l})
+      sig = chartMix(sig, std::bit_cast<uint64_t>(v));
+    if (sig != m_tpoSignature) {
+      m_tpoProfiles = mergeTpoProfiles(buildTpoProfiles(cs, 0, (int)cs.v.size()-1, minutes, tpoRowStep(cs, m_tpoRows)), m_tpoJoins, minutes);
+      buildTpoZones(m_tpoProfiles,cs,tpoNow);
+      m_tpoSignature = sig;
+    }
+    drawTpoProfiles(u, ctx.price, m_tpoProfiles, cs, ctx.startF, ctx.bw, m_tpoSplit, minutes, m_tpoMarks, m_tpoSelected, m_tpoExtend, m_tpoLabels);
+    u.draw.breakCmd();
+    m_drawings.draw(u.draw,ctx.price,cs,feeds.symbol,ctx.startF,ctx.bw);
+    u.draw.popClip();
+    return false;
+  }
+
   bool heatVisible = false;
   for (const IndicatorInstance& o : m_overlays)
     if (o.reg == IndHeat && o.seriesVisible) {
@@ -5003,37 +5067,6 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       int sigMask = (inst.opt & 7) ? (inst.opt & 7) : 1;
       int maxK = (sigMask & 4) ? 3 : (sigMask & 2) ? 2 : 1;
       static thread_local std::vector<float> bx, bTop, bBot;
-      // Light EMA on the σ half-width so the band fill and its outline trace
-      // the band's shape, not per-bar second-moment noise (the VWAP mid is
-      // session-cumulative and already smooth; σ is not). Warm up before the
-      // visible window so the left edge is converged at any pan, and reset
-      // at day breaks where the session σ genuinely collapses.
-      static thread_local std::vector<float> sdSm;
-      const int warm0 = std::max(ctx.vis0 - 64, 0);
-      sdSm.assign((size_t)std::max(0, ctx.vis1 - warm0 + 1), NAN);
-      {
-        float ema = NAN;
-        int64_t smDay = std::numeric_limits<int64_t>::min();
-        const float aS = 2.0f / (6.0f + 1.0f);
-        for (int i = warm0;
-             i <= ctx.vis1 && i < (int)inst.series.size() &&
-             i < (int)inst.aux.size() && i < (int)cs.v.size();
-             ++i) {
-          int64_t d = utcDay(cs.v[(size_t)i].ts);
-          if (d != smDay) {
-            ema = NAN;
-            smDay = d;
-          }
-          float midv = inst.series[(size_t)i], upv = inst.aux[(size_t)i];
-          if (std::isnan(midv) || std::isnan(upv)) {
-            ema = NAN;
-          } else {
-            float dv = upv - midv;
-            ema = std::isnan(ema) ? dv : ema + (dv - ema) * aS;
-          }
-          sdSm[(size_t)(i - warm0)] = ema;
-        }
-      }
       for (int k = 1; k <= maxK; ++k) {
         if (!(sigMask & (1 << (k - 1)))) continue;
         float scale = (float)k;
@@ -5071,12 +5104,12 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
             flushBand();
             continue;
           }
-          int64_t d = utcDay(cs.v[(size_t)i].ts);
+          int64_t d = vwapSession(cs.v[(size_t)i].ts, inst.p0);
           if (d != day) {
             flushBand();
             day = d;
           }
-          float dist = i - warm0 >= 0 ? sdSm[(size_t)(i - warm0)] : NAN;
+          float dist = up - mid;
           if (std::isnan(dist)) {
             flushBand();
             continue;
@@ -5099,7 +5132,7 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
         float mid = inst.series[(size_t)i];
         float up = inst.aux[(size_t)i], dn = inst.aux2[(size_t)i];
         if (std::isnan(mid) || std::isnan(up) || std::isnan(dn)) continue;
-        int64_t dday = utcDay(cs.v[(size_t)i].ts);
+        int64_t dday = vwapSession(cs.v[(size_t)i].ts, inst.p0);
         if (prevDay != std::numeric_limits<int64_t>::min() && dday != prevDay &&
             tickYs.size() >= 2) {
           float x = ctx.xOf(i - 1) + ctx.bw * 0.5f;
@@ -5525,219 +5558,6 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
       u.draw.rect({cx - candleBodyW * 0.5f, bodyTop, candleBodyW, bodyH},
                   withAlpha(side, 0.98f));
     }
-  } else {
-    // Classic crypto TPO: UTC-day profiles, one letter per 30/60-minute
-    // bracket and one occurrence per price row. POC and 70% value area use
-    // TPO counts, not volume.
-    struct TpoRow { int64_t tick = 0; uint64_t letters = 0; };
-    struct TpoSession {
-      int64_t day = 0;
-      int last = 0;
-      double open = 0, close = 0;
-      double ibHigh = -1e300, ibLow = 1e300;
-      std::unordered_map<int64_t, uint64_t> rows;
-    };
-    double tpoStep = niceStep((ctx.price.hi - ctx.price.lo) /
-                              std::max(1.0f, ctx.price.area.h / 11.0f));
-    const double dayMs = 86400000.0;
-    const double bracketMs = (m_tpoBracket == 0 ? 30.0 : 60.0) * 60000.0;
-    // TPO is session-native rather than candle-native. Show the latest few UTC
-    // sessions ending at the current horizontal viewport, allocating a stable
-    // profile column to each instead of stretching letters over bar spacing.
-    int maxSessions = tpoMaxSessions(ctx.price.area.w);
-    int tpoFirst = tpoWindowFirst(cs, ctx.vis1, maxSessions);
-
-    // Cached profile build: session construction, per-row letter maps and the
-    // POC/value-area extraction previously ran every frame (thousands of hash
-    // operations plus a sort per session) even though historical sessions are
-    // immutable. tpoStep is lattice-quantized (niceStep) so it is stable
-    // frame-to-frame; rebuild immediately on any window/step/bracket change,
-    // otherwise refresh the forming bar's letters at most every 250 ms.
-    struct TpoDraw {
-      int sessionIndex = 0;
-      std::vector<TpoRow> rows;
-      int64_t poc = 0;
-      int maxCount = 0, totalCount = 0;
-      int pocIndex = 0, vaLo = 0, vaHi = 0;
-    };
-    static thread_local std::vector<TpoSession> tpoSessions;
-    static thread_local std::vector<TpoDraw> tpoDraws;
-    static thread_local uint64_t tpoSig = 0;
-    static thread_local std::chrono::steady_clock::time_point tpoBuiltAt{};
-    const auto nowTp = std::chrono::steady_clock::now();
-    uint64_t tpSig = 1469598103934665603ull;
-    auto mixTp = [&tpSig](uint64_t x) { tpSig ^= x; tpSig *= 1099511628211ull; };
-    mixTp(std::bit_cast<uint64_t>(tpoStep));
-    mixTp((uint64_t)m_tpoBracket);
-    mixTp((uint64_t)maxSessions);
-    mixTp((uint64_t)tpoFirst);
-    mixTp((uint64_t)(ctx.vis1 + 1));
-    mixTp((uint64_t)cs.v.size());
-    if (!cs.v.empty()) {
-      uint64_t u;
-      std::memcpy(&u, &cs.v.front().ts, 8);
-      mixTp(u);
-    }
-    const bool tpRebuild =
-        tpSig != tpoSig || tpoDraws.empty() ||
-        std::chrono::duration_cast<std::chrono::milliseconds>(nowTp - tpoBuiltAt)
-                .count() > 250;
-
-    if (tpRebuild) {
-      tpoSig = tpSig;
-      tpoBuiltAt = nowTp;
-      tpoSessions.clear();
-      for (int i = tpoFirst; i <= ctx.vis1; ++i) {
-        const Candle& candle = cs.v[(size_t)i];
-        int64_t day = utcDay(candle.ts);
-        if (tpoSessions.empty() || tpoSessions.back().day != day) {
-          TpoSession fresh;
-          fresh.day = day;
-          fresh.open = fresh.close = candle.o;
-          tpoSessions.push_back(std::move(fresh));
-        }
-        TpoSession& session = tpoSessions.back();
-        session.last = i;
-        session.close = candle.c;
-        int period = (int)std::floor((candle.ts - day * dayMs) / bracketMs);
-        period = std::clamp(period, 0, 63);
-        int ibPeriods = m_tpoBracket == 0 ? 2 : 1;
-        if (period < ibPeriods) {
-          session.ibHigh = std::max(session.ibHigh, candle.h);
-          session.ibLow = std::min(session.ibLow, candle.l);
-        }
-        int64_t loTick = (int64_t)std::floor(candle.l / tpoStep);
-        int64_t hiTick = (int64_t)std::ceil(candle.h / tpoStep);
-        for (int64_t tick = loTick; tick <= hiTick && tick - loTick < 4096; ++tick)
-          session.rows[tick] |= 1ull << period;
-      }
-
-      tpoDraws.clear();
-      tpoDraws.resize(tpoSessions.size());
-      for (size_t sessionIndex = 0; sessionIndex < tpoSessions.size(); ++sessionIndex) {
-        TpoSession& session = tpoSessions[sessionIndex];
-        TpoDraw& draw = tpoDraws[sessionIndex];
-        draw.sessionIndex = (int)sessionIndex;
-        draw.rows.reserve(session.rows.size());
-        for (const auto& entry : session.rows) {
-          int count = __builtin_popcountll(entry.second);
-          draw.totalCount += count;
-          if (count > draw.maxCount) { draw.maxCount = count; draw.poc = entry.first; }
-          draw.rows.push_back({entry.first, entry.second});
-        }
-        std::sort(draw.rows.begin(), draw.rows.end(),
-                  [](const TpoRow& a, const TpoRow& b) { return a.tick < b.tick; });
-        for (int i = 0; i < (int)draw.rows.size(); ++i)
-          if (draw.rows[(size_t)i].tick == draw.poc) { draw.pocIndex = i; break; }
-        draw.vaLo = draw.vaHi = draw.pocIndex;
-        int covered =
-            draw.rows.empty()
-                ? 0
-                : __builtin_popcountll(draw.rows[(size_t)draw.pocIndex].letters);
-        int targetCount = (int)std::ceil(draw.totalCount * 0.70);
-        while (covered < targetCount &&
-               (draw.vaLo > 0 || draw.vaHi + 1 < (int)draw.rows.size())) {
-          int below = draw.vaLo > 0
-                          ? __builtin_popcountll(draw.rows[(size_t)draw.vaLo - 1].letters)
-                          : -1;
-          int above = draw.vaHi + 1 < (int)draw.rows.size()
-                          ? __builtin_popcountll(draw.rows[(size_t)draw.vaHi + 1].letters)
-                          : -1;
-          if (above >= below)
-            covered += __builtin_popcountll(draw.rows[(size_t)++draw.vaHi].letters);
-          else
-            covered += __builtin_popcountll(draw.rows[(size_t)--draw.vaLo].letters);
-        }
-      }
-    }
-
-    for (size_t sessionIndex = 0; sessionIndex < tpoDraws.size(); ++sessionIndex) {
-      TpoSession& session = tpoSessions[(size_t)tpoDraws[sessionIndex].sessionIndex];
-      const std::vector<TpoRow>& rows = tpoDraws[sessionIndex].rows;
-      const int64_t poc = tpoDraws[sessionIndex].poc;
-      const int maxCount = tpoDraws[sessionIndex].maxCount;
-      const int vaLo = tpoDraws[sessionIndex].vaLo;
-      const int vaHi = tpoDraws[sessionIndex].vaHi;
-      float slotW = ctx.price.area.w / std::max<size_t>(1, tpoDraws.size());
-      float sx = ctx.price.area.x + sessionIndex * slotW;
-      float available = std::max(2.0f, slotW - 8.0f);
-
-      u.draw.rect({sx, ctx.price.area.y, 1, ctx.price.area.h}, withAlpha(t.border, 0.72f));
-      if (!rows.empty() && available > 90.0f) {
-        char dayLabel[16] = "UTC";
-        time_t sessionTime = (time_t)(session.day * 86400);
-        tm utcBuf{};
-        if (gmtime_r(&sessionTime, &utcBuf))
-          strftime(dayLabel, sizeof(dayLabel), "%m-%d", &utcBuf);
-        char summary[112], pocB[24], vaLoB[24], vaHiB[24];
-        chartFmtPrice(pocB, sizeof(pocB), poc * tpoStep);
-        chartFmtPrice(vaLoB, sizeof(vaLoB), rows[(size_t)vaLo].tick * tpoStep);
-        chartFmtPrice(vaHiB, sizeof(vaHiB), rows[(size_t)vaHi].tick * tpoStep);
-        snprintf(summary, sizeof(summary), "%s  %s  POC %s  VA %s-%s",
-                 dayLabel, m_tpoBracket == 0 ? "30M" : "60M", pocB, vaLoB, vaHiB);
-        u.draw.textFit({sx + 5, ctx.price.area.y + 4, available - 8, 14}, summary,
-                       t.textDim, DrawList::Left);
-      }
-      for (int ri = 0; ri < (int)rows.size(); ++ri) {
-        const TpoRow& row = rows[(size_t)ri];
-        int count = __builtin_popcountll(row.letters);
-        double p = row.tick * tpoStep;
-        float top = ctx.price.yOf(p + tpoStep * 0.5);
-        float bottom = ctx.price.yOf(p - tpoStep * 0.5);
-        float rowY = std::min(top, bottom), rowH = std::max(1.0f, std::fabs(bottom - top));
-        // Pixel-grid snap (shared floor boundaries): TPO rows stack densely
-        // and fractional rects left an AA fringe hairline at every seam.
-        float tTop = std::floor(rowY), tBot = std::floor(rowY + rowH);
-        if (tBot - tTop < 1.0f) tBot = tTop + 1.0f;
-        rowY = tTop;
-        rowH = tBot - tTop;
-        bool inValue = ri >= vaLo && ri <= vaHi;
-        bool isPoc = row.tick == poc;
-        bool singlePrint = count == 1;
-        float charWidth = 7.0f;
-        float profileW = std::min(available, std::max(charWidth, count * charWidth));
-        if (inValue)
-          u.draw.rect({sx + 1, rowY, profileW + 3.0f, rowH},
-                      withAlpha(t.accent, isPoc ? 0.18f : 0.045f));
-        if (inValue)
-          u.draw.rect({sx + 1, rowY, isPoc ? 2.0f : 1.0f, rowH},
-                      withAlpha(t.accent, isPoc ? 0.95f : 0.52f));
-        if (rowH >= 8.0f && count * charWidth <= available) {
-          char letters[65];
-          int n = 0;
-          for (int bit = 0; bit < 64; ++bit)
-            if (row.letters & (1ull << bit))
-              letters[n++] = bit < 26 ? (char)('A' + bit)
-                           : bit < 52 ? (char)('a' + bit - 26) : (char)('0' + (bit - 52) % 10);
-          letters[n] = '\0';
-          u.draw.textAligned({sx + 3, rowY, available - 4, rowH}, letters,
-                             isPoc ? t.accent : singlePrint ? t.chartWarm : t.text,
-                             DrawList::Left);
-        } else if (maxCount > 0) {
-          float fill = available * count / maxCount;
-          u.draw.rect({sx + 2, rowY + 1, fill, std::max(1.0f, rowH - 2)},
-                      withAlpha(isPoc ? t.accent : t.textDim, isPoc ? 0.72f : 0.28f));
-        }
-        if (isPoc)
-          u.draw.rect({sx + 1, std::floor(ctx.price.yOf(p)), profileW + 3.0f, 1.0f},
-                      withAlpha(t.accent, 0.92f));
-      }
-
-      // Initial-balance bracket and session open/close markers are kept at the
-      // profile edge so they remain visible in both letters and compact modes.
-      if (session.ibHigh > -1e200 && session.ibLow < 1e200) {
-        float iy0 = ctx.price.yOf(session.ibHigh), iy1 = ctx.price.yOf(session.ibLow);
-        float ix = sx + available - 2.0f;
-        u.draw.rect({ix, iy0, 1.0f, std::max(1.0f, iy1 - iy0)},
-                    withAlpha(t.chartWarm, 0.78f));
-        u.draw.rect({ix - 4, iy0, 5, 1}, withAlpha(t.chartWarm, 0.78f));
-        u.draw.rect({ix - 4, iy1, 5, 1}, withAlpha(t.chartWarm, 0.78f));
-      }
-      u.draw.rect({sx + 1, ctx.price.yOf(session.open), 6, 2}, withAlpha(t.text, 0.72f));
-      Color closeColor = session.close >= session.open ? t.green : t.red;
-      u.draw.rect({sx + available - 6, ctx.price.yOf(session.close), 6, 2},
-                  withAlpha(closeColor, 0.90f));
-    }
   }
 
   // Live HL profiles + predicted-liq profile sit on the right edge.
@@ -5784,8 +5604,7 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
 
   m_drawings.draw(u.draw, ctx.price, cs, feeds.symbol, ctx.startF, ctx.bw);
 
-  // Overlay series stay off TPO (that pane is letters, not a price overlay).
-  // Legend chrome still draws so every instance can be removed or hidden.
+  // TPO returns above; these overlays and legends belong to candle modes.
   // Clicking the name (the same hit as a pane label) hides the plot.
   float legendY = ctx.price.area.y + 6;
   for (size_t ov = 0; ov < m_overlays.size(); ++ov) {
@@ -5817,14 +5636,14 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
                       indPalette(inst.colorB), seriesWidth);
       else if (i == IndVwap)
         drawVwapLine(u.draw, ctx.price, cs, inst.series, ctx.vis0, ctx.vis1,
-                     ctx.startF, ctx.bw, c, seriesWidth);
+                     ctx.startF, ctx.bw, c, seriesWidth, inst.p0, inst.p2);
       else if (i == IndLevels)
         drawPeriodLevels(u.draw, ctx.price, inst.levels, inst.p0 & 7, inst.flag,
                          {indPalette(inst.colorA), indPalette(inst.colorB),
-                          indPalette(inst.colorC)}, ctx.startF, ctx.bw, seriesWidth);
+                          indPalette(inst.colorC)}, ctx.startF, ctx.bw, seriesWidth, std::clamp(inst.opt,0,2));
       else if (i != IndD7 && !(capsOf(i) & CapOnce))
         drawSeries(u.draw, ctx.price, inst.series, ctx.vis0, ctx.vis1,
-                   ctx.startF, ctx.bw, c, seriesWidth);
+                     ctx.startF, ctx.bw, c, seriesWidth);
     }
     char name[48];
     formatInstanceName(inst, name, sizeof(name));
@@ -5844,19 +5663,19 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
     u.draw.textAligned({ctx.price.area.x + 6, legendY, ctx.price.area.w - 12, 14},
                        name, c, DrawList::Left, 0, true);
     float nw = u.draw.measure(name);
-    float valueW = 0;
     if (m_showIndicatorLabels && !std::isnan(v)) {
       if (!status) {
         if (paneKind(i)) kPresent[i].fmt(inst)(vb, sizeof(vb), v);
         else chartFmtPrice(vb, sizeof(vb), v);
       }
-      valueW = u.draw.measure(vb);
       u.draw.textAligned(
           {ctx.price.area.x + 6 + nw + 10, legendY, ctx.price.area.w - nw - 46, 14}, vb,
           inst.seriesVisible ? t.text : withAlpha(t.text, 0.45f), DrawList::Left,
           0, true);
     }
-    float textW = nw + (valueW > 0 ? valueW + 15.0f : 6.0f);
+    // Reserve a value cell: a price/status changing while the mouse is down
+    // must not move the settings hit target between press and release.
+    float textW = nw + 72.0f;
     Rect settingsIcon, removeIcon;
     legendActionRects(ctx.price.area.x + 6, textW, legendY - 1, 16,
                       ctx.price.area.x + ctx.price.area.w - 4.0f, settingsIcon,
@@ -5869,7 +5688,7 @@ bool ChartPanel::drawPricePane(Ui& u, Feeds& feeds, PlotCtx& ctx) {
                     std::max(1.0f, settingsIcon.x - (ctx.price.area.x + 6)), 16};
     Behavior lb = behavior(u, labelClick, u.id("label"));
     u.tip(u.id("labeltip"), labelClick, i == IndLevels && inst.seriesVisible
-        ? "UTC opens; requires opening candles in loaded history. Click to hide."
+        ? "UTC opens from daily history, independent of chart timeframe. Click to hide."
         : (inst.seriesVisible ? "hide" : "show"));
     if (lb.clicked) {
       inst.seriesVisible = !inst.seriesVisible;
@@ -5937,7 +5756,7 @@ void ChartPanel::drawLastPriceRow(Ui& u, Feeds& feeds, PlotCtx& ctx) {
   else if (m_lastPriceColor == 2)
     priceColor = t.textDim;
 
-  if (m_showLastPriceLine) {
+  if (m_showLastPriceLine && m_chartType != 3) {
     auto style = static_cast<DrawList::LineStyle>(
         std::clamp(m_lastPriceStyle, 0, 2));
     float width = kLastPriceLineWidths[std::clamp(m_lastPriceWidth, 0, 2)];
@@ -5981,7 +5800,8 @@ void ChartPanel::drawCrosshairRow(Ui& u, Feeds& feeds, PlotCtx& ctx) {
   float mx = u.input.mouseX, my = u.input.mouseY;
   Color xc = withAlpha(t.textDim, 0.5f);
   u.draw.line(ctx.price.area.x, my, ctx.price.area.x + ctx.price.area.w, my, xc, 1.0f);
-  u.draw.line(mx, ctx.chart.y, mx, ctx.chart.y + ctx.stackH, xc, 1.0f);
+  if (m_chartType != 3)
+    u.draw.line(mx, ctx.chart.y, mx, ctx.chart.y + ctx.stackH, xc, 1.0f);
   double pr = ctx.price.vOf(my);
   char pb[24];
   chartFmtPrice(pb, sizeof(pb), pr);
@@ -5990,6 +5810,8 @@ void ChartPanel::drawCrosshairRow(Ui& u, Feeds& feeds, PlotCtx& ctx) {
   u.draw.breakCmd();
   Rect tag{ctx.gutter.x + 2, my - 9, ctx.gutter.w - 4, 18};
   gutterTag(u.draw, tag, pb, t.text);
+
+  if (m_chartType == 3) return; // Compact TPO columns represent bracket counts, not intraday time
 
   int ci = (int)std::floor(ctx.startF + (mx - ctx.price.area.x) / ctx.bw);
   if (ci >= 0 && ci < ctx.size) {
@@ -6039,14 +5861,14 @@ struct IndSettingsLayout {
 // Per-register popover geometry, in kRegistry order.
 static constexpr IndSettingsLayout kIndLayouts[] = {
     {false, 2, 3, 0}, // VOL
-    {true, 2, 4, 0},  // CVD
+    {true, 2, 5, 0},  // CVD
     {true, 1, 2, 0},  // RSI
     {true, 2, 2, 0},  // MACD
     {true, 1, 1, 0},  // EMA
     {true, 1, 1, 0},  // SMA
     {true, 2, 2, 0},  // BB
     {false, 0, 0, 200}, // BOOK HEAT
-    {true, 4, 1, 0},  // VWAP (line + three individually colored sigma bands)
+    {true, 4, 4, 0},  // VWAP (line + three individually colored sigma bands)
     {true, 2, 2, 0},  // ST
     {true, 1, 1, 0},  // EMA 200
     {true, 2, 2, 0},  // STOCH
@@ -6056,7 +5878,7 @@ static constexpr IndSettingsLayout kIndLayouts[] = {
     {true, 3, 2, 0},  // D7
     {true, 3, 2, 0},  // D7 RSI
     {true, 2, 2, 0},  // D7 SCORE (second opt row reserved for pane PLACE)
-    {true, 3, 2, 0},  // LEVELS
+    {true, 3, 3, 0},  // LEVELS
     {true, 2, 1, 0},  // OI
     {true, 2, 2, 0},  // FUND
     {true, 2, 4, 0},  // CIPHER B (WT colors; preset/signals/guides/layer rows)
@@ -6084,9 +5906,9 @@ static constexpr IndColorRow kIndColors[][4] = {
     {{"LINE", &IndicatorInstance::colorA}, {"BAND", &IndicatorInstance::colorB}},                                     // BB
     {},                                                                                                               // BOOK HEAT
     {{"LINE", &IndicatorInstance::colorA},
-     {"1\xcf\x83", &IndicatorInstance::colorB},
-     {"2\xcf\x83", &IndicatorInstance::colorD},
-     {"3\xcf\x83", &IndicatorInstance::colorE}},                                                                      // VWAP
+     {"1 SD", &IndicatorInstance::colorB},
+     {"2 SD", &IndicatorInstance::colorD},
+     {"3 SD", &IndicatorInstance::colorE}},                                                                      // VWAP
     {{"UP", &IndicatorInstance::colorA}, {"DOWN", &IndicatorInstance::colorB}},                                       // ST
     {{"LINE", &IndicatorInstance::colorA}},                                                                           // EMA 200
     {{"%K", &IndicatorInstance::colorA}, {"%D", &IndicatorInstance::colorB}},                                         // STOCH
@@ -6256,10 +6078,27 @@ static constexpr IndOptRow kIndOpts[][4] = {
        chipSet("3", 42, 3, &IndicatorInstance::opt)}}},
     {}, // BOOK HEAT (slider page)
     {// VWAP
+      {"ANCHOR", nullptr,
+       {chipSet("DAY", 32, 0, &IndicatorInstance::p0),
+        chipSet("WK", 28, 1, &IndicatorInstance::p0),
+        chipSet("MO", 28, 2, &IndicatorInstance::p0),
+        chipSet("08 UTC", 44, 3, &IndicatorInstance::p0),
+        chipSet("13:30", 38, 4, &IndicatorInstance::p0),
+        chipSet("ROLL", 36, 5, &IndicatorInstance::p0)}},
+      {"HOURS", nullptr,
+       {chipSet("1", 36, 1, &IndicatorInstance::p1),
+        chipSet("6", 36, 6, &IndicatorInstance::p1),
+        chipSet("24", 36, 24, &IndicatorInstance::p1),
+        chipSet("168", 40, 168, &IndicatorInstance::p1)}},
+      {"PRIOR", nullptr,
+       {chipSet("OFF", 42, 0, &IndicatorInstance::p2),
+        chipSet("1", 36, 1, &IndicatorInstance::p2),
+        chipSet("3", 36, 3, &IndicatorInstance::p2),
+        chipSet("5", 36, 5, &IndicatorInstance::p2)}},
       {"SIGMA", nullptr,
-       {{"1\xcf\x83", 44, ChipKind::RequiredBits, 1, 0, 0, &IndicatorInstance::opt},
-        {"2\xcf\x83", 44, ChipKind::RequiredBits, 2, 0, 0, &IndicatorInstance::opt},
-        {"3\xcf\x83", 44, ChipKind::RequiredBits, 4, 0, 0, &IndicatorInstance::opt}}}},
+       {{"1 SD", 44, ChipKind::RequiredBits, 1, 0, 0, &IndicatorInstance::opt},
+        {"2 SD", 44, ChipKind::RequiredBits, 2, 0, 0, &IndicatorInstance::opt},
+        {"3 SD", 44, ChipKind::RequiredBits, 4, 0, 0, &IndicatorInstance::opt}}}},
     {// ST
      {"PERIOD", nullptr,
       {chipSet("7", 42, 7, &IndicatorInstance::p0),
@@ -6328,7 +6167,11 @@ static constexpr IndOptRow kIndOpts[][4] = {
        {"WEEK", 52, ChipKind::Bits, 2, 0, 0, &IndicatorInstance::p0},
        {"MONTH", 56, ChipKind::Bits, 4, 0, 0, &IndicatorInstance::p0}}},
      {"HISTORY", nullptr,
-      {chipToggle("PREVIOUS", 82, &IndicatorInstance::flag)}}},
+      {chipToggle("PREVIOUS", 82, &IndicatorInstance::flag)}},
+     {"LABELS", nullptr,
+      {chipSet("FULL", 54, 0, &IndicatorInstance::opt),
+       chipSet("SHORT", 60, 1, &IndicatorInstance::opt),
+       chipSet("HIDDEN", 68, 2, &IndicatorInstance::opt)}}},
     {// OI
      {"STYLE", nullptr,
       {{"LINE", 48, ChipKind::Set, CvdLine, 0, 0, &IndicatorInstance::opt},
@@ -6404,7 +6247,7 @@ void ChartPanel::openIndicatorSettings(Ui& u, int instId, Rect anchor) {
     u.closeOverlay(m_indicatorSettingsId);
   }
   m_indicatorSettingsInst = instId;
-  m_indicatorSettingsId = u.id("##indicator-local-settings");
+  if (!m_indicatorSettingsId) m_indicatorSettingsId = u.id("##indicator-local-settings");
   int reg = inst->reg;
   const IndSettingsLayout& lay = kIndLayouts[reg];
   float height = lay.pageH;
@@ -6413,10 +6256,13 @@ void ChartPanel::openIndicatorSettings(Ui& u, int instId, Rect anchor) {
                               (paneKind(reg) ? 1.0f : 0.0f) +
                               (lay.widthRow ? 1.0f : 0.0f));
   }
-  float width = hlMapReg(reg) ? 320.0f : 300.0f;
+  float width = hlMapReg(reg) ? 320.0f : 352.0f;
   float y = anchor.y > 520.0f ? anchor.y - height - 4.0f
                               : anchor.y + anchor.h + 4.0f;
-  m_indicatorSettingsRect = {anchor.x, y, width, height};
+  const ShellSize screen = shell_sync_canvas();
+  const float x = std::clamp(anchor.x, 4.0f, std::max(4.0f, screen.cssW - width - 4));
+  y = std::clamp(y, 4.0f, std::max(4.0f, screen.cssH - height - 4));
+  m_indicatorSettingsRect = {x, y, width, height};
   u.openOverlay(m_indicatorSettingsId, m_indicatorSettingsRect);
   u.input.pressed = false;
 }
@@ -6478,6 +6324,9 @@ void ChartPanel::openColorPicker(Ui& u, int instId,
   constexpr float W = 196.0f, H = 216.0f;
   float x = m_indicatorSettingsRect.x + m_indicatorSettingsRect.w + 6.0f;
   float y = std::max(8.0f, anchor.y - 52.0f);
+  const ShellSize screen = shell_sync_canvas();
+  x = std::clamp(x, 4.0f, std::max(4.0f, screen.cssW - W - 4));
+  y = std::clamp(y, 4.0f, std::max(4.0f, screen.cssH - H - 4));
   m_colorPickerRect = {x, y, W, H};
   u.openOverlay(m_colorPickerId, m_colorPickerRect);
   u.input.pressed = false; // keep the opening click out of the picker
@@ -6498,6 +6347,7 @@ void ChartPanel::drawColorPicker(Ui& u) {
   }
   const Theme& t = theme();
   Rect r = m_colorPickerRect;
+  u.draw.breakCmd(); // this popup covers its parent's already-drawn labels
   u.draw.shadow(r, t.radius, 14.0f, 3.0f, hexColor(0x000000, 0.45f));
   u.draw.rect(r, t.panel, t.radius);
   u.draw.rectOutline(r, t.border, 1.0f, t.radius);
@@ -6632,25 +6482,14 @@ void ChartPanel::drawIndicatorSettings(Ui& u) {
       }
       x += 22;
     }
-    // Custom swatch: shows the last picked custom color and opens the
-    // HSV picker popover. Outlined when this slot already holds one.
-    {
-      Rect sw{x, y + 2, 18, 16};
-      bool custom = (slot & kIndCustomBit) != 0;
-      Behavior b = behavior(u, sw, u.id("colcustom") + (uint64_t)y * 31);
-      u.draw.rect(sw, indPalette(m_lastCustom), 1.0f);
-      u.draw.linePattern(sw.x + 3.5f, sw.y + sw.h - 4.0f, sw.x + sw.w - 3.5f,
-                         sw.y + sw.h - 4.0f, withAlpha(hexColor(0x000000), 0.55f),
-                         1.0f, DrawList::LineStyle::Dotted);
-      if (custom)
-        u.draw.rectOutline(sw, t.text, 1.0f, 1.0f);
-      else if (b.hovered)
-        u.draw.rectOutline(sw, t.border, 1.0f, 1.0f);
-      if (b.clicked)
-        openColorPicker(u, m_indicatorSettingsInst, slotPtr,
-                        {sw.x, sw.y, sw.w, sw.h});
-      x += 22;
-    }
+    Rect customButton{x, y, 78, 20};
+    Behavior custom = behavior(u, customButton, u.id("colcustom") + (uint64_t)y * 31);
+    u.draw.rect(customButton, custom.hovered ? t.panelAlt : t.bg, 1.0f);
+    u.draw.rectOutline(customButton, custom.hovered ? t.text : t.border, 1.0f);
+    u.draw.rect({x + 4, y + 4, 12, 12}, indPalette(slot));
+    u.draw.textAligned({x + 20, y, 56, 20}, "CUSTOM", t.text, DrawList::Left);
+    if (custom.clicked)
+      openColorPicker(u, m_indicatorSettingsInst, slotPtr, customButton);
   };
 
   float y = r.y + 28;
@@ -6672,6 +6511,12 @@ void ChartPanel::drawIndicatorSettings(Ui& u) {
     }
   }
   const float optTop = y;
+  if (reg == IndCvd)
+    u.draw.textAligned({r.x + 10, optTop + 4 * 26, r.w - 20, 20},
+        cvdNeedsFlow(*inst) ? "Retained trades only; first bar may be partial"
+                            : "Historical candles use open/close delta",
+        t.textDim, DrawList::Left);
+
 
   if (reg == IndHeat) {
     // Slider rows: label left, live value right, track between.
@@ -6844,7 +6689,14 @@ void ChartPanel::drawIndicatorSettings(Ui& u) {
     // kIndOpts. The bespoke per-register chains this replaces could drift
     // from the popup height; both now read the same tables.
     const IndOptRow* rows = kIndOpts[reg];
-    for (int r = 0; r < kIndLayouts[reg].optRows && rows[r].title; ++r) {
+    for (int r = 0; r < (int)std::size(kIndOpts[0]) && r < kIndLayouts[reg].optRows && rows[r].title; ++r) {
+      if (reg == IndVwap && ((r == 1 && inst->p0 != 5) || (r == 2 && inst->p0 == 5))) {
+        optionRow(y, rows[r].title, [&](float& x, float rowY) {
+          u.draw.text(x, rowY + 14, r == 1 ? "Select ROLL to set hours" : "Session anchors only", t.textDim);
+        });
+        y += 26;
+        continue;
+      }
       if (rows[r].idScope) u.pushId(rows[r].idScope);
       optionRow(y, rows[r].title, [&](float& x, float rowY) {
         for (int ci = 0; ci < 6; ++ci) {
@@ -6922,7 +6774,15 @@ bool ChartPanel::drawLegendActions(Ui& u, int instId, Rect settings, Rect remove
   if (!(m_indicatorSettingsId && m_indicatorSettingsInst == instId &&
         u.overlayOpen(m_indicatorSettingsId)))
     u.tip(u.id("settingstip"), settings, "indicator settings");
-  if (sb.clicked) openIndicatorSettings(u, instId, settings);
+  // Open on the captured press. Other plot handlers and changing live labels
+  // cannot steal the release and make a visible settings button do nothing.
+  const bool switchSettings = m_indicatorSettingsId &&
+      u.dismissedOverlay == m_indicatorSettingsId;
+  if (sb.hovered && (u.input.pressed || switchSettings)) {
+    u.dismissedOverlay = 0;
+    u.active = 0;
+    openIndicatorSettings(u, instId, settings);
+  }
 
   Behavior rb = behavior(u, remove, u.id("remove"));
   if (rb.hovered) u.draw.rect(remove, t.bgHover, 1.0f);

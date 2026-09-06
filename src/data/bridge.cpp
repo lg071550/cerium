@@ -63,7 +63,7 @@ EM_JS(void, bridge_init_js, (int capacity), {
           var arr = d.data; // Float64Array: [ts, o, h, l, c, vol, takerBuyVol] × n
           var ptr = copyF64(arr);
           if (!ptr) return;
-          _cerium_on_candles(ptr, arr.length / 7, d.tfKind, d.tfValue, d.sym);
+          _cerium_on_candles(ptr, arr.length / 7, d.tfKind, d.tfValue, d.sym, d.preserveLive ? 1 : 0);
           _free(ptr);
           var flow = d.flow; // [ts, price, qty, side] × n
           if (flow && flow.length) {
@@ -74,6 +74,17 @@ EM_JS(void, bridge_init_js, (int capacity), {
           }
         } catch (err) {
           console.error("feeds: candles apply failed", err);
+        }
+        return;
+      }
+      if (d.kind === "calendar") {
+        var calendar = d.data;
+        if (calendar && calendar.length && calendar.length % 2 === 0) {
+          var calendarPtr = copyF64(calendar);
+          if (calendarPtr) {
+            _cerium_on_calendar(calendarPtr, calendar.length / 2, d.sym);
+            _free(calendarPtr);
+          }
         }
         return;
       }

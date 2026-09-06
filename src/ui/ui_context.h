@@ -27,6 +27,7 @@ struct Ui {
     Rect rect;
   };
   std::vector<Overlay> overlays;
+  uint64_t dismissedOverlay = 0; // outside left press, available to its owner's launcher
 
   // ---- tooltip (set by tip(), drawn by the app at end of frame) ----
   const char* pendingTip = nullptr;
@@ -41,6 +42,7 @@ struct Ui {
     frame++;
     hot = 0;
     pendingTip = nullptr;
+    dismissedOverlay = 0;
     draw.reset();
   }
 
@@ -60,6 +62,7 @@ struct Ui {
     bool pressOutside =
         (input.pressed || input.rightPressed) && !top.contains(input.mouseX, input.mouseY);
     if (pressOutside) {
+      if (input.pressed) dismissedOverlay = overlays.back().id;
       overlays.pop_back();
       input.pressed = false;
       input.rightPressed = false;

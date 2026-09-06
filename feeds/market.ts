@@ -40,7 +40,7 @@ const OKX_PERP: Record<string, string> = {
 };
 const GATE_PERP: Record<string, string> = { ETH: "ETH_USDT", BTC: "BTC_USDT", SOL: "SOL_USDT" };
 const DERIBIT_PERP: Record<string, string> = {
-  ETH: "ETH-PERPETUAL", BTC: "BTC-PERPETUAL", SOL: "SOL-PERPETUAL",
+  ETH: "ETH-PERPETUAL", BTC: "BTC-PERPETUAL", SOL: "SOL_USDC-PERPETUAL",
 };
 const BITFINEX_PERP: Record<string, string> = {
   ETH: "tETHF0:USTF0", BTC: "tBTCF0:USTF0", SOL: "tSOLF0:USTF0",
@@ -248,7 +248,7 @@ async function deribitMarket(sym: string): Promise<VenueMarket> {
   const inst = DERIBIT_PERP[sym];
   if (!inst) return { oi: null, funding: null };
   const raw = await fetchJson(
-    `https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=${sym}&kind=perpetual`,
+    `https://www.deribit.com/api/v2/public/get_book_summary_by_instrument?instrument_name=${inst}`,
   );
   const data = (raw as { result?: unknown[] } | null)?.result;
   if (!Array.isArray(data)) return { oi: null, funding: null };
@@ -260,7 +260,7 @@ async function deribitMarket(sym: string): Promise<VenueMarket> {
     const usd = num(r.open_interest);
     const mark = num(r.mark_price ?? r.mark);
     const funding = num(r.current_funding);
-    const oi = Number.isFinite(usd) && usd >= 0 && mark > 0 ? usd / mark : null;
+    const oi = Number.isFinite(usd) && usd >= 0 && mark > 0 ? (inst.includes("_USDC") ? usd : usd / mark) : null;
     return { oi, funding: Number.isFinite(funding) ? funding : null };
   }
   return { oi: null, funding: null };
@@ -352,7 +352,7 @@ async function krakenMarket(sym: string): Promise<VenueMarket> {
   const mark = num(t.markPrice);
   const funding = num(t.fundingRatePrediction ?? t.fundingRate);
   return {
-    oi: Number.isFinite(usd) && usd >= 0 && mark > 0 ? usd / mark : null,
+    oi: Number.isFinite(usd) && usd >= 0 && mark > 0 ? (inst.includes("_USDC") ? usd : usd / mark) : null,
     funding: Number.isFinite(funding) ? funding : null,
   };
 }
@@ -948,18 +948,17 @@ async function pollBinanceOi(): Promise<void> {
   setSnap(Snap.Binance, m.oi, m.funding);
 }
 
-const LIQ_SEEN_CAP = MAX_SAMPLES * 4; // match history cap; clear when exceeded
+const LIQ_SEEN_CAP = MAX_SAMPLES * 4; // bounded recent-event deduplication
 
-function ingestLiq(price: number, qty: number, ts: number, side: number): boolean {
+function ingestLiq(source: string, price: number, qty: number, ts: number, side: number): boolean {
   if (!Number.isFinite(price) || !Number.isFinite(qty) || !Number.isFinite(ts) ||
-      price <= 0 || qty <= 0 || ts <= 0) return false;
-  // Cap the dedup set to prevent unbounded growth in long sessions.
-  // Clearing is safe: the history trim below already handles the dedup window,
-  // and the C++ side deduplicates via liqTop on incremental appends.
-  if (liqSeen.size > LIQ_SEEN_CAP) liqSeen.clear();
-  const key = `${ts}|${price}|${qty}|${side}`;
+      price <= 0 || qty <= 0 || ts <= 0 || !Number.isFinite(price * qty) ||
+      (side !== 0 && side !== 1)) return false;
+
+  const key = `${source}|${ts}|${price}|${qty}|${side}`;
   if (liqSeen.has(key)) return false;
   liqSeen.add(key);
+  if (liqSeen.size > LIQ_SEEN_CAP) liqSeen.delete(liqSeen.values().next().value!);
   liqHistory.push(ts, price, qty, side);
   liqCounter += 1;
   if (liqHistory.length > MAX_SAMPLES * 4) {
@@ -970,9 +969,9 @@ function ingestLiq(price: number, qty: number, ts: number, side: number): boolea
   return true;
 }
 
-function recordLiq(price: number, qty: number, ts: number, side: number): void {
+function recordLiq(source: string, price: number, qty: number, ts: number, side: number): void {
   const start = liqCounter;
-  if (!ingestLiq(price, qty, ts, side)) return;
+  if (!ingestLiq(source, price, qty, ts, side)) return;
   const rows = new Float64Array([ts, price, qty, side]);
   (self as unknown as Worker).postMessage(
     { kind: "marketLiq", start, rows, sym: symIndex },
@@ -983,13 +982,13 @@ function recordLiq(price: number, qty: number, ts: number, side: number): void {
 // Forced-order side → panel contract: 0 = short liquidated, 1 = long liquidated.
 function forceSide(raw: unknown): number {
   const s = String(raw ?? "").toLowerCase();
-  return s === "buy" ? 0 : 1;
+  return s === "buy" ? 0 : s === "sell" ? 1 : NaN;
 }
 
 // Position-side feeds (Bybit allLiquidation, Bitget UTA): Buy/buy = long liquidated.
 function posSide(raw: unknown): number {
   const s = String(raw ?? "").toLowerCase();
-  return s === "buy" ? 1 : 0;
+  return s === "buy" ? 1 : s === "sell" ? 0 : NaN;
 }
 
 async function decodeWsData(data: unknown): Promise<string | null> {
@@ -1085,8 +1084,8 @@ function ingestBinanceForce(raw: string, symbol: string, live: boolean): number 
     const qty = num(o.z) || num(o.l) || num(o.q);
     const ts = num(o.T ?? e.E);
     const side = forceSide(o.S);
-    if (live) recordLiq(px, qty, ts, side);
-    else if (ingestLiq(px, qty, ts, side)) ++n;
+    if (live) recordLiq("binance-usdm", px, qty, ts, side);
+    else if (ingestLiq("binance-usdm", px, qty, ts, side)) ++n;
   }
   return n;
 }
@@ -1107,7 +1106,7 @@ function ingestBinanceCoinmForce(raw: string, symbol: string, contractUsd: numbe
     const px = num(o.ap) || num(o.p);
     const contracts = num(o.z) || num(o.l) || num(o.q);
     const qty = px > 0 && contracts > 0 ? (contracts * contractUsd) / px : NaN;
-    recordLiq(px, qty, num(o.T ?? e.E), forceSide(o.S));
+    recordLiq("binance-coinm", px, qty, num(o.T ?? e.E), forceSide(o.S));
   }
 }
 
@@ -1175,7 +1174,7 @@ function openBybitLiq(): void {
         if (!row || typeof row !== "object") continue;
         const o = row as Record<string, unknown>;
         // allLiquidation.S is the liquidated position side: Buy = long liquidated.
-        recordLiq(num(o.p ?? o.price), num(o.v ?? o.size),
+        recordLiq("bybit", num(o.p ?? o.price), num(o.v ?? o.size),
                   num(o.T ?? o.updatedTime), posSide(o.S ?? o.side));
       }
     },
@@ -1190,7 +1189,7 @@ function recordOkxDetails(details: unknown, ctVal: number): number {
     const o = row as Record<string, unknown>;
     const pos = String(o.posSide ?? "").toLowerCase();
     const side = pos === "long" ? 1 : pos === "short" ? 0 : forceSide(o.side);
-    if (ingestLiq(num(o.bkPx ?? o.px), num(o.sz) * ctVal, num(o.ts ?? o.time), side))
+    if (ingestLiq("okx", num(o.bkPx ?? o.px), num(o.sz) * ctVal, num(o.ts ?? o.time), side))
       ++n;
   }
   return n;
@@ -1259,7 +1258,7 @@ function openOkxLiq(): void {
           const o = row as Record<string, unknown>;
           const pos = String(o.posSide ?? "").toLowerCase();
           const side = pos === "long" ? 1 : pos === "short" ? 0 : forceSide(o.side);
-          recordLiq(num(o.bkPx ?? o.px), num(o.sz) * ctVal, num(o.ts ?? o.time), side);
+          recordLiq("okx", num(o.bkPx ?? o.px), num(o.sz) * ctVal, num(o.ts ?? o.time), side);
         }
       }
     },
@@ -1351,7 +1350,7 @@ function openBitgetLiq(): void {
         if (!row || typeof row !== "object") continue;
         const o = row as Record<string, unknown>;
         if (typeof o.symbol === "string" && o.symbol !== s) continue;
-        recordLiq(num(o.price), num(o.amount), num(o.ts), posSide(o.side));
+        recordLiq("bitget", num(o.price), num(o.amount), num(o.ts), posSide(o.side));
       }
     },
   });
@@ -1392,7 +1391,7 @@ function openDeribitLiq(): void {
           const mark = num(o.mark_price ?? o.mark);
           const funding = num(o.current_funding);
           setSnap(Snap.Deribit,
-            Number.isFinite(usd) && usd >= 0 && mark > 0 ? usd / mark : null,
+            Number.isFinite(usd) && usd >= 0 && mark > 0 ? (inst.includes("_USDC") ? usd : usd / mark) : null,
             Number.isFinite(funding) ? funding : null);
         }
         return;
@@ -1410,8 +1409,10 @@ function openDeribitLiq(): void {
         // "M" = maker was, so the liquidated side is the opposite.
         const flag = String(o.liquidation);
         let side = forceSide(o.direction);
-        if (flag === "M") side = side === 0 ? 1 : 0;
-        recordLiq(px, amt / px, num(o.timestamp), side);
+        if (flag !== "M" && flag !== "T" && flag !== "MT") continue;
+        if (!Number.isFinite(side)) continue;
+        if (flag === "M") side = 1 - side;
+        recordLiq("deribit", px, inst.includes("_USDC") ? amt : amt / px, num(o.timestamp), side);
       }
     },
   });
@@ -1434,10 +1435,10 @@ function ingestHtxRow(row: unknown, code: string, ctVal: number, live: boolean):
   const side = pos === "long" ? 1 : pos === "short" ? 0 : forceSide(o.side ?? o.direction);
   if (live) {
     const before = liqCounter;
-    recordLiq(px, qty, ts, side);
+    recordLiq("htx", px, qty, ts, side);
     return liqCounter > before;
   }
-  return ingestLiq(px, qty, ts, side);
+  return ingestLiq("htx", px, qty, ts, side);
 }
 
 function ingestHtxPayload(msg: unknown, code: string, ctVal: number, live: boolean): number {
@@ -1522,7 +1523,7 @@ function openAsterLiq(): void {
       if (!msg || msg.e !== "forceOrder") return;
       const o = msg.o && typeof msg.o === "object"
         ? (msg.o as Record<string, unknown>) : msg;
-      recordLiq(num(o.p), num(o.q), num(o.T), forceSide(o.S));
+      recordLiq("aster", num(o.p), num(o.q), num(o.T), forceSide(o.S));
     },
   });
 }
@@ -1534,7 +1535,7 @@ function ingestBitgetRows(list: unknown, symbol: string): number {
     if (!row || typeof row !== "object") continue;
     const o = row as Record<string, unknown>;
     if (typeof o.symbol === "string" && o.symbol !== symbol) continue;
-    if (ingestLiq(num(o.price), num(o.amount), num(o.ts), posSide(o.side)))
+    if (ingestLiq("bitget", num(o.price), num(o.amount), num(o.ts), posSide(o.side)))
       ++n;
   }
   return n;
@@ -1551,7 +1552,7 @@ function ingestGateRows(list: unknown): number {
     let ts = num(o.time_ms ?? o.time);
     if (ts > 0 && ts < 1e12) ts *= 1000;
     // `size` is user position size: positive = long, negative = short.
-    if (ingestLiq(px, Math.abs(sz) * GATE_CTVAL, ts, sz < 0 ? 0 : 1)) ++n;
+    if (ingestLiq("gate", px, Math.abs(sz) * GATE_CTVAL, ts, sz < 0 ? 0 : 1)) ++n;
   }
   return n;
 }
@@ -1594,7 +1595,7 @@ function ingestBitfinexRow(row: unknown): boolean {
   const ts = num(row[2]);
   if (!(px > 0) || !(Math.abs(amt) > 0)) return false;
   // Amount is position size: positive = long, negative = short.
-  return ingestLiq(px, Math.abs(amt), ts, amt < 0 ? 0 : 1);
+  return ingestLiq("bitfinex", px, Math.abs(amt), ts, amt < 0 ? 0 : 1);
 }
 
 function recordBitfinexRow(row: unknown): void {
@@ -1603,7 +1604,7 @@ function recordBitfinexRow(row: unknown): void {
   if (!bitfinexWanted(String(row[4] ?? ""))) return;
   const amt = num(row[5]);
   const px = num(row[11] ?? row[6]);
-  recordLiq(px, Math.abs(amt), num(row[2]), amt < 0 ? 0 : 1);
+  recordLiq("bitfinex", px, Math.abs(amt), num(row[2]), amt < 0 ? 0 : 1);
 }
 
 function openBitfinexLiq(): void {
@@ -1633,7 +1634,7 @@ function recordLighterTrade(row: unknown): void {
   const px = num(o.price);
   const sz = num(o.size);
   // is_maker_ask: taker bought → forced buy → short liquidated.
-  recordLiq(px, sz, num(o.timestamp ?? o.transaction_time),
+  recordLiq("lighter", px, sz, num(o.timestamp ?? o.transaction_time),
             o.is_maker_ask ? 0 : 1);
 }
 
@@ -1696,7 +1697,7 @@ function openDydxLiq(): void {
         const kind = String(o.type ?? "").toUpperCase();
         if (kind !== "LIQUIDATED" && kind !== "DELEVERAGED") continue;
         const ts = Date.parse(String(o.createdAt ?? ""));
-        recordLiq(num(o.price), num(o.size), ts,
+        recordLiq("dydx", num(o.price), num(o.size), ts,
                   String(o.side ?? "").toUpperCase() === "SELL" ? 1 : 0);
       }
     },
@@ -1717,7 +1718,7 @@ function openExtendedLiq(): void {
           const o = row as Record<string, unknown>;
           const kind = String(o.tT ?? "").toUpperCase();
           if (kind !== "LIQUIDATION" && kind !== "LIQUIDATED") continue;
-          recordLiq(num(o.p), num(o.q), num(o.T), forceSide(o.S));
+          recordLiq("extended", num(o.p), num(o.q), num(o.T), forceSide(o.S));
         }
       },
     },
@@ -1747,7 +1748,7 @@ function ingestHlFill(row: unknown): boolean {
   if (!row || typeof row !== "object") return false;
   const o = row as Record<string, unknown>;
   if (!isHlLiqFill(o, hlCoin())) return false;
-  return ingestLiq(num(o.px), num(o.sz), num(o.time), hlLiqSide(o.dir, o.side));
+  return ingestLiq("hyperliquid", num(o.px), num(o.sz), num(o.time), hlLiqSide(o.dir, o.side));
 }
 
 function recordHlFills(rows: unknown, since = 0): void {
@@ -1757,7 +1758,7 @@ function recordHlFills(rows: unknown, since = 0): void {
     const o = row as Record<string, unknown>;
     if (since > 0 && num(o.time) < since) continue;
     if (!isHlLiqFill(o, hlCoin())) continue;
-    recordLiq(num(o.px), num(o.sz), num(o.time), hlLiqSide(o.dir, o.side));
+    recordLiq("hyperliquid", num(o.px), num(o.sz), num(o.time), hlLiqSide(o.dir, o.side));
   }
 }
 

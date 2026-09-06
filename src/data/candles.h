@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <array>
 
 // Chart timeframe: time-based bars (value = minutes), tick bars (value =
 // trades/bar), or volume bars (value = base-asset volume/bar). Time history
@@ -33,6 +34,7 @@ struct Candle {
 
 struct CandleSeries {
   std::vector<Candle> v;
+  std::vector<std::array<double, 2>> calendarOpens; // exact UTC daily [time, open], independent of chart buckets
   Timeframe tf;
   int sym = -1;    // canonical symbol index these candles belong to
   int barCount = 0; // trades seen in the forming bar (tick bars only)
@@ -46,7 +48,7 @@ struct CandleSeries {
 
   static constexpr size_t MAX_CANDLES = 2000;
 
-  void load(const double* data, int n, Timeframe tf_, int symIdx);
+  void load(const double* data, int n, Timeframe tf_, int symIdx, bool preserveLive = false);
   // side: 0=buy 1=sell. onTrade is the venue-0 (Binance) clock + OHLC
   // reference for time/tick bars; volume bars are aggregated and come from
   // onAgg (see below).

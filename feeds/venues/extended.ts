@@ -132,6 +132,7 @@ export class ExtendedAdapter implements VenueAdapter {
 
   private teardown(): void {
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -181,6 +182,7 @@ export class ExtendedAdapter implements VenueAdapter {
 
   private teardownTrades(): void {
     if (this.tradeWs) {
+      this.tradeWs.onopen = null;
       this.tradeWs.onclose = null;
       this.tradeWs.onerror = null;
       this.tradeWs.onmessage = null;

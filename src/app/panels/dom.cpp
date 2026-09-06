@@ -16,7 +16,7 @@
 
 namespace {
 constexpr int kLimits[] = {0, 40, 80, 160};
-constexpr int kWindows[] = {5, 15, 60};
+constexpr int kWindows[] = {5, 15, 300};
 
 double epochMs() {
   using namespace std::chrono;
@@ -186,7 +186,7 @@ void saveSettings(DomPanel& st) {
   normalizeSettings(st);
   char buf[512];
   snprintf(buf, sizeof(buf),
-           "7,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.12g,%d,%d",
+           "8,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.12g,%d,%d",
            st.venue, (unsigned)st.mask, st.showUsd, st.showTrades,
            st.showCumulative, st.showVenueCounts, st.showSummary,
            st.showInspector, st.showBars, st.showTexture, st.showEdges,
@@ -229,12 +229,13 @@ void loadSettings(DomPanel& st) {
                    &intensity, &amountPrecision, &pricePrecision, &custom);
   }
   std::free(saved);
-  if (!((count == 24 && version == 7) ||
+  if (!((count == 24 && (version == 7 || version == 8)) ||
         (count == 23 && version == 6) ||
         (count == 22 && (version == 5 || version == 4 || version == 3)) ||
         (count == 21 && (version == 1 || version == 2))))
     return;
-  bool migrate = version < 7;
+  bool migrate = version < 8;
+  if (version < 8) window = 2;
   if (version < 6) queue = 1;
   if (version < 7) walls = 1;
   if (version == 1 && venue < 0) venue = 0;
@@ -285,7 +286,7 @@ void resetSettings(DomPanel& st) {
   st.showFlowFlashes = true;
   st.density = 1;
   st.levelLimit = 0;
-  st.tradeWindow = 1;
+  st.tradeWindow = 2;
   st.groupMode = 0;
   st.scaleMode = 0;
   st.intensity = 1;
@@ -403,7 +404,7 @@ void drawSettings(Ui& u, Rect area, DomPanel& st) {
                  break;
                }
                case 7: {
-                 const char* labels[] = {"5 SEC", "15 SEC", "60 SEC"};
+                 const char* labels[] = {"5 SEC", "15 SEC", "5 MIN"};
                  for (int i = 0; i < 3; ++i)
                    option(labels[i], 66, st.tradeWindow == i,
                           [&, i] { st.tradeWindow = i; });
@@ -654,7 +655,10 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
     return;
   }
 
-  uint64_t modelKey = DomModel::sourceSignature(feeds, st.venue, now);
+  // Expire hits before the depth rebuild classifies decreases as executions.
+  st.model.updateTrades(feeds, st.venue, st.mask, st.effectiveStep,
+                        (double)kWindows[std::clamp(st.tradeWindow, 0, 2)], now);
+  uint64_t modelKey = books;
   // Visible tick band (stale-by-a-frame mid is fine; the model unions
   // mid-near anyway). The band rides the rebuild gate so scrolling never
   // shows unmaterialized rows.
@@ -674,8 +678,6 @@ void drawDom(Ui& u, Rect r, DomPanel& st, Feeds& feeds) {
                       now, reqLo, reqHi);
     st.model.sourceVersion = modelKey;
   }
-  st.model.updateTrades(feeds, st.venue, st.mask, st.effectiveStep,
-                        (double)kWindows[std::clamp(st.tradeWindow, 0, 2)], now);
 
   float y = r.y + 23;
   float summaryH = st.showSummary && r.h >= 100 ? 20.0f : 0.0f;

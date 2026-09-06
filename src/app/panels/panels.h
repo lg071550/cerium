@@ -206,7 +206,7 @@ struct DomPanel {
   bool showWalls = true, showFlowFlashes = true;
   int density = 1;       // tight / normal / relaxed
   int levelLimit = 0;    // auto / 40 / 80 / 160
-  int tradeWindow = 1;   // 5 / 15 / 60 seconds
+  int tradeWindow = 2;   // 5 / 15 seconds / 5 minutes
   int groupMode = 0;     // auto / 1x / 2x / 5x / 10x / custom
   int scaleMode = 0;     // linear / sqrt / log
   int intensity = 1;     // quiet / normal / strong

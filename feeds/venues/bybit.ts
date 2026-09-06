@@ -93,6 +93,7 @@ export class BybitBaseAdapter implements VenueAdapter {
 
   private readonly deps: AdapterDeps;
   private ws: WebSocket | null = null;
+  private synced=false;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private readonly conn: Reconnect;
 
@@ -120,6 +121,7 @@ export class BybitBaseAdapter implements VenueAdapter {
   }
 
   private open(): void {
+    this.synced=false;
     this.deps.setState("connecting");
     const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
@@ -144,11 +146,13 @@ export class BybitBaseAdapter implements VenueAdapter {
   }
 
   private teardown(): void {
+    this.synced=false;
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -177,9 +181,10 @@ export class BybitBaseAdapter implements VenueAdapter {
       return;
     }
     if (parsed.kind === "snapshot") {
+      this.synced=true;
       this.deps.book.applySnapshot(parsed.bids, parsed.asks);
       this.deps.setState("live");
-    } else {
+    } else if(this.synced) {
       this.deps.book.applyUpdates(parsed.updates);
     }
   }

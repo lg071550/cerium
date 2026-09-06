@@ -50,7 +50,7 @@ const KRAKEN_SPOT: Record<string, string> = { ETH: "ETH/USD", BTC: "BTC/USD", SO
 const KRAKEN_PERP: Record<string, string> = {
   ETH: "PI_ETHUSD",
   BTC: "PI_XBTUSD",
-  SOL: "PI_SOLUSD",
+  SOL: "PF_SOLUSD",
 };
 const BITSTAMP_SPOT: Record<string, string> = { ETH: "ethusd", BTC: "btcusd", SOL: "solusd" };
 const CRYPTOCOM_SPOT: Record<string, string> = { ETH: "ETH_USD", BTC: "BTC_USD", SOL: "SOL_USD" };
@@ -68,7 +68,7 @@ const BITFINEX_PERP: Record<string, string> = {
 const DERIBIT_PERP: Record<string, string> = {
   ETH: "ETH-PERPETUAL",
   BTC: "BTC-PERPETUAL",
-  SOL: "SOL-PERPETUAL",
+  SOL: "SOL_USDC-PERPETUAL",
 };
 const USD_PAIR: Record<string, string> = { ETH: "ETH-USD", BTC: "BTC-USD", SOL: "SOL-USD" }; // dydx + extended
 const LIGHTER_MARKET: Record<string, number> = { ETH: 0, BTC: 1, SOL: 2 };

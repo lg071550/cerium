@@ -128,6 +128,7 @@ export class MexcPerpAdapter implements VenueAdapter {
       this.pingTimer = null;
     }
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;

@@ -9,12 +9,27 @@
 
 static Feeds* g_feedsInstance = nullptr;
 
+extern "C" void cerium_on_calendar(double* data, int n, int sym) {
+  if (!g_feedsInstance || sym != g_feedsInstance->symbol || !data || n < 1 || n > 1000) return;
+  auto& cs = g_feedsInstance->candles;
+  std::vector<std::array<double, 2>> next;
+  for (int i = 0; i < n; ++i) {
+    const double ts = data[i * 2], open = data[i * 2 + 1];
+    if (!std::isfinite(ts) || !std::isfinite(open) || ts <= 0 || open <= 0 ||
+        std::fmod(ts, 86400000.0) != 0 || (!next.empty() && ts <= next.back()[0])) continue;
+    next.push_back({ts, open});
+  }
+  if (next.empty()) return;
+  cs.calendarOpens = std::move(next);
+  ++cs.historyVersion;
+}
+
 extern "C" void cerium_on_candles(double* data, int n, int tfKind, double tfValue,
-                                  int sym) {
+                                  int sym, int preserveLive) {
   if (!g_feedsInstance || sym != g_feedsInstance->symbol) return;
   Timeframe tf{(Timeframe::Kind)(uint8_t)tfKind, tfValue};
   if (!(tf == g_feedsInstance->candles.tf)) return; // stale in-flight bootstrap
-  g_feedsInstance->candles.load(data, n, tf, sym);
+  g_feedsInstance->candles.load(data, n, tf, sym, preserveLive != 0);
 }
 
 extern "C" void cerium_on_orderflow(double* data, int n, int tfKind,
@@ -182,6 +197,7 @@ void Feeds::setSymbol(int sym) {
   }
   tape.clear();
   candles.v.clear();
+  candles.calendarOpens.clear();
   candles.barCount = 0;
   candles.awaitingHistory = true;
   candles.historyLoaded = false;

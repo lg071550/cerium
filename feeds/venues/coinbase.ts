@@ -42,8 +42,7 @@ export function parseCoinbaseL2(msg: unknown, sizeMultiplier = 1): ParsedCoinbas
   }
 
   if (sawSnapshot) return { kind: "snapshot", seq, bids, asks };
-  if (updates.length > 0) return { kind: "update", seq, updates };
-  return null;
+  return { kind: "update", seq, updates };
 }
 
 function toLevel(u: unknown, sizeMultiplier: number): L2Update | null {
@@ -62,6 +61,7 @@ export function parseCoinbaseTrades(msg: unknown, sizeMultiplier = 1): TradePrin
   for (const evRaw of msg.events) {
     if (!isRecord(evRaw)) return null;
     if (evRaw.type !== "snapshot" && evRaw.type !== "update") return null;
+    if(evRaw.type==="snapshot") continue;
     if (!Array.isArray(evRaw.trades)) return null;
     for (const tRaw of evRaw.trades) {
       const print = toPrint(tRaw, sizeMultiplier);
@@ -101,6 +101,7 @@ export class CoinbaseL2Adapter implements VenueAdapter {
   private readonly sizeMultiplier: number;
   private ws: WebSocket | null = null;
   private lastSeq: number | null = null;
+  private synced=false;
   private readonly conn: Reconnect;
 
   constructor(deps: AdapterDeps, config: CoinbaseConfig) {
@@ -126,7 +127,7 @@ export class CoinbaseL2Adapter implements VenueAdapter {
 
   private open(): void {
     this.deps.setState("connecting");
-    this.lastSeq = null;
+    this.lastSeq = null; this.synced=false;
     const ws = new WebSocket(WS_URL);
     this.ws = ws;
     ws.onopen = () => {
@@ -149,6 +150,7 @@ export class CoinbaseL2Adapter implements VenueAdapter {
 
   private teardown(): void {
     if (this.ws) {
+      this.ws.onopen = null;
       this.ws.onclose = null;
       this.ws.onerror = null;
       this.ws.onmessage = null;
@@ -156,7 +158,7 @@ export class CoinbaseL2Adapter implements VenueAdapter {
       this.ws = null;
     }
     this.deps.book.clear();
-    this.lastSeq = null;
+    this.lastSeq = null; this.synced=false;
   }
 
   private handle(event: MessageEvent): void {
@@ -167,6 +169,17 @@ export class CoinbaseL2Adapter implements VenueAdapter {
       return;
     }
 
+    // sequence_num is shared by every channel on this connection, including
+    // subscription acknowledgements, heartbeats and trade messages.
+    if(isRecord(raw)) {
+      const seq=safeInteger(raw.sequence_num);
+      if(seq!==null) {
+        if(this.lastSeq!==null && seq!==this.lastSeq+1) {
+          this.conn.dropped(`sequence gap: last ${this.lastSeq}, got ${seq}`); return;
+        }
+        this.lastSeq=seq;
+      }
+    }
     const prints = parseCoinbaseTrades(raw, this.sizeMultiplier);
     if (prints) {
       this.deps.onTrade?.(prints);
@@ -185,24 +198,13 @@ export class CoinbaseL2Adapter implements VenueAdapter {
       return;
     }
 
-    if (this.lastSeq !== null) {
-      if (parsed.seq <= this.lastSeq) {
-        this.conn.dropped(`sequence regression: last ${this.lastSeq}, got ${parsed.seq}`);
-        return;
-      }
-      if (parsed.seq > this.lastSeq + 1) {
-        // A skipped sequence means updates were lost upstream; applying them
-        // over the current book would silently corrupt it.
-        this.conn.dropped(`sequence gap: last ${this.lastSeq}, got ${parsed.seq}`);
-        return;
-      }
-    }
-    this.lastSeq = parsed.seq;
+
 
     if (parsed.kind === "snapshot") {
+      this.synced=true;
       this.deps.book.applySnapshot(parsed.bids, parsed.asks);
       this.deps.setState("live");
-    } else {
+    } else if(this.synced) {
       this.deps.book.applyUpdates(parsed.updates);
     }
   }

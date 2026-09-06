@@ -6,8 +6,8 @@
 #include <cmath>
 #include <cstddef>
 
-// UTC calendar opens. Missing opening candles stay unknown: the left edge
-// of a rolling history window is not a day/week/month open.
+// Exact daily metadata supplies UTC opens on custom timeframes. Without it,
+// only an exact boundary candle qualifies; missing opens remain unknown.
 struct PeriodOpen {
   double price = NAN;
   double startMs = 0;

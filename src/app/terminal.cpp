@@ -167,6 +167,9 @@ int Terminal::panelId(const char* title) const {
 }
 
 void Terminal::init(Renderer* renderer) {
+  if (char* saved = shell_storage_get("cerium.fps.uncapped")) {
+    uncappedFps = saved[0] == '1'; free(saved);
+  }
   m_renderer = renderer;
   ui.init(renderer->atlas());
   ui.draw.setTextShadowColor(theme().textShadow);
@@ -225,7 +228,7 @@ void Terminal::frame(const Input& input, float frameDt, float uiDt,
     restoreLayout();
     m_restored = true;
   }
-  if (frameDt > 0) m_fps = m_fps * 0.95f + (1.0f / frameDt) * 0.05f;
+  m_fps = (float)cerium_perf(4); // measured renders/second, not averaged reciprocal tick times
 
   ui.begin(input, uiDt);
   ui.overlayGate();
@@ -407,7 +410,7 @@ void Terminal::drawTopBar(float w) {
   if (m_showStats && m_renderer) {
     const Renderer::Stats& st = m_renderer->stats();
     double frameMs = cerium_perf(0) + cerium_perf(1) + cerium_perf(2);
-    snprintf(stats, sizeof(stats), "%d draws  /  %.1f ms", st.drawCalls, frameMs);
+    snprintf(stats, sizeof(stats), "%d draws | CPU %.1fms", st.drawCalls, frameMs);
   } else {
     int live = feeds.liveCount();
     if (themeScale() != 1.0f)
@@ -439,11 +442,26 @@ void Terminal::drawTopBar(float w) {
     ui.draw.textAligned(statsR, stats, sb.hovered ? t.text : t.textDim,
                         DrawList::Center);
     separator(statsR.x);
-    ui.tip(sid, statsR, "runtime stats (click to toggle)");
+    static char frameTip[160];
+    snprintf(frameTip, sizeof(frameTip), "CPU/frame: feeds %.2f ms | UI %.2f ms | submit %.2f ms. Not GPU execution time. Click to toggle.",
+        cerium_perf(0), cerium_perf(1), cerium_perf(2));
+    ui.tip(sid, statsR, frameTip);
+
+    const float fpsW = w > 840 ? 92.0f : 0.0f;
+    if (fpsW > 0) {
+      Rect fpsR{statsR.x - fpsW, 1, fpsW, t.topBarH - 2};
+      if (chip(ui, fpsR, uncappedFps ? "FPS UNCAPPED" : "FPS AUTO", uncappedFps)) {
+        uncappedFps = !uncappedFps;
+        shell_storage_set("cerium.fps.uncapped", uncappedFps ? "1" : "0");
+      }
+      separator(fpsR.x);
+      ui.tip(ui.id("fps-mode-tip"), fpsR,
+          "AUTO follows display refresh. Uncapped submits between display frames. FPS counts actual renders.");
+    }
 
     // Active snapshot is a quiet workspace breadcrumb in its own segment.
     if (!m_activeLayout.empty() && w > 980) {
-      Rect activeR{statsR.x - activeW, 1, activeW, t.topBarH - 2};
+      Rect activeR{statsR.x - fpsW - activeW, 1, activeW, t.topBarH - 2};
       ui.draw.textFit(activeR, m_activeLayout.c_str(), t.accent,
                       DrawList::Center, 10);
       separator(activeR.x);

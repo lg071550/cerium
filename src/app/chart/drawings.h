@@ -40,13 +40,16 @@ struct DrawingSet {
   bool placing = false;
   bool hovering = false;
   bool dragging = false;
+  bool awaitingEnd = false;
+  int currentSymbol = 0;
+  ListState managerList;
 
   void setStorageKey(const std::string& chartSettingsKey);
   void load();
   void save() const;
 
   bool handle(Ui& u, const ChartPane& pane, const CandleSeries& cs, int symbol,
-              float startF, float bw, int size);
+              float startF, float bw, int size, Rect controls = {});
   void draw(DrawList& d, const ChartPane& pane, const CandleSeries& cs,
             int symbol, float startF, float bw) const;
 
