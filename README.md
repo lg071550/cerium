@@ -6,13 +6,12 @@ TypeScript market-data workers.
 
 - Candles, custom timeframes, tick and volume bars, and footprints.
 - TPO profiles with split view, value area, POC, single prints and tails.
-- DOM, order books, trade tape and aggregated liquidations.
+- aggregated DOM, order books, trade tape and liquidations.
 - VWAP, CVD, open interest, calendar levels and other indicators.
 - Chart drawings, dockable panels and saved layouts.
-- 27 exchange adapters; BTC, ETH and SOL coverage varies by venue.
+- 27 exchange adapters.
 
-Exchange feeds connect directly from the browser. No Cerium account is needed.
-Optional HyperTracker overlays require a provider token.
+Exchange feeds connect directly from the browser. Optional HyperTracker overlays require a provider token.
 
 ## Build and run
 
@@ -49,7 +48,7 @@ connectivity and regional restrictions.
 
 Charts retain 2,000 candles; footprints retain up to 320,000 aggregate prints.
 Older candles can fall outside loaded tick history. Cold history loads may take
-minutes. DOM queue tiles are inferred from L2 changes, not market-by-order data.
+minutes. DOM queue tiles are inferred from L2 changes, not MBO data.
 
 ## Renderer
 
